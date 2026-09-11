@@ -79,6 +79,10 @@ def _jit_hicache_staged_module(
                 "launch_all_mla_lf_pf_staged",
                 f"&HiCacheStagedWriteBackKernel<{args}>::run_all_mla_lf_pf_staged",
             ),
+            (
+                "launch_page_first_to_layer_dma",
+                f"&HiCacheStagedWriteBackKernel<{args}>::run_page_first_to_layer_dma",
+            ),
         ],
     )
 
@@ -403,6 +407,33 @@ def transfer_hicache_all_layer_mla(
         indices_src,
         cache_src_stride_bytes,
         cache_dst_stride_bytes,
+    )
+
+
+def transfer_hicache_page_first_to_layer_dma(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    *,
+    layer_id: int,
+    page_size: int,
+) -> None:
+    src = src.view(src.shape[0], src.shape[1], -1)
+    dst = dst.view(dst.shape[0], -1)
+    element_size = dst.shape[1] * dst.element_size()
+    module = _jit_hicache_staged_module(
+        element_size=element_size,
+        unroll=_default_unroll(element_size),
+        block_quota=DEFAULT_BLOCK_QUOTA,
+    )
+    module.launch_page_first_to_layer_dma(
+        src,
+        dst,
+        src_indices.cpu(),
+        dst_indices.cpu(),
+        layer_id,
+        page_size,
     )
 
 

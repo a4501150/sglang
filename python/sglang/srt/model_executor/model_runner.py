@@ -83,6 +83,7 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.hicache_storage import hicache_tensor_digest
 from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
@@ -1130,6 +1131,15 @@ class ModelRunner:
         # final addresses. Self-guards (no-op in full mode / non-recovery paths).
         self.maybe_capture_gdn_recovery_graphs()
 
+        if is_scale_joiner:
+            if self._elastic_cuda_graph_enabled():
+                if defer_decode_capture:
+                    self._recapture_elastic_cuda_graphs()
+                    finalize_cuda_graph_capture(self)
+            # Scheduler startup calls this path even when CUDA graphs are disabled.
+            target_size = get_parallel().ep_join_rank_offset + get_parallel().tp_size
+            self._finalize_elastic_ep_joiner(target_size)
+
     def maybe_capture_gdn_recovery_graphs(self):
         """Capture per-bucket FlashInfer SSM-state recovery cuda graphs at warmup.
 
@@ -1155,15 +1165,6 @@ class ModelRunner:
         self.attn_backend.capture_recovery_graphs(
             self.decode_cuda_graph_runner.capture_bs
         )
-
-        if is_scale_joiner:
-            if self._elastic_cuda_graph_enabled():
-                if defer_decode_capture:
-                    self._recapture_elastic_cuda_graphs()
-                    finalize_cuda_graph_capture(self)
-            # Scheduler startup calls this path even when CUDA graphs are disabled.
-            target_size = get_parallel().ep_join_rank_offset + get_parallel().tp_size
-            self._finalize_elastic_ep_joiner(target_size)
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
@@ -1833,6 +1834,71 @@ class ModelRunner:
 
         return output
 
+    def _log_hicache_mamba_state_before_forward(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        if not envs.SGLANG_HICACHE_FILE_BACKEND_LOG_PAGE_DIGESTS.get():
+            return
+        pool = self.req_to_token_pool
+        if not isinstance(pool, HybridReqToTokenPool) or self.is_draft_worker:
+            return
+
+        req_pool_indices = forward_batch.req_pool_indices
+        logical_indices = pool.req_index_to_mamba_index_mapping[req_pool_indices]
+        physical_indices = pool.translate_mamba_indices(logical_indices)
+        clear_indices = forward_batch.mamba_clear_indices
+        cow_src_indices = forward_batch.mamba_cow_src_indices
+        cow_dst_indices = forward_batch.mamba_cow_dst_indices
+
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
+
+        def _tolist(indices):
+            return None if indices is None else indices.detach().cpu().tolist()
+
+        req_pool_indices_list = _tolist(req_pool_indices)
+        logical_indices_list = _tolist(logical_indices)
+        physical_indices_list = _tolist(physical_indices)
+        logger.warning(
+            "HiCache pre-forward Mamba mapping req_pool_indices=%s "
+            "logical_slots=%s physical_slots=%s clear_slots=%s "
+            "cow_src_slots=%s cow_dst_slots=%s",
+            req_pool_indices_list,
+            logical_indices_list,
+            physical_indices_list,
+            _tolist(clear_indices),
+            _tolist(cow_src_indices),
+            _tolist(cow_dst_indices),
+        )
+
+        mamba_pool = pool.mamba_pool
+        for req_pool_index, logical_index, physical_index in zip(
+            req_pool_indices_list, logical_indices_list, physical_indices_list
+        ):
+            components = [
+                ("mamba_temporal", mamba_pool.mamba_cache.temporal[:, physical_index]),
+                *(
+                    (f"mamba_conv_{conv_index}", conv[:, physical_index])
+                    for conv_index, conv in enumerate(mamba_pool.mamba_cache.conv)
+                ),
+            ]
+            for sibling in mamba_pool._slot_siblings:
+                for name, tensor, slot_axis in sibling.get_storage_tensors():
+                    slices = [slice(None)] * tensor.ndim
+                    slices[slot_axis] = physical_index
+                    components.append((name, tensor[tuple(slices)]))
+            for component, tensor in components:
+                logger.warning(
+                    "HiCache pre-forward Mamba digest req_pool_index=%d "
+                    "logical_slot=%d physical_slot=%d component=%s bytes=%d sha256=%s",
+                    req_pool_index,
+                    logical_index,
+                    physical_index,
+                    component,
+                    tensor.numel() * tensor.element_size(),
+                    hicache_tensor_digest(tensor),
+                )
+
     def _maybe_execute_deferred_mamba_cow_and_clear(
         self, forward_batch: ForwardBatch
     ) -> None:
@@ -1865,6 +1931,12 @@ class ModelRunner:
             forward_batch.mamba_cow_src_indices is not None
             and len(forward_batch.mamba_cow_src_indices) > 0
         ):
+            # A HiCache load publishes the radix slot layerwise on its H->D
+            # stream.  Deferred COW reads the complete source slot at once, so
+            # it must wait for the final layer rather than racing ahead of the
+            # per-layer attention waits and copying an uninitialized source
+            # over the independently restored request slot.
+            pool.wait_for_hicache_load_complete()
             if pool.mamba_ckpt_pool is not None:
                 # int8 checkpoints: dequantize src int8 ckpt slot into the active bf16 dst.
                 pool.mamba_ckpt_pool.load_to_active(
@@ -1878,6 +1950,7 @@ class ModelRunner:
                     pool.translate_mamba_indices(forward_batch.mamba_cow_src_indices),
                     pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
                 )
+        self._log_hicache_mamba_state_before_forward(forward_batch)
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None

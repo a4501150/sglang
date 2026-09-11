@@ -16,7 +16,12 @@ _SGLANG_NIXL_CONFIG_KEYS = {
     "l3_cleaner_enabled",
     "l3_cleaner_high_watermark",
     "l3_cleaner_low_watermark",
+    "gds_compatibility_mode",
+    "storage_mode",
 }
+
+
+_GDS_PLUGINS = frozenset({"GDS", "GDS_MT"})
 
 
 class NixlBackendConfig:
@@ -66,6 +71,26 @@ class NixlBackendConfig:
             if raw_key in self.config:
                 config[cleaner_key] = parser(self.config[raw_key])
         return config
+
+    def get_gds_compatibility_mode(self) -> bool:
+        value = self.config.get("gds_compatibility_mode", False)
+        if not isinstance(value, bool):
+            raise ValueError("gds_compatibility_mode must be a boolean")
+        return value
+
+    def get_storage_mode(self) -> str:
+        """Return the resolved L3 storage mode: auto, odirect, or gds.
+
+        auto prefers the native GDS device path but falls back to the
+        O_DIRECT file path. odirect keeps the file path and disables the
+        device target. gds requires a usable GDS plugin and fails loudly.
+        """
+        value = str(self.config.get("storage_mode", "auto")).lower()
+        if value not in ("auto", "odirect", "gds"):
+            raise ValueError(
+                f"Invalid storage_mode {value!r}; expected auto, odirect, or gds."
+            )
+        return value
 
     def get_specified_plugin(self) -> str:
         """decide which plugin to use: either config or SGLANG_HICACHE_NIXL_BACKEND_PLUGIN specifies the plugin, if not, use "auto" """
@@ -135,6 +160,7 @@ class NixlBackendSelection:
         self.plugin = plugin
         self.backend_name = None
         self.mem_type = None
+        self.device_backend_name = None
         self.nixlconfig = nixlconfig
 
     def create_backend(self, agent) -> bool:
@@ -192,6 +218,11 @@ class NixlBackendSelection:
             )
 
             self.mem_type = "OBJ" if self.backend_name in self.OBJ_PLUGINS else "FILE"
+            if self.backend_name in _GDS_PLUGINS:
+                # A GDS primary backend serves the device target itself; a
+                # DRAM-capable companion is resolved separately for the host
+                # path.
+                self.device_backend_name = self.backend_name
             logger.debug(
                 f"Created NIXL backend: {self.backend_name} with memory type: {self.mem_type}"
             )
@@ -202,6 +233,75 @@ class NixlBackendSelection:
                 f"Failed to create NIXL backend: {e}, backend_name {self.backend_name}, supported plugins {plugin_list} initparams {initparams}"
             )
             return False
+
+    def resolve_device_backend(self, agent) -> bool:
+        """Create the VRAM-capable file companion for device-target transfers."""
+        if self.device_backend_name is not None:
+            return self.device_backend_name in _GDS_PLUGINS
+        for plugin in ("GDS_MT", "GDS"):
+            if plugin in agent.get_plugin_list():
+                try:
+                    agent.create_backend(
+                        plugin,
+                        self.nixlconfig.get_backend_initparams(plugin)
+                        if self.nixlconfig
+                        else {},
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to create GDS companion backend %s: %s", plugin, e
+                    )
+                    return False
+                self.device_backend_name = plugin
+                logger.info(
+                    "HiCache device target enabled with NIXL plugin %s.", plugin
+                )
+                return True
+        return False
+
+    def resolve_host_backend(self, agent) -> bool:
+        """Ensure a DRAM-capable file backend exists for host-mediated transfers.
+
+        The GDS plugin cannot target host memory, so when the primary backend
+        is GDS-only, create a POSIX/3FS companion and make it the host-path
+        backend; the GDS backend stays registered for device transfers.
+        """
+        if self.backend_name not in _GDS_PLUGINS:
+            return True
+        for plugin in self.FILE_PLUGINS:
+            if plugin in agent.get_plugin_list() and plugin not in _GDS_PLUGINS:
+                try:
+                    agent.create_backend(
+                        plugin,
+                        self.nixlconfig.get_backend_initparams(plugin)
+                        if self.nixlconfig
+                        else {},
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to create host companion backend %s: %s", plugin, e
+                    )
+                    return False
+                self.device_backend_name = self.backend_name
+                self.backend_name = plugin
+                logger.info(
+                    "HiCache host path uses NIXL plugin %s; device target stays on %s.",
+                    plugin,
+                    self.device_backend_name,
+                )
+                return True
+        return False
+
+    def validate_device_target(self) -> None:
+        if self.device_backend_name not in _GDS_PLUGINS:
+            raise RuntimeError(
+                "HiCacheNixl device target requires a created GDS or GDS_MT "
+                f"backend, got {self.device_backend_name!r}."
+            )
+        if self.mem_type != "FILE":
+            raise RuntimeError(
+                "HiCacheNixl device target requires FILE storage descriptors."
+            )
 
 
 class NixlFileManager:

@@ -1123,6 +1123,7 @@ def build_hybrid_mamba_stack(
     params: CacheInitParams,
     kv_pool: Any,
     mamba_pool: Any,
+    indexer_pool: Any,
     full_layer_mapping: dict[int, int],
     mamba_layer_mapping: dict[int, int],
     load_cache_event,
@@ -1180,6 +1181,18 @@ def build_hybrid_mamba_stack(
         allocator_type=_get_allocator_type(),
         layout=mamba_layout,
     )
+    indexer_host_pool = None
+    if indexer_pool is not None:
+        from sglang.srt.mem_cache.pool_host.dsa import (
+            DSAIndexerPoolHost,
+            make_sparse_indexer_pool_decl,
+        )
+
+        indexer_host_pool = DSAIndexerPoolHost(
+            decl=make_sparse_indexer_pool_decl(indexer_pool),
+            anchor_host=kv_host_pool,
+            allocator_type=_get_allocator_type(),
+        )
     entries = [
         build_pool_entry(
             name=PoolName.KV,
@@ -1202,6 +1215,16 @@ def build_hybrid_mamba_stack(
             device_free_fn=mamba_allocator.free,
         ),
     ]
+    if indexer_host_pool is not None:
+        entries.append(
+            build_pool_entry(
+                name=PoolName.INDEXER,
+                host_pool=indexer_host_pool,
+                device_pool=indexer_pool,
+                layer_mapping=full_layer_mapping,
+                transfer_layer_id_max=transfer_layer_id_max,
+            )
+        )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -1776,10 +1799,13 @@ class _MambaStrategy(StackStrategy):
         mamba_layer_mapping = _stage_local_layer_mapping(
             params.req_to_token_pool.mamba_map, kvcache.start_layer
         )
+        from sglang.srt.mem_cache.pool_host.dsa import supports_direct_indexer_pool
+
         host_pool_group, cache_controller = build_hybrid_mamba_stack(
             params=params,
             kv_pool=kvcache.full_kv_pool,
             mamba_pool=params.req_to_token_pool.mamba_pool,
+            indexer_pool=(kvcache if supports_direct_indexer_pool(kvcache) else None),
             full_layer_mapping=full_layer_mapping,
             mamba_layer_mapping=mamba_layer_mapping,
             load_cache_event=load_cache_event,
@@ -1792,6 +1818,7 @@ class _MambaStrategy(StackStrategy):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
         )
+        has_indexer = PoolName.INDEXER in host_pool_group.entry_map
         return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
@@ -1799,8 +1826,19 @@ class _MambaStrategy(StackStrategy):
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
                 ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
             },
+            sidecars=(
+                [
+                    SidecarPoolSpec(
+                        pool_name=PoolName.INDEXER,
+                        indices_from_pool=PoolName.KV,
+                        hit_policy=PoolHitPolicy.ALL_PAGES,
+                    )
+                ]
+                if has_indexer
+                else []
+            ),
             register_req_to_token_counter=True,
-            pools_desc="KV + MAMBA",
+            pools_desc="KV + MAMBA + INDEXER" if has_indexer else "KV + MAMBA",
         )
 
 

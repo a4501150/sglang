@@ -292,7 +292,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Needs the draft-token count derived just above.
     # GDN MTP none-mode cache: linear-chain only, and mutually exclusive
     # with ReplaySSM.
-    validate_gdn_mtp_cache_mode(server_args)
+    run_hook(validate_gdn_mtp_cache_mode, server_args)
 
     from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
 
