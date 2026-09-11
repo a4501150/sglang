@@ -427,6 +427,8 @@ class CompressedTensorsConfig(QuantizationConfig):
     def _is_dynamic_token_w4a8(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
+        if input_quant is None:
+            return False
         is_weight_4_bits = weight_quant.num_bits == 4
         is_activation_8_bits = input_quant.num_bits == 8
         weight_strategy = (
@@ -494,6 +496,8 @@ class CompressedTensorsConfig(QuantizationConfig):
     def _is_dynamic_token_w8a8(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
+        if input_quant is None:
+            return False
         is_8_bits = weight_quant.num_bits == input_quant.num_bits == 8
         weight_strategy = (
             weight_quant.strategy == QuantizationStrategy.TENSOR.value
@@ -573,30 +577,29 @@ class CompressedTensorsConfig(QuantizationConfig):
     def _is_fp4a4_nvfp4(
         self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
     ):
-        if weight_quant is None or input_quant is None:
+        if weight_quant is None:
             return False
 
-        is_tensor_group_quant = (
+        is_weight_match = (
             weight_quant.strategy == QuantizationStrategy.TENSOR_GROUP.value
-            and input_quant.strategy == QuantizationStrategy.TENSOR_GROUP.value
+            and weight_quant.symmetric
+            and weight_quant.group_size == 16
+            and weight_quant.type == QuantizationType.FLOAT
+            and weight_quant.num_bits == 4
         )
-        is_symmetric = weight_quant.symmetric and input_quant.symmetric
+        if not is_weight_match:
+            return False
 
-        is_group_size_16 = (
-            weight_quant.group_size == 16 and input_quant.group_size == 16
-        )
-        is_float_type = (
-            weight_quant.type == QuantizationType.FLOAT
-            and input_quant.type == QuantizationType.FLOAT
-        )
-        is_4_bits = weight_quant.num_bits == 4 and input_quant.num_bits == 4
+        if input_quant is None:
+            # Weight-only NVFP4 (W4A16): activation quantization stays dynamic.
+            return True
 
         return (
-            is_tensor_group_quant
-            and is_float_type
-            and is_4_bits
-            and is_group_size_16
-            and is_symmetric
+            input_quant.strategy == QuantizationStrategy.TENSOR_GROUP.value
+            and input_quant.symmetric
+            and input_quant.group_size == 16
+            and input_quant.type == QuantizationType.FLOAT
+            and input_quant.num_bits == 4
         )
 
     def _is_wNa16_group_channel(
@@ -608,11 +611,13 @@ class CompressedTensorsConfig(QuantizationConfig):
             or weight_quant.strategy == QuantizationStrategy.GROUP.value
         )
         is_static = not weight_quant.dynamic
+        is_integer = weight_quant.type != QuantizationType.FLOAT
 
         # Both symmetric and asymmetric weight quant are handled by
         # CompressedTensorsWNA16 via the Marlin kernel path; asymmetric
         # checkpoints carry a weight zero-point.
-        return is_channel_group and input_quant_none and is_static
+        # Float types (FP8 W8A16) are handled by later checks.
+        return is_channel_group and input_quant_none and is_static and is_integer
 
     def _is_wna16_triton_moe_supported(self, weight_quant: BaseModel) -> bool:
         return (

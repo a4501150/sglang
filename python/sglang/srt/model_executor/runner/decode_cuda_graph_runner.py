@@ -581,7 +581,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
-        return num_tokens if self.ragged_verify_mode else bs
+        # Spec verify packs captured_req_width rows per request; keying the
+        # graph by bs would cap the backend's output buffer at bs rows and
+        # clamp the extra logit rows.
+        if self.ragged_verify_mode or self.captured_req_width > 1:
+            return num_tokens
+        return bs
 
     def _global_num_tokens_for_graph(self, num_tokens: int) -> Optional[list[int]]:
         if self.require_mlp_tp_gather:
