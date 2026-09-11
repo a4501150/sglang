@@ -96,6 +96,13 @@ class RadixLinearAttention(nn.Module):
             return w.view(w.size(0), w.size(2))
         return src
 
+    @conv_weights.setter
+    def conv_weights(self, value):
+        # nn.Module rejects replacing a registered child with a tensor.
+        if "_conv_source" in self._modules:
+            delattr(self, "_conv_source")
+        self._conv_source = value
+
     def forward(
         self,
         forward_batch: ForwardBatch,

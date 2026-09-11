@@ -78,6 +78,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.validation_hook import (
         default_unset_prefill_decode_interval,
         validate_experimental_sgl_marlin,
+        validate_gdn_mtp_cache_mode,
         validate_prefill_decode_interval,
         validate_response_store,
         validate_sampling_mask_max_tokens,
@@ -287,6 +288,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
     run_hook(handle_speculative_decoding, server_args)
+
+    # Needs the draft-token count derived just above.
+    # GDN MTP none-mode cache: linear-chain only, and mutually exclusive
+    # with ReplaySSM.
+    validate_gdn_mtp_cache_mode(server_args)
 
     from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
 
