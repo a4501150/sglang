@@ -44,6 +44,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_sm120,
     is_xpu,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -100,6 +101,9 @@ _direct_default_tactic = None
 _prefer_direct = None
 _run_direct_dense = None
 _enable_bf16_splitk_gemm = False
+_sm120_lowm_bf16_gemm = None
+_use_sm120_lowm_bf16_gemm = None
+_enable_sm120_lowm_bf16_gemm = False
 
 # GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
 # Unlisted shapes, including M=64, retain the existing TGV/cuBLAS path.
@@ -210,6 +214,8 @@ def initialize_bf16_gemm_config() -> None:
     global _prefer_direct
     global _run_direct_dense
     global _enable_bf16_splitk_gemm
+    global _sm120_lowm_bf16_gemm, _use_sm120_lowm_bf16_gemm
+    global _enable_sm120_lowm_bf16_gemm
 
     backend_str = get_exec().kernel.bf16_gemm_backend
     if backend_str == "auto" and get_platform().is_sm100:
@@ -271,6 +277,22 @@ def initialize_bf16_gemm_config() -> None:
         _run_direct_dense = run_direct_dense
         _enable_bf16_splitk_gemm = True
 
+    _enable_sm120_lowm_bf16_gemm = False
+    if (
+        envs.SGLANG_ENABLE_SM120_LOWM_BF16_GEMM.get()
+        and is_sm120()
+        and not get_exec().deterministic.enable_deterministic_inference
+    ):
+        from sglang.kernels.ops.gemm.sm120_lowm_bf16_gemm import (
+            sm120_lowm_bf16_gemm,
+            use_sm120_lowm_bf16_gemm,
+        )
+
+        _sm120_lowm_bf16_gemm = sm120_lowm_bf16_gemm
+        _use_sm120_lowm_bf16_gemm = use_sm120_lowm_bf16_gemm
+        _enable_sm120_lowm_bf16_gemm = True
+        logger.info("SM120 low-M BF16 GEMM path enabled")
+
     _BF16_GEMM_BACKEND = backend
 
 
@@ -331,6 +353,14 @@ def _bf16_gemm_dispatch_impl(
         output = _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
             *x.shape[:-1], -1
         )
+    elif (
+        _enable_sm120_lowm_bf16_gemm
+        and _use_sm120_lowm_bf16_gemm is not None
+        and bias is None
+        and addend is None
+        and _use_sm120_lowm_bf16_gemm(m, weight.shape[0], weight.shape[1])
+    ):
+        return _sm120_lowm_bf16_gemm(x, weight)
     elif _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
         m, weight.shape[0], weight.shape[1]
     ):
@@ -496,6 +526,21 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 # keeping the per-shape kernel choice.
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
+
+        elif (
+            _enable_sm120_lowm_bf16_gemm
+            and bias is None
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and not layer.weight.requires_grad
+        ):
+            m = x.numel() // x.shape[-1]
+            if _use_sm120_lowm_bf16_gemm is not None and _use_sm120_lowm_bf16_gemm(
+                m, layer.weight.shape[0], layer.weight.shape[1]
+            ):
+                return _sm120_lowm_bf16_gemm(x, layer.weight)
+            return F.linear(x, layer.weight, bias)
 
         return F.linear(x, layer.weight, bias)
 

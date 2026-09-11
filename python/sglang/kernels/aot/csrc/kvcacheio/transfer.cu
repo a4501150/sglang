@@ -1115,6 +1115,35 @@ inline void transfer_kv_page_first_direct_impl(
     return;
   }
 
+  const int device_id = at::cuda::current_device();
+  // The host-pointer capability is static per device and can differ between
+  // GPUs, so cache one entry per device rather than re-querying on every
+  // transfer or collapsing to a single global bool. Function-local static
+  // initialization is thread-safe in C++11+ and queries each visible device
+  // exactly once; devices whose query fails (or that are out of range) keep
+  // the 0 entry and take the page-copy fallback.
+  static const std::vector<int> can_use_host_pointer_caps = [] {
+    std::vector<int> caps;
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0) {
+      caps.assign(device_count, 0);
+      for (int device = 0; device < device_count; ++device) {
+        int supported = 0;
+        if (cudaDeviceGetAttribute(
+                &supported, cudaDevAttrCanUseHostPointerForRegisteredMem, device) ==
+            cudaSuccess) {
+          caps[device] = supported;
+        }
+      }
+    }
+    return caps;
+  }();
+  if (device_id < 0 || device_id >= static_cast<int>(can_use_host_pointer_caps.size()) ||
+      can_use_host_pointer_caps[device_id] == 0) {
+    fallback_to_page_copy();
+    return;
+  }
+
   // Symbol gate: runtime may not expose cudaMemcpyBatchAsync in some environments.
   static void* cuda_memcpy_batch_async_sym = dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync");
   if (cuda_memcpy_batch_async_sym == nullptr) {
@@ -1145,7 +1174,6 @@ inline void transfer_kv_page_first_direct_impl(
   std::vector<size_t> batch_sizes;
   std::vector<size_t> attrs_idxs(1, 0);
   cudaMemcpyAttributes attrs{};
-  const int device_id = at::cuda::current_device();
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   auto append_copy = [&](void* src, void* dst, size_t size_bytes) {

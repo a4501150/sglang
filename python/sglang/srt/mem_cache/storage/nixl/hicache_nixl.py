@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
+    PoolTransferTarget,
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache
@@ -23,7 +24,11 @@ from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import HiCacheL3Cleaner
 
 from .nixl_registry import NixlRegistry
-from .nixl_utils import NixlBackendConfig, NixlBackendSelection, NixlFileManager
+from .nixl_utils import (
+    NixlBackendConfig,
+    NixlBackendSelection,
+    NixlFileManager,
+)
 
 try:
     from nixl._api import nixl_agent, nixl_agent_config, nixlBind
@@ -132,6 +137,34 @@ class HiCacheNixl(HiCacheStorage):
         self.backend_selector = NixlBackendSelection(plugin, nixlconfig)
         if not self.backend_selector.create_backend(self.agent):
             raise RuntimeError("Failed to create NIXL backend")
+        self._gds_compatibility_mode = nixlconfig.get_gds_compatibility_mode()
+        self._storage_mode = nixlconfig.get_storage_mode()
+        self._device_target_enabled = False
+        if self._storage_mode != "odirect" and self.backend_selector.mem_type == "FILE":
+            enabled = self.backend_selector.resolve_device_backend(self.agent)
+            if enabled:
+                # Host-mediated transfers still exist (prefetch staging and
+                # sidecar host pools) and cuFile cannot target DRAM, so the
+                # host path needs a DRAM-capable file backend next to GDS.
+                enabled = self.backend_selector.resolve_host_backend(self.agent)
+            if enabled and self._gds_compatibility_mode:
+                enabled = False
+                logger.warning(
+                    "NIXL GDS backend reports cuFile compatibility mode; the "
+                    "device target is disabled."
+                )
+            if self._storage_mode == "gds" and not enabled:
+                raise RuntimeError(
+                    "storage_mode=gds requires a usable GDS or GDS_MT NIXL "
+                    "plugin without cuFile compatibility mode."
+                )
+            self._device_target_enabled = enabled
+        logger.info(
+            "HiCacheNixl storage mode %s resolved: host backend %s, device backend %s.",
+            self._storage_mode,
+            self.backend_selector.backend_name,
+            self.backend_selector.device_backend_name,
+        )
 
         self.registry = NixlRegistry(
             self.agent,
@@ -159,6 +192,11 @@ class HiCacheNixl(HiCacheStorage):
         self._logical_anchor = False
         self._hybrid_pool_ctx: dict[PoolName, _HybridPoolContext] = {}
         self.registered_pools: dict[PoolName, HostKVCache] = {}
+        self._device_regs: List[Any] = []
+        self.registered_device_pools: dict[PoolName, Any] = {}
+        # VRAM addresses already registered; a pool exposed under two names
+        # (e.g. KV and INDEXER on one QSA pool) must not register twice.
+        self._device_reg_addrs: set[int] = set()
         cleanup_dirs = (
             self.file_manager.iter_all_base_dirs()
             if self.file_manager is not None
@@ -272,31 +310,27 @@ class HiCacheNixl(HiCacheStorage):
 
     def _xfer_pre_registered(
         self,
-        host_buffers: List[tuple],
+        local_buffers: List[tuple],
         keys: List[str],
         direction: str,
+        local_mem_type: str = "DRAM",
     ) -> bool:
-        """Run a transfer where the host side is already pre-registered.
-
-        ``host_buffers`` is a list of ``(addr, size)`` tuples within the
-        pre-registered host region (kv_buffer for zero-copy, bounce buffer
-        otherwise). Only the storage side is registered per transfer.
-        """
-        if len(host_buffers) != len(keys):
-            logger.error("Mismatch between number of host buffers and keys")
+        """Run a transfer where the local side is already registered."""
+        if len(local_buffers) != len(keys):
+            logger.error("Mismatch between number of local buffers and keys")
             return False
 
-        host_descs = self.agent.get_xfer_descs(
-            [(addr, size, 0) for (addr, size) in host_buffers], "DRAM"
+        local_descs = self.agent.get_xfer_descs(
+            [(addr, size, 0) for (addr, size) in local_buffers], local_mem_type
         )
-        if host_descs is None:
-            logger.error("Failed to build host xfer descs")
+        if local_descs is None:
+            logger.error("Failed to build %s xfer descs", local_mem_type)
             return False
 
-        with self.registry.storage(host_buffers, keys, direction) as storage_descs:
+        with self.registry.storage(local_buffers, keys, direction) as storage_descs:
             if storage_descs is None:
                 return False
-            return self._xfer_and_wait(host_descs, storage_descs, direction)
+            return self._xfer_and_wait(local_descs, storage_descs, direction)
 
     def get(
         self,
@@ -448,6 +482,134 @@ class HiCacheNixl(HiCacheStorage):
             "HiCacheNixl: registered hybrid host pool %s zero_copy=%s",
             host_pool_name,
             is_zero_copy,
+        )
+
+    def _validate_device_target(self) -> None:
+        self.backend_selector.validate_device_target()
+        if self._gds_compatibility_mode:
+            raise RuntimeError(
+                "HiCacheNixl device target rejects cuFile compatibility mode."
+            )
+
+    @property
+    def supports_device_target(self) -> bool:
+        if getattr(self, "_storage_mode", "auto") == "odirect":
+            return False
+        if not getattr(self, "_device_target_enabled", False):
+            return False
+        try:
+            self._validate_device_target()
+        except RuntimeError:
+            return False
+        return True
+
+    def register_mem_device_pool_v2(self, device_pool: Any, device_pool_name: PoolName):
+        self._validate_device_target()
+        existing = self.registered_device_pools.get(device_pool_name)
+        if existing is device_pool:
+            return
+        if existing is not None:
+            raise ValueError(
+                f"HiCacheNixl device pool {device_pool_name} is already registered."
+            )
+        get_tensors = getattr(device_pool, "get_hicache_transfer_tensors", None)
+        if not callable(get_tensors):
+            raise ValueError(
+                f"HiCacheNixl device pool {device_pool_name} lacks "
+                "get_hicache_transfer_tensors()."
+            )
+        tensors = list(get_tensors())
+        if not tensors:
+            raise ValueError(
+                f"HiCacheNixl device pool {device_pool_name} has no transfer tensors."
+            )
+        for index, tensor in enumerate(tensors):
+            if not tensor.is_cuda:
+                raise ValueError(
+                    f"HiCacheNixl device pool {device_pool_name} tensor {index} is not CUDA memory."
+                )
+            addr = tensor.data_ptr()
+            if addr in self._device_reg_addrs:
+                continue
+            self._device_reg_addrs.add(addr)
+            self._pre_register_device(
+                addr,
+                tensor.numel() * tensor.element_size(),
+                f"{device_pool_name}_buffer_{index}",
+            )
+        super().register_mem_device_pool_v2(device_pool, device_pool_name)
+
+    def _get_device_component_keys(
+        self, keys: List[str], pool_name: PoolName, component_names: List[str]
+    ) -> List[str]:
+        if pool_name == PoolName.KV:
+            return [
+                f"{self._get_suffixed_key(key)}_{component}"
+                for key in keys
+                for component in component_names
+            ]
+        return [
+            f"{self._get_suffixed_key(key)}_{pool_name}_{component}"
+            for key in keys
+            for component in component_names
+        ]
+
+    def _prepare_device_transfer(
+        self, transfer: PoolTransfer
+    ) -> tuple[List[str], List[tuple], int]:
+        self._validate_device_target()
+        target_pool = transfer.target_pool
+        target_indices = transfer.target_indices
+        keys = transfer.keys or []
+        if target_pool is None or target_indices is None:
+            logger.error(
+                "HiCacheNixl device transfer %s has no target pool or indices",
+                transfer.name,
+            )
+            return [], [], 0
+        if self.registered_device_pools.get(transfer.name) is not target_pool:
+            logger.error("HiCacheNixl device pool %s is not registered", transfer.name)
+            return [], [], 0
+        if target_indices.is_cuda:
+            raise ValueError(
+                "HiCacheNixl device transfer indices must be on CPU for descriptor construction."
+            )
+        page_size = getattr(target_pool, "page_size", 1) or 1
+        if target_indices.numel() != len(keys) * page_size:
+            logger.error(
+                "Device pool %s indices length mismatch: expected %s, got %s",
+                transfer.name,
+                len(keys) * page_size,
+                target_indices.numel(),
+            )
+            return [], [], 0
+        get_segments = getattr(target_pool, "get_hicache_page_segments", None)
+        if not callable(get_segments):
+            raise ValueError(
+                f"HiCacheNixl device pool {transfer.name} lacks "
+                "get_hicache_page_segments()."
+            )
+        segments = list(get_segments(target_indices))
+        if not keys or not segments or len(segments) % len(keys):
+            logger.error(
+                "HiCacheNixl device transfer %s returned invalid page segments",
+                transfer.name,
+            )
+            return [], [], 0
+        component_count = len(segments) // len(keys)
+        component_names = [name for name, _, _ in segments[:component_count]]
+        for page_offset in range(0, len(segments), component_count):
+            if [
+                name
+                for name, _, _ in segments[page_offset : page_offset + component_count]
+            ] != component_names:
+                raise ValueError(
+                    f"HiCacheNixl device pool {transfer.name} changed component order between pages."
+                )
+        return (
+            self._get_device_component_keys(keys, transfer.name, component_names),
+            [(address, size) for _, address, size in segments],
+            component_count,
         )
 
     def _hybrid_pool_supports_zero_copy(
@@ -606,6 +768,15 @@ class HiCacheNixl(HiCacheStorage):
         except Exception as e:
             raise RuntimeError(f"Failed to pre-register host {kind} with NIXL") from e
 
+    def _pre_register_device(self, base_addr: int, total_size: int, kind: str) -> None:
+        reg_descs = self.agent.get_reg_descs([(base_addr, total_size, 0, "")], "VRAM")
+        if reg_descs is None:
+            raise RuntimeError(f"Failed to build reg descs for device {kind}")
+        try:
+            self._device_regs.append(self.agent.register_memory(reg_descs))
+        except Exception as e:
+            raise RuntimeError(f"Failed to pre-register device {kind} with NIXL") from e
+
     def clear(self) -> None:
         if self.file_manager is None:
             return
@@ -625,6 +796,14 @@ class HiCacheNixl(HiCacheStorage):
         self._bounce_get = None
         self._bounce_page_bytes = None
         self._hybrid_pool_ctx.clear()
+        while self._device_regs:
+            reg = self._device_regs.pop()
+            try:
+                self.agent.deregister_memory(reg)
+            except Exception as e:
+                logger.debug("deregister of pre-registered device region failed: %s", e)
+        self.registered_device_pools.clear()
+        self._device_reg_addrs.clear()
 
     def __del__(self):
         try:
@@ -747,29 +926,28 @@ class HiCacheNixl(HiCacheStorage):
         self,
         keys: List[str],
         key_strs: List[str],
-        host_buffers: List[tuple],
+        local_buffers: List[tuple],
         direction: str,
+        local_mem_type: str = "DRAM",
     ) -> List[bool]:
-        """Run a batch READ or WRITE for the v1 path against the pre-registered
-        host region (no per-transfer host registration).
-        """
-        if not key_strs or not host_buffers:
+        """Run a batch READ or WRITE against a pre-registered local region."""
+        if not key_strs or not local_buffers:
             return [False] * len(keys)
 
-        if len(key_strs) != len(host_buffers):
-            logger.error("Mismatch between number of key_strs and host_buffers")
+        if len(key_strs) != len(local_buffers):
+            logger.error("Mismatch between number of key_strs and local buffers")
             return [False] * len(keys)
 
         if self.backend_selector.mem_type == "FILE":
             file_paths = [self.file_manager.get_file_path(key) for key in key_strs]
-            success = self._xfer_pre_registered(host_buffers, file_paths, direction)
+            success = self._xfer_pre_registered(
+                local_buffers, file_paths, direction, local_mem_type
+            )
         else:  # mem_type == "OBJ"
-            success = self._xfer_pre_registered(host_buffers, key_strs, direction)
+            success = self._xfer_pre_registered(
+                local_buffers, key_strs, direction, local_mem_type
+            )
 
-        # READ results are consumed by _batch_get_postprocess, which pairs
-        # entries 2*i / 2*i+1 for non-MLA zero-copy: it needs one bool per
-        # key_str (i.e. per `_k`/`_v` buffer). WRITE results map 1:1 to
-        # pages, i.e. to `keys`.
         result_len = len(key_strs) if direction == "READ" else len(keys)
         return [success] * result_len
 
@@ -950,6 +1128,25 @@ class HiCacheNixl(HiCacheStorage):
     ) -> dict[str, List[bool]]:
         results: dict[str, List[bool]] = {}
         for transfer in transfers:
+            if transfer.target == PoolTransferTarget.DEVICE:
+                key_strs, device_buffers, key_multiplier = (
+                    self._prepare_device_transfer(transfer)
+                )
+                if not key_strs:
+                    results[transfer.name] = [False] * len(transfer.keys or [])
+                    continue
+                transfer_results = self._batch_xfer(
+                    key_strs,
+                    key_strs,
+                    device_buffers,
+                    "READ",
+                    local_mem_type="VRAM",
+                )
+                results[transfer.name] = self._page_results(
+                    transfer_results, key_multiplier
+                )
+                continue
+
             host_pool, key_strs, host_buffers, page_offsets, key_multiplier = (
                 self._prepare_pool_transfer(transfer, for_write=False)
             )
@@ -988,6 +1185,25 @@ class HiCacheNixl(HiCacheStorage):
     ) -> dict[str, List[bool]]:
         results: dict[str, List[bool]] = {}
         for transfer in transfers:
+            if transfer.target == PoolTransferTarget.DEVICE:
+                key_strs, device_buffers, key_multiplier = (
+                    self._prepare_device_transfer(transfer)
+                )
+                if not key_strs:
+                    results[transfer.name] = [False] * len(transfer.keys or [])
+                    continue
+                transfer_results = self._batch_xfer(
+                    key_strs,
+                    key_strs,
+                    device_buffers,
+                    "WRITE",
+                    local_mem_type="VRAM",
+                )
+                results[transfer.name] = self._page_results(
+                    transfer_results, key_multiplier
+                )
+                continue
+
             _, key_strs, host_buffers, _, key_multiplier = self._prepare_pool_transfer(
                 transfer, for_write=True
             )

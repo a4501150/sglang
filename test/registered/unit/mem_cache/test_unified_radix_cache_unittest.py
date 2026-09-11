@@ -9875,6 +9875,12 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         operation.handle = CacheRequestHandle("req", 0)
         operation.request_id = "req"
         operation.completed_tokens = 8
+        operation.host_indices = list(range(100, 108))
+        operation.device_indices = None
+        operation.hash_value = [f"h{i}" for i in range(8)]
+        operation.pool_storage_result = None
+        operation.storage_start = 0
+        operation.is_terminated.return_value = False
         cache.ongoing_prefetch = {
             operation.handle: _OngoingPrefetch(
                 7,
@@ -10047,6 +10053,7 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         }
 
         operation = mock.Mock()
+        operation.device_indices = None
         operation.host_indices = host_indices
         operation.completed_tokens = completed_tokens
         operation.pool_storage_result = PoolTransferResult(
@@ -10947,6 +10954,92 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         req.finished_reason = FINISH_ABORT()
         self.assertTrue(cache.session.try_cache_finished_req(req))
         cache.sanity_check()
+
+
+class TestHiCacheStorageShutdown(CustomTestCase):
+    def _assert_backup_queue_drained(self, controller_cls):
+        import threading
+        from queue import Queue
+
+        controller = controller_cls.__new__(controller_cls)
+        controller.storage_stop_event = threading.Event()
+        controller.backup_queue = Queue()
+        controller.ack_backup_queue = Queue()
+        controller.backup_skip = False
+        completed = []
+        controller._page_backup = completed.append
+
+        operations = [mock.Mock(), mock.Mock()]
+        for operation in operations:
+            controller.backup_queue.put(operation)
+        controller.storage_stop_event.set()
+        controller.backup_queue.put(None)
+
+        worker = threading.Thread(target=controller.backup_thread_func)
+        worker.start()
+        worker.join(timeout=1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(completed, operations)
+        self.assertEqual(
+            [controller.ack_backup_queue.get_nowait() for _ in operations], operations
+        )
+
+    def test_base_backup_worker_drains_fifo_on_shutdown(self):
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        self._assert_backup_queue_drained(HiCacheController)
+
+    def test_hybrid_backup_worker_drains_fifo_on_shutdown(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        self._assert_backup_queue_drained(HybridCacheController)
+
+    def test_detach_drains_shutdown_acks_before_fallback_release(self):
+        cache = mock.Mock()
+        controller = cache.cache_controller
+        attachment = StorageAttachment.__new__(StorageAttachment)
+        attachment._cache = cache
+        order = []
+
+        cache.drain_storage_control_queues_local.side_effect = lambda: order.append(
+            "drain"
+        )
+        controller.detach_storage_backend.side_effect = lambda: order.append("stop")
+        attachment._release_pending_storage_ops = mock.Mock(
+            side_effect=lambda: order.append("release")
+        )
+
+        ok, _ = attachment.detach()
+
+        self.assertTrue(ok)
+        self.assertEqual(order, ["drain", "stop", "drain", "release", "drain"])
+
+    def test_host_pool_is_destroyed_after_storage_shutdown(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        order = []
+        cache.shutdown = mock.Mock(side_effect=lambda: order.append("shutdown") or True)
+        cache.linker = mock.Mock()
+        cache.linker.close.side_effect = lambda: order.append("linker")
+        cache.host_pool_group = mock.Mock()
+        cache.host_pool_group.destroy.side_effect = lambda: order.append("pool")
+
+        UnifiedRadixCache.release_host_resources(cache)
+
+        self.assertEqual(order, ["shutdown", "linker", "pool"])
+
+    def test_live_storage_worker_blocks_host_pool_destruction(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.shutdown = mock.Mock(return_value=False)
+        cache.linker = None
+        cache.host_pool_group = mock.Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "storage threads"):
+            UnifiedRadixCache.release_host_resources(cache)
+
+        cache.host_pool_group.destroy.assert_not_called()
 
 
 if __name__ == "__main__":

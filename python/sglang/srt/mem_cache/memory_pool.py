@@ -1144,6 +1144,89 @@ class MambaPool:
         for sibling in self._slot_siblings:
             yield from sibling.iter_transfer_state_entries()
 
+    def _iter_transfer_state_tensors(self):
+        """Yield transferable whole state tensors with their per-slot slice axis.
+
+        HiCache GDS addresses whole per-layer-stack buffers and expands layers
+        itself; the PD path uses the layer-flattened ``_iter_transfer_state_entries``.
+        """
+        for field, value in vars(self.mamba_cache).items():
+            if field in self._NON_TRANSFER_STATE_FIELDS or value is None:
+                continue
+            tensors = value if isinstance(value, list) else [value]
+            slice_axis = self.conv_slice_axis if field == "conv" else 0
+            for state_tensor in tensors:
+                # A ShortConv layer has no temporal state, so that buffer is
+                # empty. Advertising it fails the whole batch registration.
+                if state_tensor.numel() == 0:
+                    continue
+                yield field, state_tensor, slice_axis
+
+    def _hicache_transfer_components(self):
+        components = []
+        field_counts = {}
+        for field, tensor, _ in self._iter_transfer_state_tensors():
+            tensor_index = field_counts.get(field, 0)
+            field_counts[field] = tensor_index + 1
+            if not tensor.is_contiguous():
+                raise ValueError(
+                    f"HiCache GDS does not support noncontiguous Mamba {field} tensors."
+                )
+            for layer_offset, layer_id in enumerate(self.mamba_layer_ids):
+                components.append(
+                    (f"{field}_{tensor_index}_{layer_id}", tensor, 1, layer_offset)
+                )
+        for sibling in self._slot_siblings:
+            for name, tensor, slot_axis in sibling.get_storage_tensors():
+                if not tensor.is_contiguous():
+                    raise ValueError(
+                        f"HiCache GDS does not support noncontiguous Mamba {name} tensors."
+                    )
+                prefix_shape = tensor.shape[:slot_axis]
+                prefix_count = math.prod(prefix_shape) if prefix_shape else 1
+                for prefix_index in range(prefix_count):
+                    component_name = (
+                        f"{name}_{prefix_index}" if prefix_count > 1 else name
+                    )
+                    components.append((component_name, tensor, slot_axis, prefix_index))
+        return components
+
+    def get_hicache_transfer_tensors(self):
+        tensors = []
+        seen = set()
+        for _, tensor, _, _ in self._hicache_transfer_components():
+            if id(tensor) not in seen:
+                tensors.append(tensor)
+                seen.add(id(tensor))
+        return tensors
+
+    def get_hicache_page_segments(self, target_indices: torch.Tensor):
+        if target_indices.is_cuda:
+            raise ValueError("HiCache GDS Mamba indices must stay on CPU.")
+        components = self._hicache_transfer_components()
+        segments = []
+        for slot in target_indices.tolist():
+            if slot < 0:
+                raise ValueError(f"HiCache GDS Mamba slot {slot} is negative.")
+            for name, tensor, slot_axis, prefix_index in components:
+                if slot >= tensor.shape[slot_axis]:
+                    raise ValueError(
+                        f"HiCache GDS Mamba slot {slot} exceeds {name} capacity."
+                    )
+                suffix_shape = tensor.shape[slot_axis + 1 :]
+                row_numel = math.prod(suffix_shape) if suffix_shape else 1
+                row_bytes = row_numel * tensor.element_size()
+                prefix_offset = prefix_index * tensor.stride(slot_axis - 1)
+                element_offset = prefix_offset + slot * tensor.stride(slot_axis)
+                segments.append(
+                    (
+                        name,
+                        tensor.data_ptr() + element_offset * tensor.element_size(),
+                        row_bytes,
+                    )
+                )
+        return segments
+
     def get_contiguous_buf_infos(self):
         """Get transferable state buffer information for RDMA registration."""
         data_ptrs, data_lens, item_lens = [], [], []
@@ -1218,7 +1301,12 @@ class MambaPool:
         return subdims_per_tensor
 
     def get_kv_size_bytes(self):
-        return self.mamba_cache.mem_usage_bytes()
+        sibling_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for sibling in self._slot_siblings
+            for _, tensor, _ in sibling.get_storage_tensors()
+        )
+        return self.mamba_cache.mem_usage_bytes() + sibling_bytes
 
 
 class HybridReqToTokenPool(ReqToTokenPool):
@@ -1546,7 +1634,20 @@ class HybridReqToTokenPool(ReqToTokenPool):
         return self.short_conv_pool.layer_intermediate_cache(layer_id)
 
     def get_ngram_context(self, ngram_indices: torch.Tensor) -> torch.Tensor:
+        # HiCache restores slot-indexed PLE state on the same H->D stream as
+        # Mamba, before recording the first layer-done event.  PLE builds its
+        # shared N-gram batch before entering any decoder layer, so it cannot
+        # rely on short_conv_layer_cache()'s per-layer wait to order this read.
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(0)
         return self.ngram_pool.get_context(ngram_indices)
+
+    def wait_for_hicache_load_complete(self) -> None:
+        """Order whole-slot consumers after an active layerwise H->D load."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(
+                self.layer_transfer_counter.num_layers - 1
+            )
 
     def set_ngram_context(
         self, ngram_indices: torch.Tensor, context: torch.Tensor
@@ -2464,6 +2565,78 @@ class MHATokenToKVPool(KVCache):
         """Buffers to register for PD KV transfer, in ``_kv_buffer_descs`` order.
         Override when the registerable storage differs from k/v_buffer."""
         return self.k_buffer + self.v_buffer
+
+    def _hicache_transfer_components(self):
+        components = [
+            (f"k_{index}", tensor) for index, tensor in enumerate(self.k_buffer)
+        ]
+        components.extend(
+            (f"v_{index}", tensor) for index, tensor in enumerate(self.v_buffer)
+        )
+        if getattr(self, "k_scale_buffer", None) is not None:
+            components.extend(
+                (f"k_scale_{index}", tensor)
+                for index, tensor in enumerate(self.k_scale_buffer)
+            )
+            components.extend(
+                (f"v_scale_{index}", tensor)
+                for index, tensor in enumerate(self.v_scale_buffer)
+            )
+        for name, tensor in components:
+            if not tensor.is_contiguous():
+                raise ValueError(
+                    f"HiCache GDS does not support noncontiguous MHA tensor {name}."
+                )
+        return components
+
+    def get_hicache_transfer_tensors(self):
+        return [tensor for _, tensor in self._hicache_transfer_components()]
+
+    def get_hicache_page_segments(self, target_indices: torch.Tensor):
+        if target_indices.is_cuda:
+            raise ValueError("HiCache GDS KV indices must stay on CPU.")
+        if target_indices.numel() % self.page_size:
+            raise ValueError("HiCache GDS KV indices must contain complete pages.")
+
+        components = self._hicache_transfer_components()
+        total_slots = self.size + self.page_size
+        component_layouts = []
+        for name, tensor in components:
+            if tensor.shape[0] == total_slots:
+                tokens_per_row = 1
+            elif tensor.shape[0] * self.page_size == total_slots:
+                tokens_per_row = self.page_size
+            else:
+                raise ValueError(
+                    f"HiCache GDS cannot map MHA tensor {name} shape {tuple(tensor.shape)} to pages."
+                )
+            row_bytes = math.prod(tensor.shape[1:]) * tensor.element_size()
+            component_layouts.append((name, tensor, tokens_per_row, row_bytes))
+
+        indices = target_indices.tolist()
+        segments = []
+        for offset in range(0, len(indices), self.page_size):
+            page_indices = indices[offset : offset + self.page_size]
+            first = page_indices[0]
+            if first < 0 or first % self.page_size:
+                raise ValueError(f"HiCache GDS KV page starts at invalid slot {first}.")
+            if page_indices != list(range(first, first + self.page_size)):
+                raise ValueError("HiCache GDS KV page indices must be contiguous.")
+            for name, tensor, tokens_per_row, row_bytes in component_layouts:
+                row = first // tokens_per_row
+                row_count = self.page_size // tokens_per_row
+                if row + row_count > tensor.shape[0]:
+                    raise ValueError(
+                        f"HiCache GDS KV page at slot {first} exceeds {name} capacity."
+                    )
+                segments.append(
+                    (
+                        name,
+                        tensor.data_ptr() + row * row_bytes,
+                        row_count * row_bytes,
+                    )
+                )
+        return segments
 
     def get_contiguous_buf_infos(self):
         """(ptrs, lens, item_lens) for PD KV transfer, derived from the descriptors.
@@ -5149,6 +5322,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
             ) % self._compress_tail_k[idx].shape[1]
             self._compress_tail_k[idx][req_pool_idx, slots] = key_tail
             self._compress_tail_score[idx][req_pool_idx, slots] = score_tail
+
+    def get_hicache_indexer_page_buffers(self) -> List[torch.Tensor]:
+        return self.index_k_with_scale_buffer
 
     def _clear_buffers(self):
         super()._clear_buffers()

@@ -105,6 +105,9 @@ class StorageBackupSpec(NamedTuple):
     hash_value: list[str]
     prefix_keys: Optional[list[str]]
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
+    # VRAM slots backing this node while it is still resident in L1. A
+    # device-direct storage backup reads them and skips the L2 payload copy.
+    device_value: Optional[torch.Tensor] = None
 
 
 class UnifiedTreeNode:
@@ -2200,6 +2203,67 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.kv_events.record_store(new_node, medium=StorageMedium.CPU)
         return result
 
+    #: Only the Python tree core can splice device-resident paths
+    #: (``insert_device``); the Rust core keeps prefetches on the host path.
+    supports_device_insert = True
+
+    def insert_device(
+        self,
+        node_id: NodeId,
+        key: RadixKey,
+        device_value: torch.Tensor,
+        hash_value: list[str],
+    ) -> InsertResult:
+        """Insert a device-resident tree path descending from the given node.
+
+        Used by device-direct (GDS) prefetch splices: the payload lands in
+        VRAM slots the caller allocated and never touches host pages. The
+        walked prefix duplicates live tree data and the caller frees it;
+        a new leaf adopts the suffix slots and gets a write-through backup
+        action. The Python TreeCore only; FULL component (KV + KV-derived
+        sidecars) trees."""
+        node = self.node_by_id(node_id)
+        total_len = len(key)
+        self._touch_node(node)
+        if total_len == 0:
+            return InsertResult(prefix_len=0, mamba_exist=True)
+
+        child_key = key.child_key(self.page_size)
+        matched_length = 0
+        cache_actions: list[CacheAction | ComponentAction] = []
+        while len(key) > 0 and child_key in node.children:
+            node = node.children[child_key]
+            self._touch_node(node)
+            prefix_len = node.key.match(key, page_size=self.page_size)
+            if prefix_len < len(node.key):
+                node, action = self._split_node(node.key, node, prefix_len)
+                if action is not None:
+                    cache_actions.append(action)
+
+            key = key[prefix_len:]
+            device_value = device_value[prefix_len:]
+            hash_value = hash_value[prefix_len // self.page_size :]
+            matched_length += prefix_len
+
+            if len(key):
+                child_key = key.child_key(self.page_size)
+
+        result = InsertResult(
+            prefix_len=matched_length,
+            total_len=total_len,
+            cache_actions=cache_actions,
+        )
+        result.last_device_node = node.id
+        if len(key) == 0:
+            return result
+
+        new_node = self._add_new_node(node, key, device_value, priority=node.priority)
+        new_node.hash_value = hash_value
+        cache_actions.append(self._build_backup_kv_action(new_node))
+        result.inserted_host_node = new_node.id
+        result.last_device_node = new_node.id
+        return result
+
     def build_backup_spec(self, node_id: NodeId):
         """Read a node's device->host backup spec (device value + component transfers) now."""
         return self._build_backup_spec(self.node_by_id(node_id))
@@ -2244,6 +2308,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 comp_xfers[comp.component_type] = transfers
         return StorageBackupSpec(
             host_value=node.component_data[BASE_COMPONENT_TYPE].host_value,
+            device_value=node.component_data[BASE_COMPONENT_TYPE].value,
             token_ids=node.key.token_ids,
             hash_value=node.hash_value,
             prefix_keys=prefix_keys,

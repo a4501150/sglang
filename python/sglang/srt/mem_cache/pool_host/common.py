@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import os
 from collections import defaultdict
-from functools import lru_cache
+from functools import cache, lru_cache
 
 import torch
 
@@ -18,6 +19,111 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
 _CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
+_CUDA_DEV_ATTR_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM = 91
+
+
+@cache
+def can_use_host_pointer_for_registered_mem(device_id: int) -> bool:
+    """Whether CUDA hands back the same device pointer for registered host
+    memory (needed by the direct page-first kernel path). Returns False —
+    safe async-DMA fallback — on HIP or any runtime where the query is
+    unavailable, and never raises."""
+    if _is_hip or not torch.cuda.is_available():
+        return False
+    try:
+        value = ctypes.c_int()
+        result = int(
+            torch.cuda.cudart().cudaDeviceGetAttribute(
+                ctypes.byref(value),
+                _CUDA_DEV_ATTR_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM,
+                device_id,
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not query CUDA registered-host pointer capability (%s); "
+            "HiCache page-first transfers will use asynchronous DMA copies.",
+            exc,
+        )
+        return False
+    supported = result == 0 and value.value != 0
+    if not supported:
+        logger.warning(
+            "CUDA reports distinct registered-host pointer aliases; HiCache "
+            "page-first transfers will use asynchronous DMA copies."
+        )
+    return supported
+
+
+def transfer_kv_all_layer_direct_lf_pf(
+    src_ptrs: list[torch.Tensor],
+    dst_ptrs: list[torch.Tensor],
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    if can_use_host_pointer_for_registered_mem(torch.cuda.current_device()):
+        from sgl_kernel.kvcacheio import transfer_kv_all_layer_direct_lf_pf as transfer
+
+        transfer(src_ptrs, dst_ptrs, src_indices, dst_indices, page_size)
+        return
+
+    src_indices_cpu = src_indices.cpu()
+    dst_indices_cpu = dst_indices.cpu()
+    num_pages = src_indices_cpu.numel() // page_size
+    is_mla = len(dst_ptrs) == 1
+    num_layers = len(src_ptrs) if is_mla else len(src_ptrs) // 2
+    for page_offset in range(num_pages):
+        index_offset = page_offset * page_size
+        src_index = int(src_indices_cpu[index_offset])
+        dst_page = int(dst_indices_cpu[index_offset]) // page_size
+        for layer_id in range(num_layers):
+            dst_ptrs[0][dst_page, layer_id].copy_(
+                src_ptrs[layer_id][src_index : src_index + page_size],
+                non_blocking=True,
+            )
+            if not is_mla:
+                dst_ptrs[1][dst_page, layer_id].copy_(
+                    src_ptrs[layer_id + num_layers][src_index : src_index + page_size],
+                    non_blocking=True,
+                )
+
+
+def transfer_kv_per_layer_direct_pf_lf(
+    src_ptrs: list[torch.Tensor],
+    dst_ptrs: list[torch.Tensor],
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    page_size: int,
+) -> None:
+    if can_use_host_pointer_for_registered_mem(torch.cuda.current_device()):
+        from sgl_kernel.kvcacheio import transfer_kv_per_layer_direct_pf_lf as transfer
+
+        transfer(src_ptrs, dst_ptrs, src_indices, dst_indices, layer_id, page_size)
+        return
+
+    src_indices_cpu = src_indices.cpu()
+    dst_indices_cpu = dst_indices.cpu()
+    num_pages = src_indices_cpu.numel() // page_size
+    is_mla = len(src_ptrs) == 1
+    num_layers = len(dst_ptrs) if is_mla else len(dst_ptrs) // 2
+    for page_offset in range(num_pages):
+        index_offset = page_offset * page_size
+        src_page = int(src_indices_cpu[index_offset]) // page_size
+        dst_index = int(dst_indices_cpu[index_offset])
+        for layer_offset in range(num_layers):
+            dst_ptrs[layer_offset][dst_index : dst_index + page_size].copy_(
+                src_ptrs[0][src_page, layer_id + layer_offset],
+                non_blocking=True,
+            )
+            if not is_mla:
+                dst_ptrs[layer_offset + num_layers][
+                    dst_index : dst_index + page_size
+                ].copy_(
+                    src_ptrs[1][src_page, layer_id + layer_offset],
+                    non_blocking=True,
+                )
 
 
 class HostTensorAllocator:

@@ -395,6 +395,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             self._binding.empty_match_result()
         )
 
+    # Device-direct prefetch splice (insert_device) is Python-core only; the
+    # controller checks this and keeps the host path for the Rust core.
+    supports_device_insert = False
+
     def node_by_id(self, node_id: NodeId) -> UnifiedTreeNode:
         # TODO(Jialin): Move the remaining Python-node consumers to
         # backend-neutral APIs: sessions (#29173), C128 (#33676).
@@ -422,6 +426,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         raise NotImplementedError(
             "attach_swa_window: buffer-mode SWA window repair is not yet "
             "ported to the Rust tree core"
+        )
+
+    def insert_device(self, *args, **kwargs) -> InsertResult:
+        raise NotImplementedError(
+            "insert_device: not yet ported to the Rust tree core "
+            "(device-direct prefetch requires the Python tree core)"
         )
 
     def inc_lock_ref(

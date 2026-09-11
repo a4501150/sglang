@@ -294,6 +294,7 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -3152,11 +3153,46 @@ class Scheduler(
                     if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
+                last_hash = tree_cache.get_last_hash_value(last_host_node)
+                if envs.SGLANG_HICACHE_FILE_BACKEND_LOG_PAGE_DIGESTS.get():
+                    full_hashes = get_hash_str(
+                        req.full_untruncated_fill_ids[:match_end],
+                        page_size=self.page_size,
+                    )
+                    anchor_page_count = matched_len // self.page_size
+                    expected_last_hash = (
+                        full_hashes[anchor_page_count - 1]
+                        if anchor_page_count > 0
+                        else None
+                    )
+                    requested_hashes = get_hash_str(
+                        new_input_tokens,
+                        last_hash,
+                        page_size=self.page_size,
+                    )
+                    logger.warning(
+                        "HiCache token-span anchor req=%s node=%s device_tokens=%d "
+                        "host_tokens=%d matched=%d aligned=%s match_end=%d "
+                        "last_hash=%s expected_last_hash=%s anchor_exact=%s "
+                        "requested_pages=%d expected_suffix_exact=%s",
+                        req.rid,
+                        last_host_node,
+                        len(req.prefix_indices),
+                        req.host_hit_length,
+                        matched_len,
+                        matched_len % self.page_size == 0,
+                        match_end,
+                        last_hash,
+                        expected_last_hash,
+                        last_hash == expected_last_hash,
+                        len(requested_hashes),
+                        requested_hashes == full_hashes[anchor_page_count:],
+                    )
                 return tree_cache.prefetch_from_storage(
                     req.cache_request_handle,
                     last_host_node,
                     new_input_tokens,
-                    tree_cache.get_last_hash_value(last_host_node),
+                    last_hash,
                     prefix_keys,
                     matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
                     extra_key=req.extra_key,

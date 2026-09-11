@@ -26,6 +26,47 @@ def _index_k_bytes(*, kv_heads: int, head_dim: int, dtype: torch.dtype) -> int:
     return kv_heads * head_dim * dtype.itemsize
 
 
+def _hicache_indexer_segments(
+    buffers: List[torch.Tensor], page_size: int, target_indices: torch.Tensor
+):
+    if target_indices.is_cuda:
+        raise ValueError("HiCache GDS indexer indices must stay on CPU.")
+    if target_indices.numel() % page_size:
+        raise ValueError("HiCache GDS indexer indices must contain complete pages.")
+    for index, buffer in enumerate(buffers):
+        if buffer.ndim != 2 or not buffer.is_contiguous():
+            raise ValueError(
+                f"HiCache GDS requires contiguous two-dimensional indexer buffer {index}."
+            )
+
+    indices = target_indices.tolist()
+    segments = []
+    for offset in range(0, len(indices), page_size):
+        page_indices = indices[offset : offset + page_size]
+        first = page_indices[0]
+        if first < 0 or first % page_size:
+            raise ValueError(
+                f"HiCache GDS indexer page starts at invalid slot {first}."
+            )
+        if page_indices != list(range(first, first + page_size)):
+            raise ValueError("HiCache GDS indexer page indices must be contiguous.")
+        page_index = first // page_size
+        for layer, buffer in enumerate(buffers):
+            if page_index >= buffer.shape[0]:
+                raise ValueError(
+                    f"HiCache GDS indexer page {page_index} exceeds layer {layer} capacity."
+                )
+            row_bytes = buffer.shape[1] * buffer.element_size()
+            segments.append(
+                (
+                    f"index_k_{layer}",
+                    buffer.data_ptr() + page_index * row_bytes,
+                    row_bytes,
+                )
+            )
+    return segments
+
+
 class QSATokenToKVPool(HybridLinearKVPool):
     """Hybrid KV pool with the minimal BF16 state required by simple QSA."""
 
@@ -213,9 +254,30 @@ class QSATokenToKVPool(HybridLinearKVPool):
         return self.qsa_rope_position_buffer[loc.long()]
 
     def get_qsa_compressed_k_buffer(self, layer_id: int) -> torch.Tensor:
+        self._wait_for_layer(layer_id)
         return self.qsa_compressed_k_buffer_pool[
             self._transfer_full_attention_id(layer_id)
         ]
+
+    def get_hicache_indexer_page_buffers(self) -> List[torch.Tensor]:
+        page_bytes = (
+            self.qsa_compressed_page_size
+            * self.qsa_index_kv_heads
+            * self.qsa_index_head_dim
+            * self.index_state_dtype.itemsize
+        )
+        return [
+            buffer.view(torch.uint8).reshape(-1, page_bytes)
+            for buffer in self.qsa_compressed_k_buffer_pool
+        ]
+
+    def get_hicache_transfer_tensors(self) -> List[torch.Tensor]:
+        return self.get_hicache_indexer_page_buffers()
+
+    def get_hicache_page_segments(self, target_indices: torch.Tensor):
+        return _hicache_indexer_segments(
+            self.get_hicache_indexer_page_buffers(), self.page_size, target_indices
+        )
 
     def set_qsa_compressed_k_buffer(
         self, layer_id: int, loc: torch.Tensor, compressed_k: torch.Tensor
@@ -283,3 +345,128 @@ class QSATokenToKVPool(HybridLinearKVPool):
             + self.qsa_rope_position_buffer.numel() * 8
         )
         return k_size + qsa_k_size, v_size
+
+
+class QwenDSATokenToKVPool(HybridLinearKVPool):
+    """Hybrid KV pool carrying the per-token index-K cache of tokenwise QSA:
+    a ``[size + page_size, index_kv_heads, index_head_dim]`` BF16 buffer per DSA layer,
+    addressed by raw KV slots; the FP8 deep_gemm layout is deliberately absent."""
+
+    index_state_dtype = torch.bfloat16
+
+    @classmethod
+    def qsa_bytes_per_token(
+        cls, *, kv_heads: int, head_dim: int, num_layers: int
+    ) -> int:
+        return (
+            _index_k_bytes(
+                kv_heads=kv_heads, head_dim=head_dim, dtype=cls.index_state_dtype
+            )
+            * num_layers
+        )
+
+    def __init__(
+        self,
+        *,
+        size: int,
+        dtype: torch.dtype,
+        page_size: int,
+        head_num: int,
+        head_dim: int,
+        full_attention_layer_ids: List[int],
+        device: str,
+        mamba_pool: MambaPool,
+        qsa_index_kv_heads: int,
+        qsa_index_head_dim: int,
+        qsa_token_budget: int,
+        enable_memory_saver: bool = False,
+        enable_kv_cache_copy: bool = False,
+        start_layer: Optional[int] = None,
+        full_kv_pool_class: Optional[type] = None,
+        quant_method=None,
+        post_capture_active: bool = False,
+    ):
+        if page_size != 64:
+            raise ValueError(
+                "tokenwise QSA requires KV-cache page_size 64 for its paged "
+                f"indexer buffer, got {page_size}"
+            )
+        self.dsa_index_k_buffer_pool = []
+        super().__init__(
+            size=size,
+            dtype=dtype,
+            page_size=page_size,
+            head_num=head_num,
+            head_dim=head_dim,
+            full_attention_layer_ids=full_attention_layer_ids,
+            device=device,
+            mamba_pool=mamba_pool,
+            enable_memory_saver=enable_memory_saver,
+            enable_kv_cache_copy=enable_kv_cache_copy,
+            use_mla=False,
+            start_layer=start_layer,
+            full_kv_pool_class=full_kv_pool_class,
+            quant_method=quant_method,
+            post_capture_active=post_capture_active,
+        )
+        if qsa_index_kv_heads != 1:
+            raise ValueError(
+                f"tokenwise QSA requires index_kv_heads = 1 (MQA), got "
+                f"{qsa_index_kv_heads}"
+            )
+        if min(qsa_index_kv_heads, qsa_index_head_dim, qsa_token_budget) <= 0:
+            raise ValueError("QSA cache configuration values must be positive")
+        self.qsa_compress_ratio = 1
+        self.qsa_index_kv_heads = int(qsa_index_kv_heads)
+        self.qsa_index_head_dim = int(qsa_index_head_dim)
+        self.qsa_token_topk = int(qsa_token_budget)
+        self.qsa_block_topk = int(qsa_token_budget)
+        state_size = size + page_size
+        self.dsa_index_k_buffer_pool = [
+            torch.zeros(
+                (state_size, self.qsa_index_kv_heads, self.qsa_index_head_dim),
+                dtype=self.index_state_dtype,
+                device=device,
+            )
+            for _ in full_attention_layer_ids
+        ]
+        k_size, v_size = self.get_kv_size_bytes()
+        self.mem_usage = (k_size + v_size) / GB
+
+    def set_dsa_index_k_buffer(
+        self, layer_id: int, loc: torch.Tensor, index_k: torch.Tensor
+    ) -> None:
+        buffer = self.get_dsa_index_k_buffer(layer_id)
+        buffer[loc.long()] = index_k.to(buffer.dtype)
+
+    def get_dsa_index_k_buffer(self, layer_id: int) -> torch.Tensor:
+        self._wait_for_layer(layer_id)
+        return self.dsa_index_k_buffer_pool[self._transfer_full_attention_id(layer_id)]
+
+    def get_hicache_indexer_page_buffers(self) -> List[torch.Tensor]:
+        page_bytes = (
+            self.page_size
+            * self.qsa_index_kv_heads
+            * self.qsa_index_head_dim
+            * self.index_state_dtype.itemsize
+        )
+        return [
+            buffer.view(torch.uint8).reshape(-1, page_bytes)
+            for buffer in self.dsa_index_k_buffer_pool
+        ]
+
+    def get_hicache_transfer_tensors(self) -> List[torch.Tensor]:
+        return self.get_hicache_indexer_page_buffers()
+
+    def get_hicache_page_segments(self, target_indices: torch.Tensor):
+        return _hicache_indexer_segments(
+            self.get_hicache_indexer_page_buffers(), self.page_size, target_indices
+        )
+
+    def get_kv_size_bytes(self):
+        k_size, v_size = super().get_kv_size_bytes()
+        dsa_k_size = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in self.dsa_index_k_buffer_pool
+        )
+        return k_size + dsa_k_size, v_size

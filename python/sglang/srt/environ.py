@@ -751,6 +751,13 @@ class Envs:
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
+    # HiCacheFile page I/O mode: "buffered" (default; OS page cache path) or
+    # "direct" (positional O_DIRECT preadv/pwritev straight on host pool pages
+    # via get_page_buffer_meta). Direct is strict: it fails clearly when
+    # O_DIRECT, aligned filesystem access, or host pool alignment is
+    # unavailable and never falls back silently.
+    SGLANG_HICACHE_FILE_BACKEND_IO_MODE = EnvStr("buffered")
+    SGLANG_HICACHE_FILE_BACKEND_LOG_PAGE_DIGESTS = EnvBool(False)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
     SGLANG_HICACHE_FILE_BACKEND_EVICTION_RATIO = EnvFloat(0.9)
@@ -1149,6 +1156,10 @@ class Envs:
     # Enable the allowlisted low-M BF16 Split-K GEMM path on Blackwell. Shapes
     # outside the measured allowlist continue to use CuTe DSL/cuBLAS.
     SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
+    # Route low-M BF16 GEMMs through the sm120-tuned Triton split-K kernel on
+    # SM120 GPUs, where cuBLAS picks ~20-70%-of-bandwidth WMMA kernels and the
+    # SM100 CuTe DSL/split-K paths cannot run (tcgen05).
+    SGLANG_ENABLE_SM120_LOWM_BF16_GEMM = EnvBool(True)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at

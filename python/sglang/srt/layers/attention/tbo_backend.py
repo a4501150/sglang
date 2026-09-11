@@ -10,6 +10,8 @@ from sglang.srt.layers.attention.base_attn_backend import (
 )
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 

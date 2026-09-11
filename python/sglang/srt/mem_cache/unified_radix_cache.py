@@ -153,6 +153,7 @@ class _OngoingPrefetch(NamedTuple):
 
     anchor_node_id: NodeId
     prefetch_key: RadixKey
+    # The allocated span; VRAM slots for device-direct (GDS) fetches.
     host_indices: torch.Tensor
     operation: PrefetchOperation
     anchor_lock_params: DecLockRefParams
@@ -387,7 +388,9 @@ class UnifiedRadixCache(BasePrefixCache):
             CacheRequestHandle, int
         ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
-        self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
+        self.ongoing_backup: dict[
+            int, tuple[NodeId, DecLockRefParams, Optional[DecLockRefParams]]
+        ] = {}
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
 
@@ -537,6 +540,15 @@ class UnifiedRadixCache(BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
+        if (
+            getattr(self, "cache_controller", None) is not None
+            and getattr(self, "buffer_pipeline", None) is None
+        ):
+            self.writing_check(write_back=True)
+        if not self.shutdown():
+            raise RuntimeError(
+                "HiCache storage threads are still using host resources."
+            )
         if self.linker is not None:
             self.linker.close()
         if self.host_pool_group is not None:
@@ -1898,16 +1910,32 @@ class UnifiedRadixCache(BasePrefixCache):
         aux_xfers = [x for xfers in spec.comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
 
+        device_indices = (
+            spec.device_value
+            if getattr(self.cache_controller, "storage_device_direct", False)
+            else None
+        )
         operation_id = self.cache_controller.write_storage(
             spec.host_value,
             spec.token_ids,
             spec.hash_value,
             spec.prefix_keys,
             extra_pools=aux_xfers or None,
+            device_indices=device_indices,
+        )
+        host_lock_params = self.inc_host_lock_ref(node_id).to_dec_params()
+        # A device-direct backup reads the payload from VRAM until the write
+        # acks, so pin the device value alongside the host value; the ack
+        # releases both.
+        device_lock_params = (
+            self.inc_lock_ref(node_id).to_dec_params()
+            if device_indices is not None
+            else None
         )
         self.ongoing_backup[operation_id] = (
             node_id,
-            self.inc_host_lock_ref(node_id).to_dec_params(),
+            host_lock_params,
+            device_lock_params,
         )
 
     def is_backuped(self, node_id: NodeId) -> bool:
@@ -2303,6 +2331,14 @@ class UnifiedRadixCache(BasePrefixCache):
             return self.buffer_pipeline.stage_completed_prefetch(
                 request, completed_tokens, hash_value
             )
+        if operation.device_indices is not None:
+            return self._handle_device_prefetch_result(
+                request,
+                operation,
+                last_host_node_id,
+                prefetch_key,
+                anchor_lock_params,
+            )
 
         fetched_key = prefetch_key[:completed_tokens]
         insert_result = self.tree_core.insert_host(
@@ -2367,6 +2403,53 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.prefetch_tokens_occupied,
         )
         return
+
+    def _handle_device_prefetch_result(
+        self,
+        request: CacheRequestHandle,
+        operation: PrefetchOperation,
+        anchor_node_id: NodeId,
+        prefetch_key: RadixKey,
+        anchor_lock_params: DecLockRefParams,
+    ) -> None:
+        """Splice a completed device-direct (GDS) prefetch into the tree as
+        device-resident nodes; the KV never lands in host pages."""
+        completed_tokens = operation.completed_tokens
+        device_indices = operation.device_indices
+        fetched_key = prefetch_key[:completed_tokens]
+        insert_result = self.tree_core.insert_device(
+            anchor_node_id,
+            fetched_key,
+            device_indices[:completed_tokens],
+            operation.hash_value[: completed_tokens // self.page_size],
+        )
+        self._apply_cache_actions(insert_result.cache_actions)
+        if insert_result.prefix_len > 0:
+            # The walked prefix duplicates data the tree already serves;
+            # only the new suffix becomes tree-owned.
+            self._apply_cache_action(
+                FreeDeviceKV([device_indices[: insert_result.prefix_len]])
+            )
+        loaded_from_storage = completed_tokens - insert_result.prefix_len
+        self._resolve_storage_prefetch_tokens(request, insert_result.prefix_len)
+        self.dec_host_lock_ref(anchor_node_id, anchor_lock_params)
+        del self.ongoing_prefetch[request]
+        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+        self.prefetch_loaded_tokens_by_reqid[request] = loaded_from_storage
+        if loaded_from_storage > 0:
+            self.prefetch_loaded_storage_start_by_reqid[request] = (
+                operation.storage_start + insert_result.prefix_len
+            )
+        else:
+            self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
+        logger.info(
+            "HiCache device prefetch req=%s completed=%d matched=%d loaded=%d occupied=%d",
+            request.rid,
+            completed_tokens,
+            insert_result.prefix_len,
+            loaded_from_storage,
+            self.cache_controller.prefetch_tokens_occupied,
+        )
 
     def _check_hybrid_prefetch_result(
         self,
@@ -2612,7 +2695,7 @@ class UnifiedRadixCache(BasePrefixCache):
             anchor_lock_params,
             comp_xfers,
         ) = self.ongoing_prefetch[request]
-        if operation.host_indices is None:
+        if operation.host_indices is None and operation.device_indices is None:
             self.cache_controller.terminate_prefetch(operation)
             self.revoke_pending_prefetch(request)
             return
@@ -2625,10 +2708,15 @@ class UnifiedRadixCache(BasePrefixCache):
             self.buffer_pipeline.pop_prefix_ctx(request)
             self.buffer_pipeline.release_anchor_lock(request)
         pool_transfers = [x for xfers in comp_xfers.values() for x in xfers]
-        self.cache_controller.append_host_mem_release(
-            host_indices=host_indices[:completed_tokens],
-            extra_pools=pool_transfers if operation.pool_transfers_done else None,
-        )
+        if operation.device_indices is not None:
+            prefix = operation.device_indices[:completed_tokens]
+            if prefix.numel() > 0:
+                self._apply_cache_action(FreeDeviceKV([prefix]))
+        else:
+            self.cache_controller.append_host_mem_release(
+                host_indices=host_indices[:completed_tokens],
+                extra_pools=pool_transfers if operation.pool_transfers_done else None,
+            )
         # Buffer mode granted occupancy at hit-alloc, sized to the bounce;
         # cache mode reserved the requested span at enqueue.
         self.cache_controller.prefetch_tokens_occupied -= self._prefetch_occupied_span(
@@ -2876,41 +2964,83 @@ class UnifiedRadixCache(BasePrefixCache):
             else:
                 aux_hit_tokens = hit_tokens
             alloc_len = hit_tokens
-            host_indices = cc.mem_pool_host.alloc(alloc_len)
-            if host_indices is None:
-                self.evict_host(alloc_len)
+            device_direct = (
+                cc.storage_device_direct
+                and not buffer_mode
+                and self.tree_core.supports_device_insert
+                and cc.device_prefetch_supported(operation)
+            )
+            if device_direct:
+                allocator = cc.mem_pool_device_allocator
+                span = allocator.alloc(alloc_len)
+                if span is None:
+                    self.evict_for_alloc(EvictParams(num_tokens=alloc_len))
+                    span = allocator.alloc(alloc_len)
+                if span is None:
+                    # Memory-pressure fallback: a shorter page-aligned prefix.
+                    available_size = allocator.available_size()
+                    alloc_len = min(
+                        hit_tokens,
+                        available_size - (available_size % self.page_size),
+                    )
+                    if alloc_len >= self.prefetch_threshold:
+                        span = allocator.alloc(alloc_len)
+                if span is None:
+                    self._finish_storage_prefetch(
+                        request, fulfilled_tokens=0, reason="device_capacity"
+                    )
+                    self.revoke_pending_prefetch(request)
+                    self.storage_prefetch_retries.poll_miss(
+                        request.rid,
+                        operation.storage_start + operation.storage_hit_count,
+                    )
+                    self._log_storage_prefetch_deferred(alloc_len, "device_capacity")
+                    return True
+                operation.device_indices = span
+            else:
                 host_indices = cc.mem_pool_host.alloc(alloc_len)
-            if host_indices is None and not buffer_mode:
-                # Memory-pressure fallback: a shorter page-aligned prefix.
-                # (Cache mode only — buffer mode parks for the full hit.)
-                available_size = cc.mem_pool_host.available_size()
-                alloc_len = min(
-                    hit_tokens,
-                    available_size - (available_size % self.page_size),
-                )
-                if alloc_len >= self.prefetch_threshold:
+                if host_indices is None:
+                    self.evict_host(alloc_len)
                     host_indices = cc.mem_pool_host.alloc(alloc_len)
-            if host_indices is None:
-                if buffer_mode:
-                    # Parked ops hold no pin: release and re-take at the next
-                    # attempt, which is also how a moved anchor gets noticed.
-                    self.buffer_pipeline.release_anchor_lock(request)
+                if host_indices is None and not buffer_mode:
+                    # Memory-pressure fallback: a shorter page-aligned prefix.
+                    # (Cache mode only — buffer mode parks for the full hit.)
+                    available_size = cc.mem_pool_host.available_size()
+                    alloc_len = min(
+                        hit_tokens,
+                        available_size - (available_size % self.page_size),
+                    )
+                    if alloc_len >= self.prefetch_threshold:
+                        host_indices = cc.mem_pool_host.alloc(alloc_len)
+                if host_indices is None:
+                    if buffer_mode:
+                        # Parked ops hold no pin: release and re-take at the next
+                        # attempt, which is also how a moved anchor gets noticed.
+                        self.buffer_pipeline.release_anchor_lock(request)
+                        self._log_storage_prefetch_deferred(
+                            max(alloc_len, aux_hit_tokens), "host_capacity"
+                        )
+                        return False
+                    self._finish_storage_prefetch(
+                        request, fulfilled_tokens=0, reason="host_capacity"
+                    )
+                    self.revoke_pending_prefetch(request)
+                    self.storage_prefetch_retries.poll_miss(
+                        request.rid,
+                        operation.storage_start + operation.storage_hit_count,
+                    )
                     self._log_storage_prefetch_deferred(
                         max(alloc_len, aux_hit_tokens), "host_capacity"
                     )
-                    return False
-                self._finish_storage_prefetch(
-                    request, fulfilled_tokens=0, reason="host_capacity"
-                )
-                self.revoke_pending_prefetch(request)
-                self.storage_prefetch_retries.poll_miss(
-                    request.rid, operation.storage_start + operation.storage_hit_count
-                )
-                self._log_storage_prefetch_deferred(
-                    max(alloc_len, aux_hit_tokens), "host_capacity"
-                )
-                return True
-            if not self._alloc_prefetch_aux_staging(info, aux_hit_tokens):
+                    return True
+                operation.host_indices = host_indices
+
+            # Device-direct ops never carry aux pools that need host
+            # staging (device_prefetch_supported rejects them), so the
+            # aux-staging shortfall path only applies to host staging.
+            if not device_direct and not self._alloc_prefetch_aux_staging(
+                info, aux_hit_tokens
+            ):
                 # Same outcome as a KV shortfall: nothing stays staged.
                 cc.append_host_mem_release(host_indices=host_indices)
                 if buffer_mode:
@@ -2932,12 +3062,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 return True
 
             self._resolve_storage_prefetch_tokens(
-                request, hit_tokens - alloc_len, reason="host_capacity"
+                request,
+                hit_tokens - alloc_len,
+                reason="device_capacity" if device_direct else "host_capacity",
             )
             operation.storage_hit_count = alloc_len
             operation.hash_value = operation.hash_value[: alloc_len // self.page_size]
-            operation.host_indices = host_indices
-            self.ongoing_prefetch[request] = info._replace(host_indices=host_indices)
+            self.ongoing_prefetch[request] = info._replace(
+                host_indices=(
+                    operation.device_indices if device_direct else host_indices
+                )
+            )
             if buffer_mode:
                 cc.prefetch_tokens_occupied += alloc_len
             cc.prefetch_buffer.put(operation)
@@ -3024,7 +3159,11 @@ class UnifiedRadixCache(BasePrefixCache):
                         # check_prefetch_progress() is not called for this rid yet.
                         # Let us insert the prefetch result into the radix tree.
                         self._handle_prefetch_result(operation)
-                    if operation.ack_releases_incomplete_host_indices:
+                    if operation.device_indices is not None:
+                        tail = operation.device_indices[operation.completed_tokens :]
+                        if tail.numel() > 0:
+                            self._apply_cache_action(FreeDeviceKV([tail]))
+                    elif operation.ack_releases_incomplete_host_indices:
                         cc.append_host_mem_release(
                             operation.host_indices[operation.completed_tokens :],
                             (
@@ -3044,8 +3183,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 else:
                     entry = self.ongoing_backup.pop(operation.id, None)
                     if entry is not None:
-                        node_id, lock_params = entry
-                        self.dec_host_lock_ref(node_id, lock_params)
+                        node_id, host_lock_params, device_lock_params = entry
+                        self.dec_host_lock_ref(node_id, host_lock_params)
+                        if device_lock_params is not None:
+                            self.dec_lock_ref(node_id, device_lock_params)
                 if (
                     log_metrics
                     and self.enable_storage_metrics
@@ -3181,10 +3322,11 @@ class UnifiedRadixCache(BasePrefixCache):
             return False, "HiCache storage backend is not initialized."
         return self._storage_attachment.detach()
 
-    def shutdown(self) -> None:
-        """Best-effort auto-detach of the storage backend on process shutdown."""
-        if self._storage_attachment is not None:
-            self._storage_attachment.shutdown()
+    def shutdown(self) -> bool:
+        """Detach storage before its host pools are released."""
+        if self._storage_attachment is None:
+            return True
+        return self._storage_attachment.shutdown()
 
     def clear_storage_backend(self) -> bool:
         if self._storage_attachment is None:

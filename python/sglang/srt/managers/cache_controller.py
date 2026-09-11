@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
+    PoolTransferTarget,
     count_pool_hits,
 )
 
@@ -144,6 +145,9 @@ class CacheOperation:
                 keys=[key for t in transfers if t.keys for key in t.keys] or None,
                 hit_policy=transfers[0].hit_policy,
                 indices_from_pool=transfers[0].indices_from_pool,
+                target=transfers[0].target,
+                target_pool=transfers[0].target_pool,
+                target_indices=cat_or_none(t.target_indices for t in transfers),
             )
             for transfers in grouped.values()
         ]
@@ -222,8 +226,10 @@ class StorageOperation:
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        device_indices: Optional[torch.Tensor] = None,
     ):
         self.host_indices = host_indices
+        self.device_indices = device_indices
         self.token_ids = token_ids
         self.last_hash = last_hash
         self.completed_tokens = 0
@@ -252,6 +258,7 @@ HICACHE_LOAD_POOL_USAGE_FRACTION = 0.9
 # Write-staging floor: writes are deferrable, so the flush gate grows the
 # write window dynamically into whatever load staging is not using.
 HICACHE_WRITE_STAGING_POOL_FRACTION = 0.2
+STORAGE_THREAD_SHUTDOWN_TIMEOUT = 300
 
 
 class PrefetchOperation(StorageOperation):
@@ -322,6 +329,7 @@ class HiCacheController:
         self.enable_storage = False
         self.storage_backend = None
         self.storage_backend_type = None
+        self.storage_device_direct = False
         self.enable_storage_metrics = enable_storage_metrics
         # Buffer mode: wired by the tree cache after attach; the load rate
         # limiter subtracts write staging from actual pool usage.
@@ -468,18 +476,9 @@ class HiCacheController:
         self.backup_thread.start()
 
     def _stop_storage_threads(self):
-        """Stop storage prefetch/backup threads and drain internal queues.
-
-        Caller should ensure no in-flight requests.
-        """
-        # Always request stop. This is safe even when storage is already disabled,
-        # and makes detach truly idempotent (previous partial detach may have left
-        # threads alive).
-        # NOTE: do NOT clear storage_stop_event unless threads have fully stopped; otherwise
-        # a still-alive thread may resume and touch released state.
+        """Stop storage threads after queued backups finish."""
         self.storage_stop_event.set()
 
-        # Best-effort wakeups so threads exit promptly even if blocked on queues.
         try:
             if hasattr(self, "prefetch_queue"):
                 self.prefetch_queue.put_nowait(None)
@@ -492,7 +491,6 @@ class HiCacheController:
         except Exception:
             pass
 
-        # Best-effort joins (threads are daemon, but join keeps state clean).
         threads = []
         if hasattr(self, "prefetch_thread"):
             threads.append(self.prefetch_thread)
@@ -503,17 +501,21 @@ class HiCacheController:
         if hasattr(self, "prefetch_sync_thread"):
             threads.append(self.prefetch_sync_thread)
 
-        for t in threads:
+        deadline = time.monotonic() + STORAGE_THREAD_SHUTDOWN_TIMEOUT
+        for thread in threads:
             try:
-                t.join(timeout=10)
+                thread.join(timeout=max(0, deadline - time.monotonic()))
             except Exception:
                 pass
 
-        alive = [t for t in threads if getattr(t, "is_alive", lambda: False)()]
+        alive = [
+            thread for thread in threads if getattr(thread, "is_alive", lambda: False)()
+        ]
         if alive:
             logger.error(
-                "Failed to stop HiCache storage threads cleanly: %s",
-                [getattr(t, "name", repr(t)) for t in alive],
+                "Failed to stop HiCache storage threads within %d seconds: %s",
+                STORAGE_THREAD_SHUTDOWN_TIMEOUT,
+                [getattr(thread, "name", repr(thread)) for thread in alive],
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
 
@@ -592,23 +594,38 @@ class HiCacheController:
             self.page_set_func = self._generic_page_set
 
             if (
-                self.storage_backend_type
-                in [
-                    "hf3fs",
-                    "mooncake",
-                    "npu_memcache",
-                    "eic",
-                    "nixl",
-                    "simm",
-                    "mori",
-                    "tensorcast",
-                ]
-            ) or (
-                self.storage_backend_type == "dynamic"
-                and bool(self.storage_config.extra_config.get("interface_v1", 0))
+                (
+                    self.storage_backend_type
+                    in [
+                        "hf3fs",
+                        "mooncake",
+                        "npu_memcache",
+                        "eic",
+                        "nixl",
+                        "simm",
+                        "mori",
+                        "tensorcast",
+                    ]
+                )
+                or (
+                    self.storage_backend_type == "dynamic"
+                    and bool(self.storage_config.extra_config.get("interface_v1", 0))
+                )
+                or bool(
+                    # Backends that implement positional zero-copy page I/O
+                    # (e.g. HiCacheFile with io_mode='direct') opt in through
+                    # this capability flag instead of hardcoded name lists.
+                    getattr(self.storage_backend, "supports_zero_copy_page_io", False)
+                )
             ):
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
+
+            self.storage_device_direct = bool(
+                getattr(self.storage_backend, "supports_device_target", False)
+            )
+            if self.storage_device_direct:
+                self._register_device_pools()
 
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
@@ -637,6 +654,7 @@ class HiCacheController:
             self.enable_storage = False
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
+            self.storage_device_direct = False
             raise
 
     def detach_storage_backend(self):
@@ -682,6 +700,7 @@ class HiCacheController:
         self.enable_storage = False
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
+        self.storage_device_direct = False
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
@@ -1082,6 +1101,9 @@ class HiCacheController:
         ]
         all_success = True
         completed_pages = 0
+        device_indices_cpu = None
+        if self.storage_device_direct and operation.device_indices is not None:
+            device_indices_cpu = operation.device_indices.to("cpu")
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
             # When an error is occurred, we should keep looping and produce the same number of
             # PrefetchAck as other ranks do, because prefetch_sync_thread (i.e. consumer of
@@ -1090,19 +1112,31 @@ class HiCacheController:
                 all_success = False
             if all_success:
                 batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
-                batch_host_indices = operation.host_indices[
-                    i * self.page_size : (i + len(batch_hashes)) * self.page_size
-                ]
+                batch_host_indices = (
+                    None
+                    if operation.host_indices is None
+                    else operation.host_indices[
+                        i * self.page_size : (i + len(batch_hashes)) * self.page_size
+                    ]
+                )
 
                 # Get one batch token, and update the completed_tokens if succeed
                 extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
 
+                batch_device_indices = (
+                    None
+                    if device_indices_cpu is None
+                    else device_indices_cpu[
+                        i * self.page_size : (i + len(batch_hashes)) * self.page_size
+                    ]
+                )
                 hit_pages = self._page_transfer_kv_batch(
                     operation,
                     batch_hashes,
                     batch_host_indices,
                     extra_info,
                     kv_derived_transfers,
+                    batch_device_indices,
                 )
                 # Check termination
                 if hit_pages != len(batch_hashes):
@@ -1125,6 +1159,7 @@ class HiCacheController:
         batch_host_indices: torch.Tensor,
         extra_info: HiCacheStorageExtraInfo,
         kv_derived_transfers: List[PoolTransfer],
+        batch_device_indices: Optional[torch.Tensor] = None,
     ) -> int:
         """Read a single batch from KV and KV-derived pools (e.g. indexer pool).
 
@@ -1134,21 +1169,40 @@ class HiCacheController:
         Here, "batch" means a single unit of L3 read, not a "batch" in model forward.
         """
         # Read from KV pool.
-        kv_hits = self.page_get_func(
-            operation, batch_hashes, batch_host_indices, extra_info
-        )
+        if batch_device_indices is not None:
+            kv_hits = self._get_kv_device_batch(batch_hashes, batch_device_indices)
+        else:
+            kv_hits = self.page_get_func(
+                operation, batch_hashes, batch_host_indices, extra_info
+            )
 
         # Read from KV-derived sidecar pools, if any.
         sidecar_hits: dict[str, int] = {}
         if len(kv_derived_transfers) > 0:
-            current_kv_derived_transfers = [
-                PoolTransfer(
-                    name=transfer.name,
-                    host_indices=batch_host_indices,
-                    keys=batch_hashes,
+            if batch_device_indices is not None:
+                registered = getattr(
+                    self.storage_backend, "registered_device_pools", {}
                 )
-                for transfer in kv_derived_transfers
-            ]
+                current_kv_derived_transfers = [
+                    PoolTransfer(
+                        name=transfer.name,
+                        keys=batch_hashes,
+                        target=PoolTransferTarget.DEVICE,
+                        target_pool=registered[transfer.name],
+                        target_indices=batch_device_indices,
+                        indices_from_pool=PoolName.KV,
+                    )
+                    for transfer in kv_derived_transfers
+                ]
+            else:
+                current_kv_derived_transfers = [
+                    PoolTransfer(
+                        name=transfer.name,
+                        host_indices=batch_host_indices,
+                        keys=batch_hashes,
+                    )
+                    for transfer in kv_derived_transfers
+                ]
             sidecar_results = self.storage_backend.batch_get_v2(
                 current_kv_derived_transfers, extra_info=extra_info
             )
@@ -1263,12 +1317,19 @@ class HiCacheController:
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        device_indices: Optional[torch.Tensor] = None,
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
+        When device_indices is set and the backend supports device targets, the
+        payload is written from those VRAM slots instead of the host pages.
         """
         operation = StorageOperation(
-            host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
+            host_indices,
+            token_ids,
+            hash_value=hash_value,
+            prefix_keys=prefix_keys,
+            device_indices=device_indices,
         )
         self.backup_queue.put(operation)
         return operation.id
@@ -1286,10 +1347,74 @@ class HiCacheController:
             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
         )
 
-    # Backup batch by batch
+    def _register_device_pools(self):
+        """Register VRAM pools for device-target (GDS) transfers.
+        Subclasses add sidecar pools (MAMBA, INDEXER)."""
+        if not hasattr(self.mem_pool_device, "get_hicache_transfer_tensors"):
+            logger.warning(
+                "Storage backend requests device-target transfers but %s does "
+                "not expose HiCache transfer tensors; device-direct IO is "
+                "disabled.",
+                type(self.mem_pool_device).__name__,
+            )
+            self.storage_device_direct = False
+            return
+        self.storage_backend.register_mem_device_pool_v2(
+            self.mem_pool_device, PoolName.KV
+        )
+
+    def _backup_kv_device_batch(self, keys, device_indices_cpu, offset) -> bool:
+        """Write one KV page batch VRAM->L3 through the device-target API."""
+        transfer = PoolTransfer(
+            name=PoolName.KV,
+            keys=keys,
+            target=PoolTransferTarget.DEVICE,
+            target_pool=self.mem_pool_device,
+            target_indices=device_indices_cpu[
+                offset : offset + len(keys) * self.page_size
+            ],
+        )
+        results = self.storage_backend.batch_set_v2([transfer])
+        page_ok = results.get(transfer.name, [])
+        return len(page_ok) == len(keys) and all(page_ok)
+
+    def _get_kv_device_batch(self, keys, device_batch_indices) -> int:
+        """Read one KV page batch L3->VRAM through the device-target API."""
+        transfer = PoolTransfer(
+            name=PoolName.KV,
+            keys=keys,
+            target=PoolTransferTarget.DEVICE,
+            target_pool=self.mem_pool_device,
+            target_indices=device_batch_indices,
+        )
+        results = self.storage_backend.batch_get_v2([transfer])
+        return count_pool_hits(results).get(transfer.name, 0)
+
+    def device_prefetch_supported(self, operation) -> bool:
+        """True when an L3 read for this prefetch can target VRAM directly.
+
+        Requires the KV device pool registered and every extra pool to be a
+        KV-derived sidecar with a registered device pool (it shares the KV
+        device span). Aux pools needing host staging disable the device
+        path for this operation."""
+        if not self.storage_device_direct:
+            return False
+        registered = getattr(self.storage_backend, "registered_device_pools", {})
+        if PoolName.KV not in registered:
+            return False
+        for transfer in getattr(operation, "pool_transfers", None) or []:
+            if transfer.indices_from_pool != PoolName.KV:
+                return False
+            if transfer.name not in registered:
+                return False
+        return True
+
     def _page_backup(self, operation):
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
+        device_indices_cpu = None
+        if self.storage_device_direct and operation.device_indices is not None:
+            device_indices_cpu = operation.device_indices.to("cpu")
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
             batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
             batch_host_indices = operation.host_indices[
@@ -1298,7 +1423,14 @@ class HiCacheController:
             # Set one batch token, and record if success.
             # todo: allow partial success
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+            if device_indices_cpu is not None:
+                success = self._backup_kv_device_batch(
+                    batch_hashes, device_indices_cpu, i * self.page_size
+                )
+            else:
+                success = self.page_set_func(
+                    batch_hashes, batch_host_indices, extra_info
+                )
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."
@@ -1313,7 +1445,7 @@ class HiCacheController:
         """
         Manage backup operations from host memory to storage backend.
         """
-        while not self.storage_stop_event.is_set():
+        while not self.storage_stop_event.is_set() or not self.backup_queue.empty():
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:

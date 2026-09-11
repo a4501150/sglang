@@ -108,9 +108,17 @@ class StorageOperation(BaseStorageOperation):
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        device_indices: Optional[torch.Tensor] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
     ):
-        super().__init__(host_indices, token_ids, last_hash, hash_value, prefix_keys)
+        super().__init__(
+            host_indices,
+            token_ids,
+            last_hash,
+            hash_value,
+            prefix_keys,
+            device_indices=device_indices,
+        )
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
 
@@ -122,6 +130,7 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        device_indices: Optional[torch.Tensor] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
     ):
@@ -140,6 +149,7 @@ class PrefetchOperation(StorageOperation):
             last_hash,
             prefix_keys=prefix_keys,
             pool_transfers=pool_transfers,
+            device_indices=device_indices,
         )
         self.pool_transfers_done = not bool(pool_transfers)
         # The Python transfer worker leaves the unfinished tail to the ACK drain;
@@ -296,6 +306,25 @@ class HybridCacheController(BaseHiCacheController):
         for entry in host_pools or []:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
+        if self.storage_device_direct:
+            self._register_sidecar_device_pools(host_pools or [])
+
+    def _register_sidecar_device_pools(self, entries) -> None:
+        for entry in entries:
+            if entry.name == PoolName.KV:
+                continue
+            device_pool = getattr(entry.host_pool, "device_pool", None)
+            if device_pool is None or not hasattr(
+                device_pool, "get_hicache_transfer_tensors"
+            ):
+                logger.info(
+                    "Device-target storage: pool %s has no registerable device "
+                    "pool; its transfers stay on the host-mediated path.",
+                    entry.name,
+                )
+                continue
+            self.storage_backend.register_mem_device_pool_v2(device_pool, entry.name)
+
     def detach_storage_backend(self):
         super().detach_storage_backend()
         if self.pp_prefetch_command_group is not None:
@@ -313,6 +342,8 @@ class HybridCacheController(BaseHiCacheController):
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
         if self.enable_storage and self.storage_backend is not None:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+            if self.storage_device_direct:
+                self._register_sidecar_device_pools([entry])
 
     @staticmethod
     def parse_storage_backend_extra_config(
@@ -1157,6 +1188,7 @@ class HybridCacheController(BaseHiCacheController):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        device_indices: Optional[torch.Tensor] = None,
     ) -> int:
         operation = StorageOperation(
             host_indices,
@@ -1164,6 +1196,7 @@ class HybridCacheController(BaseHiCacheController):
             hash_value=hash_value,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
+            device_indices=device_indices,
         )
         self.backup_queue.put(operation)
         return operation.id
@@ -1394,7 +1427,7 @@ class HybridCacheController(BaseHiCacheController):
         ranks. That optimization is valid for replicated MLA KV, but not for
         hybrid rank-sharded pools such as Kimi-K3 Mamba state.
         """
-        while not self.storage_stop_event.is_set():
+        while not self.storage_stop_event.is_set() or not self.backup_queue.empty():
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:

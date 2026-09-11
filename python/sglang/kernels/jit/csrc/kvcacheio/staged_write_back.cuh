@@ -9,55 +9,58 @@
 namespace sglang {
 
 #if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
-#if CUDA_VERSION >= 13000
-using CudaMemcpyBatchPtr = const void*;
-using CudaMemcpyBatchAsyncFn = cudaError_t (*)(
-    CudaMemcpyBatchPtr*,
-    CudaMemcpyBatchPtr*,
-    const size_t*,
-    size_t,
-    cudaMemcpyAttributes*,
-    size_t*,
-    size_t,
-    cudaStream_t);
-#else
-using CudaMemcpyBatchPtr = void*;
-using CudaMemcpyBatchAsyncFn = cudaError_t (*)(
-    CudaMemcpyBatchPtr*,
-    CudaMemcpyBatchPtr*,
-    size_t*,
-    size_t,
-    cudaMemcpyAttributes*,
-    size_t*,
-    size_t,
-    size_t*,
-    cudaStream_t);
-#endif
+// cudaMemcpyBatchAsync changed ABI between CUDA 12.x (9 args, includes
+// fail_idx) and CUDA 13.0 (8 args, fail_idx removed). The loaded CUDA
+// runtime determines the ABI of the dlsym-resolved symbol.
+using CudaMemcpyBatchPtr12 = void*;
+using CudaMemcpyBatchAsyncFn12 = cudaError_t (*)(
+    CudaMemcpyBatchPtr12*, CudaMemcpyBatchPtr12*, size_t*, size_t,
+    cudaMemcpyAttributes*, size_t*, size_t, size_t*, cudaStream_t);
+using CudaMemcpyBatchPtr13 = const void*;
+using CudaMemcpyBatchAsyncFn13 = cudaError_t (*)(
+    CudaMemcpyBatchPtr13*, CudaMemcpyBatchPtr13*, const size_t*, size_t,
+    cudaMemcpyAttributes*, size_t*, size_t, cudaStream_t);
 
-inline auto get_cuda_memcpy_batch_async() -> CudaMemcpyBatchAsyncFn {
-  static CudaMemcpyBatchAsyncFn cuda_memcpy_batch_async = []() {
-    void* symbol = dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync");
-    return reinterpret_cast<CudaMemcpyBatchAsyncFn>(symbol);
+struct CudaMemcpyBatchState {
+  void* symbol = nullptr;
+  bool runtime_is_13 = false;
+};
+
+inline auto get_cuda_memcpy_batch_state() -> const CudaMemcpyBatchState& {
+  static CudaMemcpyBatchState state = [] {
+    CudaMemcpyBatchState s;
+    s.symbol = dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync");
+    int runtime_version = 0;
+    if (cudaRuntimeGetVersion(&runtime_version) == cudaSuccess) {
+      s.runtime_is_13 = runtime_version >= 13000;
+    }
+    return s;
   }();
-  return cuda_memcpy_batch_async;
+  return state;
 }
 
 inline auto call_cuda_memcpy_batch_async(
-    CudaMemcpyBatchAsyncFn copy_fn,
-    CudaMemcpyBatchPtr* dsts,
-    CudaMemcpyBatchPtr* srcs,
-    size_t* sizes,
+    const CudaMemcpyBatchState& state,
+    const void** dsts,
+    const void** srcs,
+    const size_t* sizes,
     size_t count,
     cudaMemcpyAttributes* attrs,
     size_t* attrs_idxs,
     size_t num_attrs,
     cudaStream_t stream) -> cudaError_t {
-#if CUDA_VERSION >= 13000
-  return copy_fn(dsts, srcs, sizes, count, attrs, attrs_idxs, num_attrs, stream);
-#else
-  size_t fail_idx = std::numeric_limits<size_t>::max();
-  return copy_fn(dsts, srcs, sizes, count, attrs, attrs_idxs, num_attrs, &fail_idx, stream);
-#endif
+  if (state.runtime_is_13) {
+    auto fn = reinterpret_cast<CudaMemcpyBatchAsyncFn13>(state.symbol);
+    return fn(
+        dsts, srcs, sizes, count, attrs, attrs_idxs, num_attrs, stream);
+  } else {
+    auto fn = reinterpret_cast<CudaMemcpyBatchAsyncFn12>(state.symbol);
+    size_t fail_idx = std::numeric_limits<size_t>::max();
+    return fn(
+        const_cast<CudaMemcpyBatchPtr12*>(dsts),
+        const_cast<CudaMemcpyBatchPtr12*>(srcs),
+        const_cast<size_t*>(sizes), count, attrs, attrs_idxs, num_attrs, &fail_idx, stream);
+  }
 }
 #endif
 
@@ -102,20 +105,26 @@ inline bool try_copy_page_first_pages_batch(
 #if defined(USE_ROCM) || !defined(CUDA_VERSION) || (CUDA_VERSION < 12080)
   return false;
 #else
-  host::RuntimeCheck(src_ptrs.size() == dst_ptrs.size(), "Source and destination tensors must have the same count");
-  constexpr size_t kLargeCopyThresholdBytes = 128 * 1024;
-  thread_local std::vector<CudaMemcpyBatchPtr> batch_srcs;
-  thread_local std::vector<CudaMemcpyBatchPtr> batch_dsts;
-  thread_local std::vector<size_t> batch_sizes;
 
-  int driver_version = 0;
-  cudaError_t driver_version_err = cudaDriverGetVersion(&driver_version);
-  if (driver_version_err != cudaSuccess || driver_version < 12080) {
+  // A genuine CUDA API failure must surface through the runtime check path
+  // rather than being silently converted into a fallback. A normal query
+  // that reports the capability as absent (value 0) still returns false so
+  // callers keep the per-page copy fallback.
+  int can_use_host_pointer = 0;
+  host::RuntimeDeviceCheck(cudaDeviceGetAttribute(
+      &can_use_host_pointer, cudaDevAttrCanUseHostPointerForRegisteredMem, device_id));
+  if (can_use_host_pointer == 0) {
     return false;
   }
 
-  auto copy_fn = get_cuda_memcpy_batch_async();
-  if (copy_fn == nullptr) {
+  host::RuntimeCheck(src_ptrs.size() == dst_ptrs.size(), "Source and destination tensors must have the same count");
+  constexpr size_t kLargeCopyThresholdBytes = 128 * 1024;
+  thread_local std::vector<const void*> batch_srcs;
+  thread_local std::vector<const void*> batch_dsts;
+  thread_local std::vector<size_t> batch_sizes;
+
+  const auto& batch_state = get_cuda_memcpy_batch_state();
+  if (batch_state.symbol == nullptr) {
     return false;
   }
 
@@ -165,7 +174,7 @@ inline bool try_copy_page_first_pages_batch(
   attrs.flags = 0;
 
   cudaError_t err = call_cuda_memcpy_batch_async(
-      copy_fn,
+      batch_state,
       batch_dsts.data(),
       batch_srcs.data(),
       batch_sizes.data(),
@@ -174,11 +183,10 @@ inline bool try_copy_page_first_pages_batch(
       attrs_idxs.data(),
       1,
       stream);
-  if (err == cudaErrorNotSupported || err == cudaErrorCallRequiresNewerDriver || err == cudaErrorInvalidValue) {
+  if (err != cudaSuccess) {
     (void)cudaGetLastError();
     return false;
   }
-  host::RuntimeCheck(err == cudaSuccess, "cudaMemcpyBatchAsync failed. error=", cudaGetErrorString(err));
   return true;
 #endif
 }
@@ -290,6 +298,82 @@ struct HiCacheStagedWriteBackKernel {
     }
   }
 
+  static void run_page_first_to_layer_dma_impl(
+      const tvm::ffi::TensorView src,
+      const tvm::ffi::TensorView dst,
+      const tvm::ffi::TensorView src_indices_cpu,
+      const tvm::ffi::TensorView dst_indices_cpu,
+      const int64_t layer_id,
+      const int64_t page_size) {
+    using namespace host;
+
+    auto T = SymbolicSize{"num_host_tokens"};
+    auto U = SymbolicSize{"num_device_tokens"};
+    auto N = SymbolicSize{"num_layers"};
+    auto D = SymbolicSize{"element_dim"};
+    auto I = SymbolicSize{"num_indices"};
+    auto dtype = SymbolicDType{};
+    auto device = SymbolicDevice{};
+
+    TensorMatcher({T, N, D})  //
+        .with_dtype(dtype)
+        .with_device<kDLCPU, kDLGPUHost>()
+        .verify(src);
+    TensorMatcher({U, D})  //
+        .with_dtype(dtype)
+        .with_device<kDLGPU>(device)
+        .verify(dst);
+    TensorMatcher({I})  //
+        .with_dtype<int64_t>()
+        .with_device<kDLCPU, kDLGPUHost>()
+        .verify(src_indices_cpu);
+    TensorMatcher({I})  //
+        .with_dtype<int64_t>()
+        .with_device<kDLCPU, kDLGPUHost>()
+        .verify(dst_indices_cpu);
+
+    RuntimeCheck(page_size > 0, "HiCache page-first DMA: page_size must be positive");
+    RuntimeCheck(I.unwrap() % page_size == 0, "HiCache page-first DMA: index count must be page aligned");
+    RuntimeCheck(layer_id >= 0 && layer_id < N.unwrap(), "HiCache page-first DMA: layer index out of bounds");
+    RuntimeCheck(src.stride(2) == 1 && dst.stride(1) == 1, "HiCache page-first DMA: element dimensions must be contiguous");
+
+    const auto elem_size = dtype_bytes(dtype.unwrap());
+    const auto row_bytes = static_cast<size_t>(D.unwrap() * elem_size);
+    const auto src_pitch = static_cast<size_t>(src.stride(0) * elem_size);
+    const auto dst_pitch = static_cast<size_t>(dst.stride(0) * elem_size);
+    RuntimeCheck(row_bytes <= src_pitch && row_bytes <= dst_pitch, "HiCache page-first DMA: row width exceeds tensor pitch");
+
+    const auto* src_indices = static_cast<const int64_t*>(src_indices_cpu.data_ptr());
+    const auto* dst_indices = static_cast<const int64_t*>(dst_indices_cpu.data_ptr());
+    const auto num_pages = I.unwrap() / page_size;
+    const auto stream = LaunchKernel::resolve_device(device.unwrap());
+    const auto* src_base = static_cast<const char*>(src.data_ptr()) +
+                           static_cast<size_t>(layer_id * src.stride(1) * elem_size);
+    auto* dst_base = static_cast<char*>(dst.data_ptr());
+
+    for (const auto page_offset : irange(num_pages)) {
+      const auto index_offset = page_offset * page_size;
+      const auto src_index = src_indices[index_offset];
+      const auto dst_index = dst_indices[index_offset];
+      RuntimeCheck(
+          src_index >= 0 && src_index + page_size <= T.unwrap(),
+          "HiCache page-first DMA: source page out of bounds");
+      RuntimeCheck(
+          dst_index >= 0 && dst_index + page_size <= U.unwrap(),
+          "HiCache page-first DMA: destination page out of bounds");
+
+      RuntimeDeviceCheck(cudaMemcpy2DAsync(
+          dst_base + static_cast<size_t>(dst_index) * dst_pitch,
+          dst_pitch,
+          src_base + static_cast<size_t>(src_index) * src_pitch,
+          src_pitch,
+          row_bytes,
+          static_cast<size_t>(page_size),
+          cudaMemcpyHostToDevice,
+          stream));
+    }
+  }
+
  public:
   static void run_all_lf_pf_staged(
       const tvm::ffi::TensorView k_cache_dst,
@@ -311,6 +395,17 @@ struct HiCacheStagedWriteBackKernel {
         k_ptr_src,
         v_ptr_src,
         page_size);
+  }
+
+  static void run_page_first_to_layer_dma(
+      const tvm::ffi::TensorView src,
+      const tvm::ffi::TensorView dst,
+      const tvm::ffi::TensorView src_indices_cpu,
+      const tvm::ffi::TensorView dst_indices_cpu,
+      const int64_t layer_id,
+      const int64_t page_size) {
+    run_page_first_to_layer_dma_impl(
+        src, dst, src_indices_cpu, dst_indices_cpu, layer_id, page_size);
   }
 
   static void run_all_mla_lf_pf_staged(

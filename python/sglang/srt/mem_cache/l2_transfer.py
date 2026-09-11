@@ -8,10 +8,30 @@ from typing import Any, Callable, NamedTuple, Optional
 import torch
 
 from sglang.srt.mem_cache.pool_host.base import shared_host_layout_domains
-from sglang.srt.utils import get_device_module
+from sglang.srt.utils import get_device_module, is_cuda_alike, is_hip
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+
+
+@contextmanager
+def _bind_tvm_ffi_to_current_torch_stream(enabled: bool):
+    """Keep HiCache JIT copies on the transfer stream used by completion events."""
+    if not enabled or not is_cuda_alike():
+        yield
+        return
+
+    from tvm_ffi.core import _env_get_current_stream, _env_set_current_stream
+
+    device_type = 10 if is_hip() else 2
+    device_index = torch.cuda.current_device()
+    previous_stream = _env_get_current_stream(device_type, device_index)
+    current_stream = torch._C._cuda_getCurrentRawStream(device_index)
+    _env_set_current_stream(device_type, device_index, current_stream)
+    try:
+        yield
+    finally:
+        _env_set_current_stream(device_type, device_index, previous_stream)
 
 
 @cache
@@ -114,7 +134,8 @@ class L2TransferEngine:
                 start_event.wait(stream)
                 prepared = self._prepare_transfers(transfers)
                 ack_start.record()
-                yield prepared, completion
+                with _bind_tvm_ffi_to_current_torch_stream(self.io_backend == "kernel"):
+                    yield prepared, completion
                 ack_finish.record()
                 finish_recorded = True
                 self._record_stream(transfers + prepared, stream)
@@ -153,6 +174,17 @@ class L2TransferEngine:
             transfers, self.host_to_device_stream, "host_to_device", start_event
         ) as (transfers, completion):
             primary = transfers[0] if transfers else None
+            for transfer in transfers:
+                load_slot_siblings = getattr(
+                    transfer.host_pool, "load_slot_siblings_to_device", None
+                )
+                if load_slot_siblings is not None:
+                    load_slot_siblings(
+                        transfer.device_pool,
+                        transfer.host_indices,
+                        transfer.device_indices,
+                        self.io_backend,
+                    )
             for layer_id in range(transfer_layer_id_max):
                 for transfer in transfers:
                     local_layer_id = (
@@ -176,6 +208,16 @@ class L2TransferEngine:
                     )
                 if on_layer_done is not None:
                     on_layer_done(layer_id)
+            for transfer in transfers:
+                log_transfer_digests = getattr(
+                    transfer.host_pool, "log_transfer_digests", None
+                )
+                if log_transfer_digests is not None:
+                    log_transfer_digests(
+                        "host_to_device",
+                        transfer.host_indices,
+                        transfer.device_indices,
+                    )
         return completion
 
     @staticmethod

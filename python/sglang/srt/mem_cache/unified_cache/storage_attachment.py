@@ -146,14 +146,11 @@ class StorageAttachment:
         The caller must ensure there are no running or queued requests. Ordering
         matters and is the reason this is not just ``controller.detach()``:
 
-        1. drain the control queues while the bookkeeping is still intact, so
-           in-flight acks / releases can still be matched to their nodes --
-           otherwise host pages and host locks leak;
-        2. stop the storage threads;
-        3. only then release whatever prefetch / backup is still tracked, since
-           nothing can race the bookkeeping once the threads are gone;
-        4. drain once more, because step 3 only *queues* the host pages -- this
-           is what hands them back to the pool and its sidecars.
+        1. drain control queues while their bookkeeping is intact;
+        2. stop storage threads after they finish queued backups;
+        3. drain the acknowledgments produced during shutdown;
+        4. release any operations that did not produce acknowledgments;
+        5. drain the host-page release queues before pool destruction.
         """
         cache = self._cache
         controller = cache.cache_controller
@@ -166,6 +163,7 @@ class StorageAttachment:
             # is already False, since that may be leftover state from an earlier
             # partial detach.
             controller.detach_storage_backend()
+            cache.drain_storage_control_queues_local()
         except Exception as e:
             logger.exception("Failed to detach storage backend.")
             # Never crash the server for an admin operation. The controller raises
@@ -183,17 +181,18 @@ class StorageAttachment:
         cache.enable_storage_metrics = False
         return True, "Detached HiCache storage backend successfully."
 
-    def shutdown(self) -> None:
-        """Best-effort auto-detach on process shutdown.
-
-        Keeps startup and runtime behavior consistent: a backend attached either
-        via CLI args or via the admin API is detached on exit.
-        """
+    def shutdown(self) -> bool:
+        """Detach the backend during process shutdown."""
         try:
-            if self._cache.enable_storage:
-                self.detach()
+            if not self._cache.enable_storage:
+                return True
+            ok, message = self.detach()
+            if not ok:
+                logger.error(message)
+            return ok
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")
+            return False
 
     def clear(self) -> bool:
         """Drop everything the backend has stored, keeping it attached."""
@@ -410,9 +409,13 @@ class StorageAttachment:
                 cache.ongoing_prefetch.pop(handle, None)
 
         for ack_id in list(cache.ongoing_backup):
-            node_id, lock_params = cache.ongoing_backup.pop(ack_id)
+            node_id, host_lock_params, device_lock_params = cache.ongoing_backup.pop(
+                ack_id
+            )
             try:
-                cache.dec_host_lock_ref(node_id, lock_params)
+                cache.dec_host_lock_ref(node_id, host_lock_params)
+                if device_lock_params is not None:
+                    cache.dec_lock_ref(node_id, device_lock_params)
             except Exception:
                 logger.exception("Failed to release host lock for backup op %s", ack_id)
 
