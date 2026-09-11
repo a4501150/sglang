@@ -131,10 +131,16 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         host_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
         device_indices = torch.tensor([4, 5, 6, 7], dtype=torch.int64)
 
-        with mock.patch(
-            "sglang.srt.mem_cache.pool_host.mha.transfer_kv_per_layer_mla_pf_lf",
-            create=True,
-        ) as transfer:
+        with (
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.mha.can_use_host_pointer_for_registered_mem",
+                return_value=True,
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.mha.transfer_kv_per_layer_mla_pf_lf",
+                create=True,
+            ) as transfer,
+        ):
             host.load_to_device_per_layer(
                 device_pool,
                 host_indices,
@@ -256,6 +262,10 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
             mock.patch(
                 "sglang.srt.mem_cache.pool_host.mha.jit_transfer_hicache_all_layer_mla_staged_lf_pf",
                 side_effect=staged_copy,
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.mha.can_use_host_pointer_for_registered_mem",
+                return_value=True,
             ),
             mock.patch(
                 "sglang.srt.mem_cache.pool_host.mha.transfer_kv_per_layer_mla_pf_lf",

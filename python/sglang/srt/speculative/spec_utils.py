@@ -950,9 +950,16 @@ def _verify_commit_step_indices(
         != seq_lens_post_verify // mamba_track_interval
     )
     tracking_point = seq_lens_post_verify // mamba_track_interval * mamba_track_interval
-    to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0).to(
-        torch.int64
-    )
+    # The state after the token at position tracking_point - 1 is the
+    # accepted step tracking_point - pre - 1 (0-based within the accepted
+    # path); clamping only guards the masked non-crossing rows.
+    to_track_ith = torch.clamp(
+        torch.minimum(
+            tracking_point - seq_lens_pre_verify - 1,
+            accept_lens - 1,
+        ),
+        min=0,
+    ).to(torch.int64)
     candidate_track_steps = accept_index[req_idx, to_track_ith] - accept_indices_offset
     mamba_steps_to_track = torch.where(
         to_track_mask,
@@ -1145,9 +1152,13 @@ def commit_mamba_states_after_verify(
             seq_post = batch.seq_lens + accept_lens
             to_track_mask = seq_pre // ti != seq_post // ti
             tracking_point = seq_post // ti * ti
-            to_track_ith = torch.clamp(tracking_point - seq_pre - 1, min=0).to(
-                torch.int64
-            )
+            # Same step formula as _verify_commit_step_indices: the
+            # checkpoint after token tracking_point is accepted step
+            # tracking_point - seq_pre - 1.
+            to_track_ith = torch.clamp(
+                torch.minimum(tracking_point - seq_pre - 1, accept_lens - 1),
+                min=0,
+            ).to(torch.int64)
             candidate = accept_index[req_idx, to_track_ith] - accept_indices_offset
             mamba_steps_to_track = torch.where(
                 to_track_mask, candidate, torch.full_like(candidate, -1)

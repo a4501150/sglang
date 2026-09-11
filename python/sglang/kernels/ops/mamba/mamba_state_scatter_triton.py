@@ -757,7 +757,10 @@ def _fused_commit_track_indices_kernel(
         post = pre + al
         cross = (pre // interval) != (post // interval)
         tp = (post // interval) * interval
-        ti = tp - pre - 1
+        # The state after the token at position tp - 1 (0-based within the
+        # accepted path) is step tp - pre - 1; the boundary can fall beyond
+        # the accepted speculative path, so clamp to an accepted step.
+        ti = tl.minimum(tp - pre - 1, al - 1)
         ti = tl.where(ti < 0, 0, ti)
         cand = tl.load(accept_index_ptr + row + ti).to(tl.int64) - base
         tl.store(track_steps_out_ptr + b, tl.where(cross, cand, -1))

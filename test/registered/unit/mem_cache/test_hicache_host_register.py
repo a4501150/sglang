@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
 )
+from sglang.srt.mem_cache.pool_host import common as pool_host_common
 from sglang.srt.mem_cache.pool_host import mha as mha_pool_host
 from sglang.srt.mem_cache.pool_host import mla as mla_pool_host
 from sglang.srt.mem_cache.pool_host.common import (
@@ -74,10 +75,13 @@ class TestHiCacheHostRegister(unittest.TestCase):
             with self.subTest(layout=layout):
                 host = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
                 host.device_pool = SimpleNamespace(
-                    device="cpu", index_k_with_scale_buffer=target_buffers
+                    device="cpu",
+                    get_hicache_indexer_page_buffers=lambda: target_buffers,
                 )
                 host.mtp_draft_device_pools = [
-                    SimpleNamespace(index_k_with_scale_buffer=[draft_buffer])
+                    SimpleNamespace(
+                        get_hicache_indexer_page_buffers=lambda: [draft_buffer]
+                    )
                 ]
                 host.layout = layout
                 host.layer_num = 4
@@ -164,6 +168,8 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 pool.device = "cpu"
                 pool.pin_memory = True
                 pool.allocator = object()
+                pool.slot_sibling_tensors = []
+                pool.slot_sibling_storage_bytes = []
                 alloc = mock.Mock(
                     side_effect=lambda *args, **kwargs: torch.empty(
                         1, dtype=torch.uint8
@@ -184,6 +190,128 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         3 * 2 * 2 * torch.float32.itemsize,
                     ],
                 )
+
+    def test_mamba_ple_sibling_uses_aligned_backing_rows(self):
+        pool = MambaPoolHost.__new__(MambaPoolHost)
+        pool.layout = "page_first"
+        pool.page_size = 1
+        pool.size = 2
+        pool.num_mamba_layers = 1
+        pool.temporal_state_shape = (0,)
+        pool.temporal_state_elem_size = 0
+        pool.conv_state_shapes = []
+        pool.conv_state_elem_sizes = []
+        pool.temporal_dtype = torch.float16
+        pool.conv_dtype = torch.float16
+        pool.device_pool = SimpleNamespace(device="cpu")
+        pool.device = "cpu"
+        pool.pin_memory = False
+        pool.allocator = object()
+        ngram_device = torch.empty((3, 2), dtype=torch.int64)
+        pool.slot_sibling_tensors = [("ple_ngram", ngram_device, 0)]
+        pool.slot_sibling_elem_sizes = [2]
+        pool.slot_sibling_storage_bytes = [4096]
+
+        def allocate(dims, **kwargs):
+            return torch.empty(
+                dims,
+                dtype=kwargs["dtype"],
+                device=kwargs["device"],
+            )
+
+        alloc = mock.Mock(side_effect=allocate)
+        with mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}):
+            pool.kv_buffer = pool.init_kv_buffer()
+
+        logical = pool.slot_sibling_buffers[0]
+        storage = pool.slot_sibling_storage_buffers[0]
+        self.assertEqual(logical.shape, (2, 2))
+        self.assertEqual(logical.stride(0) * logical.element_size(), 4096)
+        self.assertEqual(storage.stride(0) * storage.element_size(), 4096)
+        self.assertEqual(alloc.call_args.kwargs["registration_granularity_bytes"], 4096)
+        self.assertIs(pool.get_hybrid_pool_buffer()[-1], storage)
+        self.assertEqual(torch.count_nonzero(storage).item(), 0)
+
+        logical[0] = torch.tensor([101, 202])
+        self.assertTrue(torch.equal(storage[0, :2], torch.tensor([101, 202])))
+        self.assertEqual(torch.count_nonzero(storage[0, 2:]).item(), 0)
+
+        pool.size_per_token = pool.get_size_per_token()
+        pool.set_from_flat_data_page(1, pool.get_data_page(0))
+        self.assertTrue(torch.equal(logical[1], logical[0]))
+        self.assertEqual(torch.count_nonzero(storage[1, 2:]).item(), 0)
+
+        ptrs, sizes = pool.get_page_buffer_meta(torch.tensor([0, 1]))
+        self.assertEqual(ptrs, [storage.data_ptr(), storage.data_ptr() + 4096])
+        self.assertEqual(sizes, [4096, 4096])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_mamba_direct_copy_honors_padded_logical_stride(self):
+        storage = torch.zeros((4, 512), dtype=torch.int64, pin_memory=True)
+        host = storage.as_strided(size=(4, 2), stride=(512, 1))
+        device = torch.arange(8, device="cuda", dtype=torch.int64).reshape(4, 2)
+        host_indices = torch.tensor([0, 3], dtype=torch.int64)
+        device_indices = torch.tensor([1, 2], device="cuda", dtype=torch.int64)
+        expected = device[device_indices].cpu()
+
+        MambaPoolHost._copy_tensor(
+            device, host, device_indices, host_indices, io_backend="direct"
+        )
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(host[host_indices], expected))
+        self.assertEqual(torch.count_nonzero(storage[0, 2:]).item(), 0)
+        self.assertEqual(torch.count_nonzero(storage[3, 2:]).item(), 0)
+
+        device[device_indices] = 0
+        MambaPoolHost._copy_tensor(
+            host, device, host_indices, device_indices, io_backend="direct"
+        )
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(device[device_indices].cpu(), expected))
+
+    def test_mamba_page_roundtrip_includes_ple_siblings(self):
+        pool = MambaPoolHost.__new__(MambaPoolHost)
+        pool.layout = "page_first"
+        pool.page_size = 1
+        pool.size = 2
+        pool.num_mamba_layers = 1
+        pool.temporal_state_elem_size = 2
+        pool.conv_state_elem_sizes = [3]
+        pool.temporal_dtype = torch.float16
+        pool.conv_dtype = torch.float16
+        pool.temporal_buffer = torch.arange(4, dtype=torch.float16).reshape(2, 1, 1, 2)
+        pool.conv_buffer = [torch.arange(6, dtype=torch.float16).reshape(2, 1, 1, 3)]
+        short_conv_device = torch.empty((2, 3, 4), dtype=torch.float16)
+        ngram_device = torch.empty((3, 3), dtype=torch.int64)
+        pool.slot_sibling_tensors = [
+            ("ple_short_conv", short_conv_device, 1),
+            ("ple_ngram", ngram_device, 0),
+        ]
+        pool.slot_sibling_elem_sizes = [8, 3]
+        pool.slot_sibling_buffers = [
+            torch.arange(16, dtype=torch.float16).reshape(2, 2, 4),
+            torch.empty((2, 3), dtype=torch.int64),
+        ]
+        pool.slot_sibling_buffers[0][0] = torch.arange(8, dtype=torch.float16).reshape(
+            2, 4
+        )
+        pool.slot_sibling_buffers[1][0] = torch.tensor([101, 202, 303])
+        pool.size_per_token = pool.get_size_per_token()
+
+        expected = [tensor.clone() for tensor in pool._iter_page_tensors(0)]
+        data_page = pool.get_data_page(0)
+        self.assertEqual(data_page.numel(), pool.size_per_token)
+        for tensor in pool._iter_page_tensors(1):
+            tensor.zero_()
+
+        pool.set_from_flat_data_page(1, data_page)
+
+        for actual, wanted in zip(pool._iter_page_tensors(1), expected):
+            self.assertTrue(torch.equal(actual, wanted))
+        self.assertEqual(
+            [name for name, _ in pool.get_debug_page_tensors(1)],
+            ["mamba_temporal", "mamba_conv_0", "ple_short_conv", "ple_ngram"],
+        )
 
     def test_deepseek_v4_page_layouts_use_page_registration_granularity(self):
         for layout in ("page_first", "page_first_direct"):
@@ -406,6 +534,100 @@ class TestHiCacheHostRegister(unittest.TestCase):
         )
         for ptr, _, _ in cudart.registrations:
             self.assertEqual((ptr - base) % page_copy_bytes, 0)
+
+
+class _FakeAttrCudart:
+    def __init__(self, result=0, reported=1, raises=None):
+        self.result = result
+        self.reported = reported
+        self.raises = raises
+        self.calls = []
+
+    def cudaDeviceGetAttribute(self, ptr, attr, device):
+        self.calls.append((attr, device))
+        if self.raises is not None:
+            raise self.raises
+        ptr._obj.value = self.reported
+        return self.result
+
+
+class TestHostPointerCapabilityQuery(unittest.TestCase):
+    """can_use_host_pointer_for_registered_mem must be portable: no bare
+    libcudart dlopen, safe (False, never raising) on HIP / non-CUDA, and a
+    plain attribute query through torch.cuda.cudart() on CUDA."""
+
+    def setUp(self):
+        pool_host_common.can_use_host_pointer_for_registered_mem.cache_clear()
+
+    tearDown = setUp
+
+    def test_no_cuda_returns_false_without_querying(self):
+        cudart = mock.Mock()
+        with (
+            mock.patch.object(pool_host_common, "_is_hip", False),
+            mock.patch("torch.cuda.is_available", return_value=False),
+            mock.patch.object(torch.cuda, "cudart", cudart),
+        ):
+            self.assertFalse(
+                pool_host_common.can_use_host_pointer_for_registered_mem(0)
+            )
+        cudart.assert_not_called()
+
+    def test_hip_returns_false_without_querying(self):
+        cudart = mock.Mock()
+        with (
+            mock.patch.object(pool_host_common, "_is_hip", True),
+            mock.patch("torch.cuda.is_available", return_value=True),
+            mock.patch.object(torch.cuda, "cudart", cudart),
+        ):
+            self.assertFalse(
+                pool_host_common.can_use_host_pointer_for_registered_mem(0)
+            )
+        cudart.assert_not_called()
+
+    def test_supported_query_returns_true(self):
+        cudart = _FakeAttrCudart(result=0, reported=1)
+        with (
+            mock.patch.object(pool_host_common, "_is_hip", False),
+            mock.patch("torch.cuda.is_available", return_value=True),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            self.assertTrue(pool_host_common.can_use_host_pointer_for_registered_mem(1))
+        attr = pool_host_common._CUDA_DEV_ATTR_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM
+        self.assertEqual(cudart.calls, [(attr, 1)])
+
+    def test_absent_capability_returns_false(self):
+        cudart = _FakeAttrCudart(result=0, reported=0)
+        with (
+            mock.patch.object(pool_host_common, "_is_hip", False),
+            mock.patch("torch.cuda.is_available", return_value=True),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            self.assertFalse(
+                pool_host_common.can_use_host_pointer_for_registered_mem(0)
+            )
+
+    def test_api_error_returns_false_without_raising(self):
+        cudart = _FakeAttrCudart(result=3)
+        with (
+            mock.patch.object(pool_host_common, "_is_hip", False),
+            mock.patch("torch.cuda.is_available", return_value=True),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            self.assertFalse(
+                pool_host_common.can_use_host_pointer_for_registered_mem(0)
+            )
+
+    def test_cudart_unavailable_returns_false_without_raising(self):
+        cudart = _FakeAttrCudart(raises=OSError("libcudart not loaded"))
+        with (
+            mock.patch.object(pool_host_common, "_is_hip", False),
+            mock.patch("torch.cuda.is_available", return_value=True),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            self.assertFalse(
+                pool_host_common.can_use_host_pointer_for_registered_mem(0)
+            )
 
 
 if __name__ == "__main__":

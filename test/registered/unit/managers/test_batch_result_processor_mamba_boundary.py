@@ -14,6 +14,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_utils import _verify_commit_step_indices
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -217,8 +218,8 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
         scheduler.last_batch = None
         events = []
         scheduler.model_worker = MagicMock()
-        scheduler.model_worker.wait_for_pending_state_recovery.side_effect = (
-            lambda: events.append("wait")
+        scheduler.model_worker.wait_for_pending_state_recovery.side_effect = lambda: (
+            events.append("wait")
         )
         scheduler.process_batch_result = MagicMock(
             side_effect=lambda *_args: events.append("process")
@@ -249,8 +250,8 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
         runner.req_to_token_pool = FakeHybridReqToTokenPool()
         runner.is_draft_worker = False
         runner.attn_backend = MagicMock()
-        runner.attn_backend.join_pending_state_recovery.side_effect = (
-            lambda: events.append("join")
+        runner.attn_backend.join_pending_state_recovery.side_effect = lambda: (
+            events.append("join")
         )
         forward_batch = SimpleNamespace(
             forward_mode=SimpleNamespace(
@@ -272,6 +273,63 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
         self.assertEqual(events, ["join", "wait_hicache", "copy"])
         self.assertIsNone(forward_batch.mamba_cow_src_indices)
         self.assertIsNone(forward_batch.mamba_cow_dst_indices)
+
+
+class TestSpecVerifyCommitTrackStep(unittest.TestCase):
+    """Spec-verify commit index math: an interval crossing in the MIDDLE of
+    the accepted path must track the state where the sequence reaches the
+    boundary token, not the state one accepted step later."""
+
+    def _commit_step_indices(self, seq_lens_pre, accept_lens, interval):
+        bs = len(accept_lens)
+        draft_token_num = max(accept_lens)
+        # Linear accepted chain: node i of req b is slot b * draft_token_num + i.
+        accept_index = torch.arange(bs * draft_token_num).reshape(bs, draft_token_num)
+        batch = SimpleNamespace(
+            tree_cache=SimpleNamespace(page_size=interval),
+            mamba_track_indices=object(),
+            seq_lens=torch.tensor(seq_lens_pre, dtype=torch.int64),
+        )
+        last, track = _verify_commit_step_indices(
+            batch=batch,
+            accept_index=accept_index,
+            accept_lens=torch.tensor(accept_lens, dtype=torch.int64),
+            draft_token_num=draft_token_num,
+        )
+        return last.tolist(), track.tolist()
+
+    def test_mid_path_crossing_tracks_boundary_step(self):
+        interval = 64
+        with get_context().override_server_args(
+            mamba_track_interval=interval,
+            _mamba_cache_chunk_size=interval,
+        ):
+            # req0 crosses token 64 after two of five accepted tokens: the
+            # checkpoint is accepted step 1 (state at seq_len 64), not step 2.
+            # req1 never crosses (already past the grid line). req2 crosses
+            # exactly at its last accepted token.
+            last, track = self._commit_step_indices(
+                seq_lens_pre=[62, 64, 59],
+                accept_lens=[5, 3, 5],
+                interval=interval,
+            )
+        self.assertEqual(last, [4, 2, 4])
+        self.assertEqual(track, [1, -1, 4])
+
+    def test_boundary_before_first_accepted_token_clamps_to_zero(self):
+        interval = 64
+        with get_context().override_server_args(
+            mamba_track_interval=interval,
+            _mamba_cache_chunk_size=interval,
+        ):
+            # pre=63: the boundary token is the first accepted token, so the
+            # tracked step is 0.
+            _last, track = self._commit_step_indices(
+                seq_lens_pre=[63],
+                accept_lens=[2],
+                interval=interval,
+            )
+        self.assertEqual(track, [0])
 
 
 if __name__ == "__main__":

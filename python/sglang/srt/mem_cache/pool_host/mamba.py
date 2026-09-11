@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import math
 import os
 import threading
 from typing import Optional
 
 import numpy as np
 import torch
+
+from sglang.srt.environ import envs
 
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.mem_cache.pool_host.base import (
@@ -17,7 +21,10 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    can_use_host_pointer_for_registered_mem,
     get_allocator_from_storage,
+    transfer_kv_all_layer_direct_lf_pf,
+    transfer_kv_per_layer_direct_pf_lf,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
@@ -29,9 +36,7 @@ transfer_state_all_layer_direct_lf_pf = None
 transfer_mamba_state = None
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
-        transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_direct,
-        transfer_kv_per_layer_direct_pf_lf,
         transfer_kv_per_layer_mla,
     )
 if _is_cuda or _is_hip:
@@ -55,6 +60,8 @@ if _is_npu:
         pass
 
 logger = logging.getLogger(__name__)
+
+_STORAGE_ALIGNMENT_BYTES = 4096
 
 
 _NPU_HICACHE_MAMBA_IO_ENV = "SGLANG_NPU_HICACHE_MAMBA_IO"
@@ -95,6 +102,23 @@ class MambaPoolHost(HostKVCache):
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
         self.num_mamba_layers = device_pool.num_mamba_layers
+        self.slot_sibling_tensors = [
+            descriptor
+            for sibling in getattr(device_pool, "_slot_siblings", ())
+            for descriptor in sibling.get_storage_tensors()
+        ]
+        self.slot_sibling_elem_sizes = [
+            tensor.numel() // tensor.shape[slot_axis]
+            for _, tensor, slot_axis in self.slot_sibling_tensors
+        ]
+        self.slot_sibling_storage_bytes = [
+            (elem_size * tensor.element_size() + _STORAGE_ALIGNMENT_BYTES - 1)
+            // _STORAGE_ALIGNMENT_BYTES
+            * _STORAGE_ALIGNMENT_BYTES
+            for elem_size, (_, tensor, _) in zip(
+                self.slot_sibling_elem_sizes, self.slot_sibling_tensors
+            )
+        ]
 
         self.conv_state_shapes = [
             conv_state.shape[2:] for conv_state in device_pool.mamba_cache.conv
@@ -108,13 +132,14 @@ class MambaPoolHost(HostKVCache):
         self.temporal_dtype = device_pool.mamba_cache.temporal.dtype
         self.dtype = self.conv_dtype
         self.size_per_token = self.get_size_per_token()
+        self.allocation_size_per_token = self.get_allocation_size_per_token()
 
         device_capacity = getattr(device_pool, "host_capacity_tokens", None)
         if device_capacity is None:
             device_capacity = device_pool.size
         if host_size > 0:
             self.size = sync_fixed_hicache_size(
-                int(host_size * 1e9 // self.size_per_token), host_size
+                int(host_size * 1e9 // self.allocation_size_per_token), host_size
             )
         else:
             self.size = int(device_capacity * host_to_device_ratio)
@@ -131,7 +156,7 @@ class MambaPoolHost(HostKVCache):
                 device_capacity,
             )
 
-        requested_bytes = self.size * self.size_per_token
+        requested_bytes = self.size * self.allocation_size_per_token
         available_bytes = host_memory_budget_bytes(requested_bytes)
         if requested_bytes > available_bytes:
             raise ValueError(
@@ -264,11 +289,45 @@ class MambaPoolHost(HostKVCache):
                         allocator=self.allocator,
                     )
                 )
-        # destroy() unregisters via kv_buffer; without this list the pinned
-        # registrations leak past the buffers' mmap. 0-element buffers
-        # (conv-only models' temporal state) were never registered.
+        self.slot_sibling_buffers = []
+        self.slot_sibling_storage_buffers = []
+        for storage_bytes, (_, tensor, slot_axis) in zip(
+            self.slot_sibling_storage_bytes, self.slot_sibling_tensors
+        ):
+            logical_shape = (*tensor.shape[:slot_axis], *tensor.shape[slot_axis + 1 :])
+            storage_elements = storage_bytes // tensor.element_size()
+            storage_buffer = alloc_func(
+                (self.size, storage_elements),
+                dtype=tensor.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+            logical_strides = []
+            stride = 1
+            for dim in reversed(logical_shape):
+                logical_strides.append(stride)
+                stride *= dim
+            logical_buffer = storage_buffer.as_strided(
+                size=(self.size, *logical_shape),
+                stride=(storage_elements, *reversed(logical_strides)),
+            )
+            # Padded backing rows carry garbage past the logical extent:
+            # zero the buffer explicitly rather than reusing the strides'
+            # running product, which silently ties this to the last loop.
+            logical_bytes = math.prod(logical_shape) * tensor.element_size()
+            if storage_bytes > logical_bytes:
+                storage_buffer.zero_()
+            self.slot_sibling_storage_buffers.append(storage_buffer)
+            self.slot_sibling_buffers.append(logical_buffer)
         return [
-            buf for buf in (self.temporal_buffer, *self.conv_buffer) if buf.numel() > 0
+            buf
+            for buf in (
+                self.temporal_buffer,
+                *self.conv_buffer,
+                *self.slot_sibling_storage_buffers,
+            )
+            if buf.numel() > 0
         ]
 
     def _init_write_back_staging_buffers(self):
@@ -283,8 +342,11 @@ class MambaPoolHost(HostKVCache):
         self._conv_can_use_jit = [False] * len(self.conv_buffer)
 
     def get_hybrid_pool_buffer(self):
-        # Expose all mamba host tensors that need Mooncake buffer registration.
-        return [self.temporal_buffer, *self.conv_buffer]
+        return [
+            self.temporal_buffer,
+            *self.conv_buffer,
+            *self.slot_sibling_storage_buffers,
+        ]
 
     def _iter_page_tensors(self, index: int):
         if self.layout in ["page_first", "page_first_direct"]:
@@ -295,6 +357,63 @@ class MambaPoolHost(HostKVCache):
             yield self.temporal_buffer[:, index : index + self.page_size]
             for conv_buf in self.conv_buffer:
                 yield conv_buf[:, index : index + self.page_size]
+        for sibling_buf in self.slot_sibling_buffers:
+            yield sibling_buf[index]
+
+    def get_debug_page_tensors(self, index: int):
+        yield "mamba_temporal", self.temporal_buffer[index]
+        for conv_idx, conv_buf in enumerate(self.conv_buffer):
+            yield f"mamba_conv_{conv_idx}", conv_buf[index]
+        for (name, _, _), sibling_buf in zip(
+            self.slot_sibling_tensors, self.slot_sibling_buffers
+        ):
+            yield name, sibling_buf[index]
+
+    def _iter_device_slot_tensors(self, index: int):
+        yield "mamba_temporal", self.device_pool.mamba_cache.temporal[:, index]
+        for conv_idx, conv_state in enumerate(self.device_pool.mamba_cache.conv):
+            yield f"mamba_conv_{conv_idx}", conv_state[:, index]
+        for name, tensor, slot_axis in self.slot_sibling_tensors:
+            slices = [slice(None)] * tensor.ndim
+            slices[slot_axis] = index
+            yield name, tensor[tuple(slices)]
+
+    @staticmethod
+    def _tensor_digest(tensor: torch.Tensor) -> str:
+        flat_bytes = tensor.detach().contiguous().view(torch.uint8).reshape(-1).cpu()
+        return hashlib.sha256(flat_bytes.numpy()).hexdigest()
+
+    def log_transfer_digests(
+        self,
+        direction: str,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+    ) -> None:
+        if not envs.SGLANG_HICACHE_FILE_BACKEND_LOG_PAGE_DIGESTS.get():
+            return
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
+        host_indices_list = host_indices.cpu().tolist()
+        device_indices_list = device_indices.cpu().tolist()
+        for host_index, device_index in zip(host_indices_list, device_indices_list):
+            host_components = dict(self.get_debug_page_tensors(host_index))
+            device_components = dict(self._iter_device_slot_tensors(device_index))
+            for component, host_tensor in host_components.items():
+                host_digest = self._tensor_digest(host_tensor)
+                device_digest = self._tensor_digest(device_components[component])
+                logger.warning(
+                    "HiCache transfer digest direction=%s component=%s "
+                    "host_page=%d device_slot=%d bytes=%d host_sha256=%s "
+                    "device_sha256=%s exact=%s",
+                    direction,
+                    component,
+                    host_index,
+                    device_index,
+                    host_tensor.numel() * host_tensor.element_size(),
+                    host_digest,
+                    device_digest,
+                    host_digest == device_digest,
+                )
 
     @staticmethod
     def _flatten_tensor_bytes(tensor: torch.Tensor) -> torch.Tensor:
@@ -343,7 +462,26 @@ class MambaPoolHost(HostKVCache):
             for conv_elem_size in self.conv_state_elem_sizes
         )
         temporal_size = self.temporal_state_elem_size * self.temporal_dtype.itemsize
-        return (conv_total_size + temporal_size) * self.num_mamba_layers
+        sibling_size = sum(
+            elem_size * tensor.element_size()
+            for elem_size, (_, tensor, _) in zip(
+                self.slot_sibling_elem_sizes, self.slot_sibling_tensors
+            )
+        )
+        return (conv_total_size + temporal_size) * self.num_mamba_layers + sibling_size
+
+    def get_allocation_size_per_token(self):
+        logical_sibling_bytes = sum(
+            elem_size * tensor.element_size()
+            for elem_size, (_, tensor, _) in zip(
+                self.slot_sibling_elem_sizes, self.slot_sibling_tensors
+            )
+        )
+        return (
+            self.get_size_per_token()
+            - logical_sibling_bytes
+            + sum(self.slot_sibling_storage_bytes)
+        )
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
@@ -401,10 +539,11 @@ class MambaPoolHost(HostKVCache):
             )
             dst.index_copy_(0, dst_indices.to(dst.device), staged)
             return
-        if io_backend == "kernel":
+        if io_backend == "kernel" and can_use_host_pointer_for_registered_mem(
+            torch.cuda.current_device()
+        ):
             # TODO: Rename the interface for clarity.
-            # Here, transfer_kv_per_layer_mla is reused to transfer the Mamba state.
-            # This has nothing to do with MLA; it's only reused because this interface happens to transfer a single Pool.
+            # This reuses the MLA interface because it transfers one pool.
             transfer_kv_per_layer_mla(
                 src=src,
                 dst=dst,
@@ -412,7 +551,7 @@ class MambaPoolHost(HostKVCache):
                 dst_indices=dst_indices,
                 item_size=MambaPoolHost._item_size_per_index(src),
             )
-        elif io_backend == "direct":
+        elif io_backend in ("kernel", "direct"):
             transfer_kv_direct(
                 src_layers=[src],
                 dst_layers=[dst],
@@ -460,11 +599,11 @@ class MambaPoolHost(HostKVCache):
             )
             dst.index_copy_(0, dst_indices.to(dst.device), staged)
             return
-        if io_backend == "kernel":
+        if io_backend == "kernel" and can_use_host_pointer_for_registered_mem(
+            torch.cuda.current_device()
+        ):
+            # Mamba JIT kernels require CUDA index tensors.
             item_size = MambaPoolHost._item_size_per_index(dst)
-            # Mamba JIT kernel expects all index tensors on CUDA.
-            # host_indices may be on CPU (kept there by start_writing when
-            # can_use_write_back_jit is True on the HostPoolGroup).
             if src_indices.device.type != "cuda":
                 src_indices = src_indices.to(dst_indices.device, non_blocking=True)
             transfer_kv_mamba_pf_lf(
@@ -476,7 +615,7 @@ class MambaPoolHost(HostKVCache):
                 item_size=item_size,
                 src_layout_dim=item_size * num_layers,
             )
-        elif io_backend == "direct":
+        elif io_backend in ("kernel", "direct"):
             transfer_kv_per_layer_direct_pf_lf(
                 src_ptrs=[src],
                 dst_ptrs=[dst],
@@ -543,7 +682,10 @@ class MambaPoolHost(HostKVCache):
                 can_use_jit=can_use_jit,
             )
             return
-        if io_backend == "kernel":
+        if io_backend == "kernel" and can_use_host_pointer_for_registered_mem(
+            torch.cuda.current_device()
+        ):
+            # Host indices stay on CPU for staged MHA write-back.
             item_size = MambaPoolHost._item_size_per_index(src_layers[0])
             transfer_kv_mamba_lf_pf(
                 src_ptrs=src_ptrs,
@@ -554,7 +696,7 @@ class MambaPoolHost(HostKVCache):
                 dst_layout_dim=item_size * num_layers,
                 num_layers=num_layers,
             )
-        elif io_backend == "direct":
+        elif io_backend in ("kernel", "direct"):
             src_ptrs = [src_layers[i] for i in range(num_layers)]
             transfer_kv_all_layer_direct_lf_pf(
                 src_ptrs=src_ptrs,
@@ -671,6 +813,30 @@ class MambaPoolHost(HostKVCache):
                     io_backend,
                 )
 
+    def load_slot_siblings_to_device(
+        self, device_pool, host_indices, device_indices, io_backend="kernel"
+    ):
+        for (_, device_tensor, slot_axis), host_buffer in zip(
+            self.slot_sibling_tensors, self.slot_sibling_buffers
+        ):
+            if slot_axis == 0:
+                self._copy_tensor(
+                    host_buffer,
+                    device_tensor,
+                    host_indices,
+                    device_indices,
+                    io_backend,
+                )
+            else:
+                for layer_id in range(device_tensor.shape[0]):
+                    self._copy_tensor(
+                        host_buffer[:, layer_id],
+                        device_tensor[layer_id],
+                        host_indices,
+                        device_indices,
+                        io_backend,
+                    )
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
@@ -723,6 +889,28 @@ class MambaPoolHost(HostKVCache):
                         io_backend,
                     )
 
+        for (_, device_tensor, slot_axis), host_buffer in zip(
+            self.slot_sibling_tensors, self.slot_sibling_buffers
+        ):
+            if slot_axis == 0:
+                self._copy_tensor(
+                    device_tensor,
+                    host_buffer,
+                    device_indices,
+                    host_indices,
+                    io_backend,
+                )
+            else:
+                for layer_id in range(device_tensor.shape[0]):
+                    self._copy_tensor(
+                        device_tensor[layer_id],
+                        host_buffer[:, layer_id],
+                        device_indices,
+                        host_indices,
+                        io_backend,
+                    )
+        self.log_transfer_digests("device_to_host", host_indices, device_indices)
+
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         data_page = torch.cat(
             [
@@ -745,14 +933,24 @@ class MambaPoolHost(HostKVCache):
         index: int,
         data_page: torch.Tensor,
     ) -> None:
+        # ``flat_bytes`` is a view of the caller-owned ``data_page``, which
+        # stays live through the synchronous copies below; no clone needed.
         flat_bytes = data_page.contiguous().view(torch.uint8).reshape(-1)
         start = 0
         for tensor in self._iter_page_tensors(index):
             num_bytes = tensor.numel() * tensor.element_size()
             tensor_bytes = flat_bytes[start : start + num_bytes]
             start += num_bytes
-            restored = tensor_bytes.view(dtype=tensor.dtype).reshape(tensor.shape)
-            tensor.copy_(restored)
+            if tensor.is_contiguous():
+                # Byte-level restore avoids the dtype-view storage-offset
+                # divisibility rule: a component's page offset is only a
+                # multiple of the smallest element size, not necessarily of
+                # the component's own (e.g. int64 siblings).
+                tensor.view(torch.uint8).reshape(-1).copy_(tensor_bytes)
+            else:
+                tensor.copy_(
+                    tensor_bytes.clone().view(dtype=tensor.dtype).reshape(tensor.shape)
+                )
 
     def get_page_buffer_meta(self, indices):
         """Meta data for zero-copy storage I/O.
@@ -769,10 +967,10 @@ class MambaPoolHost(HostKVCache):
         ptr_list = []
         element_size_list = []
 
-        # Compute base pointers once; each page pointer is offset from these bases.
         temporal_base_ptr = self.temporal_buffer.data_ptr()
         conv_base_ptrs = [buf.data_ptr() for buf in self.conv_buffer]
-        # Component sizes are constant across pages, so precompute once as well.
+        sibling_storage_buffers = self.slot_sibling_storage_buffers
+        sibling_base_ptrs = [buf.data_ptr() for buf in sibling_storage_buffers]
         temporal_element_size = (
             self.page_size
             * self.num_mamba_layers
@@ -787,6 +985,10 @@ class MambaPoolHost(HostKVCache):
                 * self.conv_state_elem_sizes[i]
             )
             for i in range(len(self.conv_state_shapes))
+        ]
+        sibling_element_sizes = [
+            self.page_size * buf.stride(0) * buf.element_size()
+            for buf in sibling_storage_buffers
         ]
 
         for i in range(0, len(indices), self.page_size):
@@ -814,6 +1016,9 @@ class MambaPoolHost(HostKVCache):
                 )
                 ptr_list.append(conv_ptr)
                 element_size_list.append(conv_element_sizes[j])
+            for base_ptr, element_size in zip(sibling_base_ptrs, sibling_element_sizes):
+                ptr_list.append(base_ptr + indices[i] * element_size)
+                element_size_list.append(element_size)
         return ptr_list, element_size_list
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
@@ -833,5 +1038,9 @@ class MambaPoolHost(HostKVCache):
             if buf.data_ptr() % page_size_bytes != 0:
                 return False
             if conv_stride % page_size_bytes != 0:
+                return False
+        for buf in self.slot_sibling_storage_buffers:
+            stride = buf.stride(0) * buf.element_size()
+            if buf.data_ptr() % page_size_bytes != 0 or stride % page_size_bytes != 0:
                 return False
         return True

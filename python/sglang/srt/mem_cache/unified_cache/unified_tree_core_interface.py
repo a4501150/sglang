@@ -142,6 +142,10 @@ class UnifiedTreeCoreInterface(ABC):
     Tree Core as opaque behind this surface, which grows as tree operations
     migrate onto the TreeCore."""
 
+    # Whether this core implements ``insert_device`` (device-direct prefetch
+    # splice). Cores without it must keep prefetches on the host path.
+    supports_device_insert = False
+
     # ==== Tree-owned state the Controller reads (or, via its facade setters, writes) ====
     page_size: int
     is_eagle: bool

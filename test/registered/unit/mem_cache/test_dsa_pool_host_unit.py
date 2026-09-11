@@ -1,5 +1,6 @@
 import inspect
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -23,6 +24,41 @@ class TestDSAOffloadSignatures(unittest.TestCase):
             with self.subTest(method_name=method_name):
                 signature = inspect.signature(getattr(DSATokenToKVPool, method_name))
                 self.assertIn("mamba_indices", signature.parameters)
+
+
+class TestSparseIndexerHostPages(unittest.TestCase):
+    def test_page_first_storage_round_trip_uses_device_page_contract(self):
+        device_buffers = [
+            torch.arange(96, dtype=torch.uint8).reshape(3, 32),
+            torch.arange(96, 192, dtype=torch.uint8).reshape(3, 32),
+        ]
+        device_pool = SimpleNamespace(
+            device="cpu",
+            start_layer=0,
+            layer_shard_enabled=False,
+            get_hicache_indexer_page_buffers=lambda: device_buffers,
+        )
+        anchor_host = SimpleNamespace(
+            page_size=4,
+            size=12,
+            page_num=3,
+            mtp_draft_device_pools=(),
+        )
+        host = DSAIndexerPoolHost(
+            device_pool=device_pool,
+            anchor_host=anchor_host,
+            layout="page_first",
+            pin_memory=False,
+            device="cpu",
+            allocator_type="default",
+        )
+        page = torch.arange(64, dtype=torch.uint8)
+
+        host.set_from_flat_data_page(4, page)
+
+        self.assertEqual(host.indexer_page_stride_size, 32)
+        self.assertEqual(host.size_per_token, 16)
+        self.assertTrue(torch.equal(host.get_data_page(4), page))
 
 
 class TestDSAHiCacheTransfer(unittest.TestCase):
@@ -143,6 +179,74 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
                     device_start : device_start + page_size
                 ].cpu()
                 self.assertTrue(torch.equal(got_kv, expected_kv))
+
+    def test_page_first_direct_page_contract_round_trip(self):
+        page_size = 64
+        page_bytes = 256
+        layer_num = 2
+        page_num = 4
+        device_buffers = [
+            torch.arange(page_num * page_bytes, device="cuda", dtype=torch.int64)
+            .to(torch.uint8)
+            .reshape(page_num, page_bytes)
+            + layer_id
+            for layer_id in range(layer_num)
+        ]
+        device_pool = SimpleNamespace(
+            device="cuda",
+            start_layer=0,
+            layer_shard_enabled=False,
+            get_hicache_indexer_page_buffers=lambda: device_buffers,
+        )
+        anchor_host = SimpleNamespace(
+            page_size=page_size,
+            size=page_num * page_size,
+            page_num=page_num,
+            mtp_draft_device_pools=(),
+        )
+        host = DSAIndexerPoolHost(
+            device_pool=device_pool,
+            anchor_host=anchor_host,
+            layout="page_first",
+            pin_memory=True,
+            device="cpu",
+            allocator_type="default",
+        )
+        device_pages = torch.tensor([1, 2], device="cuda", dtype=torch.int64)
+        host_pages = torch.tensor([0, 1], dtype=torch.int64)
+        device_indices = self._token_indices_for_pages(
+            device_pages, page_size, device="cuda"
+        )
+        host_indices = self._token_indices_for_pages(
+            host_pages, page_size, device="cpu"
+        )
+        expected = [buffer[device_pages].clone() for buffer in device_buffers]
+
+        host.backup_from_device_all_layer(
+            device_pool, host_indices, device_indices, "direct"
+        )
+        torch.cuda.synchronize()
+        for layer_id in range(layer_num):
+            self.assertTrue(
+                torch.equal(
+                    host.index_k_with_scale_buffer[:2, layer_id, 0],
+                    expected[layer_id].cpu(),
+                )
+            )
+            device_buffers[layer_id][device_pages] = 0
+            host.load_to_device_per_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                "direct",
+            )
+        torch.cuda.synchronize()
+
+        for layer_id in range(layer_num):
+            self.assertTrue(
+                torch.equal(device_buffers[layer_id][device_pages], expected[layer_id])
+            )
 
     @unittest.skipIf(
         is_hip(),

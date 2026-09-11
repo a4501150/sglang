@@ -34,6 +34,8 @@ class SlotIndexedState(Protocol):
 
     def iter_transfer_state_entries(self): ...
 
+    def get_storage_tensors(self) -> List[Tuple[str, torch.Tensor, int]]: ...
+
 
 class ShortConvPool:
     def __init__(
@@ -138,6 +140,11 @@ class ShortConvPool:
                 layer_id,
             )
 
+    def get_storage_tensors(self) -> List[Tuple[str, torch.Tensor, int]]:
+        if self.conv_state is None:
+            return []
+        return [("ple_short_conv", self.conv_state, 1)]
+
 
 class NGramPool:
     def __init__(
@@ -240,3 +247,8 @@ class NGramPool:
         """Yield replicated request-wide N-gram history for PD transfer."""
         if self.context is not None:
             yield "ple_ngram", self.context, None, PLE_NGRAM_STATE_LAYER_ID
+
+    def get_storage_tensors(self) -> List[Tuple[str, torch.Tensor, int]]:
+        if self.context is None:
+            return []
+        return [("ple_ngram", self.context, 0)]
