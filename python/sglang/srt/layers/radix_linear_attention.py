@@ -18,8 +18,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
-from torch import nn
-
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -30,6 +28,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from torch import nn
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -73,6 +72,8 @@ class RadixLinearAttention(nn.Module):
         self.v_dim = num_v_heads * head_v_dim
 
         self._conv_source = conv_weights
+        # (data_ptr, shape) -> memoized 2D view; see conv_weights.
+        self._conv_weights_cache = None
         self.bias = bias
         self.activation = activation
 
@@ -82,19 +83,35 @@ class RadixLinearAttention(nn.Module):
 
     @property
     def conv_weights(self):
-        """Convolution weights, derived fresh on every access.
+        """Convolution weights.
 
-        When an nn.Module (nn.Conv1d) is passed, the 2D view is built from the
-        CURRENT parameter. This is required because --cpu-offload-gb replaces
-        param.data; a view stored once then points at stale memory. Tensors
-        and tuples pass through unchanged so other models (KDA, ShortConv,
-        Lightning) are unaffected.
+        When an nn.Module (nn.Conv1d) is passed, the 2D view is memoized
+        keyed on (data_ptr, shape): --cpu-offload-gb replaces param.data
+        (changing the pointer), which is exactly when the view must be
+        rebuilt; a plain param update in place keeps the same storage, so
+        the memoized view stays live. Tensors and tuples pass through
+        unchanged so other models (KDA, ShortConv, Lightning) are
+        unaffected.
         """
         src = self._conv_source
         if isinstance(src, nn.Module):
             w = src.weight
-            return w.view(w.size(0), w.size(2))
+            key = (w.data_ptr(), tuple(w.shape))
+            cached = self._conv_weights_cache
+            if cached is not None and cached[0] == key:
+                return cached[1]
+            view = w.view(w.size(0), w.size(2))
+            self._conv_weights_cache = (key, view)
+            return view
         return src
+
+    @conv_weights.setter
+    def conv_weights(self, value):
+        # nn.Module rejects replacing a registered child with a tensor.
+        if "_conv_source" in self._modules:
+            delattr(self, "_conv_source")
+        self._conv_source = value
+        self._conv_weights_cache = None
 
     def forward(
         self,

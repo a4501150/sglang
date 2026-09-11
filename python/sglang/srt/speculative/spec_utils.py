@@ -43,7 +43,10 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
-from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
+from sglang.srt.managers.schedule_batch import (
+    mamba_lazy_spec_in_window,
+    set_mamba_track_indices_from_reqs,
+)
 from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool as assign_req_to_token_pool,
@@ -850,6 +853,37 @@ def move_accept_tokens_to_target_kvcache(
     )
 
 
+def _recover_ssm_track_unreachable(batch: ScheduleBatch) -> bool:
+    """Whether RecoverSSM may drop this verify's mamba-track plan entirely.
+
+    RecoverSSM (``--gdn-mtp-cache-mode none``) caches no intermediate h, so its
+    interval checkpoint is a second full per-GDN-layer recovery sweep rather
+    than a scatter out of a cache (see
+    ``HybridLinearAttnBackend._no_cache_mtp_recompute``). When no request can
+    reach a track boundary this step that sweep only refolds h_0 into the
+    reserved discard slot, so dropping the plan lets the commit path skip both
+    it and its conv counterpart. Only RecoverSSM opts in: the other modes
+    checkpoint with a scatter whose cost does not scale with the layer count.
+
+    Reuses ``mamba_lazy_spec_in_window``, whose 2x draft-token window absorbs
+    ``kv_committed_len`` lagging the device ``seq_lens`` under overlap. True
+    therefore means a crossing is *impossible* this step, never merely absent,
+    so a real checkpoint can never be skipped -- which is what keeps this
+    consistent with the independently computed ping-pong advance in
+    ``BatchResultProcessor._mamba_check_track_boundary``.
+    """
+    if get_exec().mamba.gdn_mtp_cache_mode != "none":
+        return False
+    max_draft_tokens = max_speculative_num_draft_tokens()
+    if max_draft_tokens is None:
+        return False
+    mamba_track_interval = get_exec().mamba.mamba_track_interval
+    return not any(
+        mamba_lazy_spec_in_window(req, mamba_track_interval, max_draft_tokens)
+        for req in batch.reqs
+    )
+
+
 def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """Rebuild mamba track indices from reqs before a TARGET_VERIFY forward.
 
@@ -861,8 +895,18 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
 
     Lazy: gather the positions planned by mamba_lazy_spec_prepare. Runs
     inside forward isolation, so it must not mutate req/pool state.
+
+    RecoverSSM: leave the plan unset on steps where no crossing is reachable,
+    which elides a whole per-GDN-layer boundary recovery sweep.
     """
     if not get_exec().mamba.enable_mamba_extra_buffer:
+        return
+    if _recover_ssm_track_unreachable(batch):
+        # Cleared explicitly: a plan built for an earlier step would otherwise
+        # survive here and re-arm the boundary sweep against stale slots.
+        batch.mamba_track_indices = None
+        batch.mamba_track_mask = None
+        batch.mamba_track_seqlens = None
         return
     track_positions = None
     if get_exec().mamba.enable_mamba_extra_buffer_lazy:
@@ -878,6 +922,52 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     batch.mamba_track_seqlens = None
     batch.mamba_prefill_track_mask_cpu = None
     batch.mamba_track_seqlens_cpu = None
+
+
+def _verify_commit_index_preamble(accept_index, accept_lens, bs, draft_token_num):
+    """Shared eager-path preamble of the mamba verify commits: the request
+    rows, the per-request accepted-token arange offsets, and each request's
+    last fully accepted step."""
+    accept_indices_offset = torch.arange(
+        0,
+        bs * draft_token_num,
+        step=draft_token_num,
+        dtype=accept_lens.dtype,
+        device=accept_lens.device,
+    )
+    req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+    last_correct_step_indices = (
+        accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
+        - accept_indices_offset
+    )
+    return req_idx, accept_indices_offset, last_correct_step_indices
+
+
+def _mamba_steps_to_track(
+    seq_pre,
+    accept_lens,
+    accept_index,
+    req_idx,
+    accept_indices_offset,
+    mamba_track_interval,
+):
+    """Eager-path twin of fused_commit_track_indices: for each request whose
+    verify crossed a track interval, the accepted step whose state lands on
+    the crossing boundary (its checkpoint snapshots into the track slot);
+    -1 for non-crossing rows. Clamping only guards the masked rows."""
+    seq_post = seq_pre + accept_lens
+    to_track_mask = (
+        seq_pre // mamba_track_interval != seq_post // mamba_track_interval
+    )
+    tracking_point = seq_post // mamba_track_interval * mamba_track_interval
+    # The state after the token at position tracking_point - 1 is the
+    # accepted step tracking_point - pre - 1 (0-based within the accepted path).
+    to_track_ith = torch.clamp(
+        torch.minimum(tracking_point - seq_pre - 1, accept_lens - 1),
+        min=0,
+    ).to(torch.int64)
+    candidate = accept_index[req_idx, to_track_ith] - accept_indices_offset
+    return torch.where(to_track_mask, candidate, torch.full_like(candidate, -1))
 
 
 def _verify_commit_step_indices(
@@ -909,35 +999,18 @@ def _verify_commit_step_indices(
             draft_token_num,
             track_grid,
         )
-    accept_indices_offset = torch.arange(
-        0,
-        bs * draft_token_num,
-        step=draft_token_num,
-        dtype=accept_lens.dtype,
-        device=accept_lens.device,
-    )
-    req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
-    last_correct_step_indices = (
-        accept_index[req_idx, (accept_lens - 1).to(torch.int64)] - accept_indices_offset
+    req_idx, accept_indices_offset, last_correct_step_indices = (
+        _verify_commit_index_preamble(accept_index, accept_lens, bs, draft_token_num)
     )
     if batch.mamba_track_indices is None:
         return last_correct_step_indices, None
-    seq_lens_pre_verify = batch.seq_lens
-    seq_lens_post_verify = batch.seq_lens + accept_lens
-    mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
-    to_track_mask = (
-        seq_lens_pre_verify // mamba_track_interval
-        != seq_lens_post_verify // mamba_track_interval
-    )
-    tracking_point = seq_lens_post_verify // mamba_track_interval * mamba_track_interval
-    to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0).to(
-        torch.int64
-    )
-    candidate_track_steps = accept_index[req_idx, to_track_ith] - accept_indices_offset
-    mamba_steps_to_track = torch.where(
-        to_track_mask,
-        candidate_track_steps,
-        torch.full_like(candidate_track_steps, -1),
+    mamba_steps_to_track = _mamba_steps_to_track(
+        batch.seq_lens,
+        accept_lens,
+        accept_index,
+        req_idx,
+        accept_indices_offset,
+        mamba_track_grid(batch.tree_cache.page_size),
     )
     return last_correct_step_indices, mamba_steps_to_track
 
@@ -1117,17 +1190,10 @@ def commit_mamba_states_after_verify(
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
-        accept_indices_offset = torch.arange(
-            0,
-            bs * draft_token_num,
-            step=draft_token_num,
-            dtype=accept_lens.dtype,
-            device=accept_lens.device,
-        )
-        req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
-        last_correct_step_indices = (
-            accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
-            - accept_indices_offset
+        req_idx, accept_indices_offset, last_correct_step_indices = (
+            _verify_commit_index_preamble(
+                accept_index, accept_lens, bs, draft_token_num
+            )
         )
         # extra_buffer: the interval-crossing step whose state must snapshot into
         # the track ping-pong slot (mirrors the regular commit's
@@ -1136,17 +1202,13 @@ def commit_mamba_states_after_verify(
         mamba_track_indices = batch.mamba_track_indices
         mamba_steps_to_track = None
         if mamba_track_indices is not None:
-            ti = mamba_track_grid(batch.tree_cache.page_size)
-            seq_pre = batch.seq_lens
-            seq_post = batch.seq_lens + accept_lens
-            to_track_mask = seq_pre // ti != seq_post // ti
-            tracking_point = seq_post // ti * ti
-            to_track_ith = torch.clamp(tracking_point - seq_pre - 1, min=0).to(
-                torch.int64
-            )
-            candidate = accept_index[req_idx, to_track_ith] - accept_indices_offset
-            mamba_steps_to_track = torch.where(
-                to_track_mask, candidate, torch.full_like(candidate, -1)
+            mamba_steps_to_track = _mamba_steps_to_track(
+                batch.seq_lens,
+                accept_lens,
+                accept_index,
+                req_idx,
+                accept_indices_offset,
+                mamba_track_grid(batch.tree_cache.page_size),
             )
         commit_kda_replayssm_after_verify(
             spec_state=spec_state,

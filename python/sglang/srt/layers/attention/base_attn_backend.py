@@ -129,6 +129,14 @@ class AttentionBackend(ABC):
         Default: no-op.
         """
 
+    def pending_state_recovery_event(self) -> Optional[torch.cuda.Event]:
+        """Return an event that cache-mutating streams must wait for, if any."""
+        return None
+
+    def join_pending_state_recovery(self) -> None:
+        """Order the current forward stream after pending state recovery."""
+        pass
+
     supports_draft_extend_metadata_staging: bool = False
 
     def draft_extend_metadata_captured_in_graph(self) -> bool:

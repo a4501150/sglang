@@ -225,6 +225,26 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
                 )
                 self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
 
+    def test_conv_weights_support_dynamic_modules_and_loader_rebinding(self):
+        conv = torch.nn.Conv1d(4, 4, 3, groups=4, bias=False)
+        layer = radix_linear_attention.RadixLinearAttention(
+            layer_id=0,
+            num_q_heads=1,
+            num_k_heads=1,
+            num_v_heads=2,
+            head_q_dim=4,
+            head_k_dim=4,
+            head_v_dim=4,
+            conv_weights=conv,
+        )
+
+        torch.testing.assert_close(
+            layer.conv_weights, conv.weight.view(conv.weight.size(0), -1)
+        )
+        rebound = torch.randn(4, 3)
+        layer.conv_weights = rebound
+        self.assertIs(layer.conv_weights, rebound)
+
 
 if __name__ == "__main__":
     import unittest

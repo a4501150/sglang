@@ -1936,6 +1936,9 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
+    def _wait_for_pending_state_recovery(self) -> None:
+        self.model_worker.wait_for_pending_state_recovery()
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -1960,6 +1963,7 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
+                self._wait_for_pending_state_recovery()
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
@@ -1979,8 +1983,10 @@ class Scheduler(
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
-        def pop_and_process():
+        def pop_and_process(*, wait_for_recovery: bool = False):
             # Process the results of the last batch
+            if wait_for_recovery:
+                self._wait_for_pending_state_recovery()
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
@@ -2008,7 +2014,7 @@ class Scheduler(
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
-                pop_and_process()
+                pop_and_process(wait_for_recovery=True)
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
@@ -2031,7 +2037,11 @@ class Scheduler(
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
-                    pop_and_process()
+                    # The fence cannot be skipped when a batch was just
+                    # launched: run_batch joins only the forward stream, and
+                    # donation/checkpoint kernels in process_batch_result read
+                    # slots that side-stream recovery writes.
+                    pop_and_process(wait_for_recovery=True)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
@@ -4340,6 +4350,13 @@ class Scheduler(
             if self.decode_offload_manager is not None:
                 # Pending offload copies may still read the device KV that retraction frees.
                 self.decode_offload_manager.drain_before_retraction()
+            # RecoverSSM must finish before retraction frees Mamba slots.
+            # The device allocator is LIFO, so a just-freed slot can be handed
+            # to a same-planning-step HiCache load-back whose ungated H2D the
+            # still-queued side-stream recovery write would clobber; joining
+            # here also orders the disagg retraction backup behind recovery.
+            # No-op when no recovery is pending.
+            self._wait_for_pending_state_recovery()
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio_tracker.current
             mamba_allocator = getattr(

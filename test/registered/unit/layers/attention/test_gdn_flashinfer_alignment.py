@@ -409,6 +409,58 @@ class TestFlashInferGDNAlignment(unittest.TestCase):
         torch.testing.assert_close(first_pool, torch.ones_like(first_pool))
         torch.testing.assert_close(second_pool, torch.full_like(second_pool, 2))
 
+    def test_none_mode_wy_verify_uses_supported_kernel_and_prepared_inputs(self):
+        kernel = _make_kernel_without_flashinfer()
+        kernel.use_state_pool = True
+        kernel.supports_none_mode_target_verify = True
+        captured = {}
+
+        def fake_wy(**kwargs):
+            captured.update(kwargs)
+            return torch.zeros_like(kwargs["v"])
+
+        kernel._wy_output_only_fn = fake_wy
+        kernel._mtp_fn = mock.Mock(side_effect=AssertionError("unexpected MTP kernel"))
+        q = torch.empty(1, 2, 1, 4, dtype=torch.bfloat16)
+        v = torch.empty(1, 2, 2, 4, dtype=torch.bfloat16)
+        cache_indices = _view_with_pointer_mod((2,), torch.int32, 4)
+
+        result = kernel.target_verify(
+            torch.zeros(2, dtype=torch.bfloat16),
+            torch.zeros(2, dtype=torch.bfloat16),
+            q,
+            torch.empty_like(q),
+            v,
+            torch.empty(1, 2, 2, dtype=torch.bfloat16),
+            torch.empty(1, 2, 2, dtype=torch.bfloat16),
+            ssm_states=torch.zeros(2, 2, 4, 4, dtype=torch.bfloat16),
+            cache_indices=cache_indices,
+            query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+            intermediate_states_buffer=None,
+            intermediate_state_indices=torch.zeros(1, 2, dtype=torch.int32),
+            cache_steps=2,
+            retrieve_parent_token=None,
+            recover_ssm=True,
+        )
+
+        self.assertEqual(result.shape, (1, 2, 2, 4))
+        self.assertEqual(captured["A_log"].dtype, torch.float32)
+        self.assertEqual(captured["A_log"].data_ptr() % 32, 0)
+        self.assertEqual(captured["initial_state_indices"].data_ptr() % 32, 0)
+        torch.testing.assert_close(
+            captured["initial_state_indices"], cache_indices[:1]
+        )
+
+    def test_none_mode_requires_the_output_only_kernel(self):
+        kernel = _make_kernel_without_flashinfer()
+        kernel.supports_target_verify = True
+        kernel.supports_none_mode_target_verify = False
+
+        self.assertTrue(kernel.can_target_verify("full"))
+        self.assertFalse(kernel.can_target_verify("none"))
+        kernel.supports_none_mode_target_verify = True
+        self.assertTrue(kernel.can_target_verify("none"))
+
 
 if __name__ == "__main__":
     unittest.main()
