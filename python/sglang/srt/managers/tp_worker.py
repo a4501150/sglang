@@ -97,6 +97,13 @@ class BaseTpWorker(ABC):
         # For a plain worker that's its own runner.
         return self.model_runner
 
+    def wait_for_pending_state_recovery(self) -> None:
+        event = self.model_runner.attn_backend.pending_state_recovery_event()
+        if event is not None:
+            # Do not consume the pending flag: the forward stream needs its own
+            # join before it can read or overwrite the recovered state.
+            event.wait()
+
     @property
     def sliding_window_size(self) -> Optional[int]:
         return self.model_runner.sliding_window_size

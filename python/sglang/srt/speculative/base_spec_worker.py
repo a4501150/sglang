@@ -238,6 +238,9 @@ class BaseSpecWorker(ABC):
         # elsewhere (eagle's draft_extend runs on the draft runner).
         return self.target_worker.model_runner
 
+    def wait_for_pending_state_recovery(self) -> None:
+        self.target_worker.wait_for_pending_state_recovery()
+
     @property
     def spec_v2_attn_backends(self) -> tuple:
         """Attn backends touched by spec_v2 forward; OR-ed by decide_needs_cpu_seq_lens.

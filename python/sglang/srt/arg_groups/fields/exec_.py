@@ -404,6 +404,15 @@ class ExecMamba(msgspec.Struct):
         int,
         "The interval to track the mamba state during decode.",
     ] = 256
+    gdn_mtp_cache_mode: A[
+        str,
+        Arg(
+            help="Intermediate h-state cache mode for GDN MTP verify. "
+            "'full' caches h at every draft-token position. "
+            "'none' reconstructs the accepted state after verify.",
+            choices=["full", "none"],
+        ),
+    ] = "full"
     enable_int8_mamba_checkpoint: A[
         bool,
         "Store radix-cached linear-attn (mamba) states in int8 (separate checkpoint pool) for ~2x cached-prefix capacity at fixed memory.",

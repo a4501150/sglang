@@ -530,6 +530,21 @@ def validate_sampling_mask_max_tokens(server_args: Any):
         )
 
 
+def validate_gdn_mtp_cache_mode(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.gdn_mtp_cache_mode != "none":
+        return
+    if cfg.enable_linear_replayssm_spec or cfg.enable_linear_replayssm:
+        raise ValueError(
+            "--gdn-mtp-cache-mode none is incompatible with ReplaySSM."
+        )
+    if cfg.speculative_eagle_topk not in (None, 1):
+        raise ValueError(
+            "--gdn-mtp-cache-mode none requires linear-chain speculative "
+            "decoding (--speculative-eagle-topk in {None, 1})."
+        )
+
+
 def check_two_batch_overlap(server_args: Any):
     # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
     # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
