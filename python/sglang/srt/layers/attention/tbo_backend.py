@@ -198,6 +198,12 @@ class TboAttnBackend(AttentionBackend):
         # normal lookup succeeds with None and __getattr__ below never runs.
         return self.primary.verify_mask
 
+    def pending_state_recovery_event(self) -> Optional[torch.cuda.Event]:
+        return self.primary.pending_state_recovery_event()
+
+    def join_pending_state_recovery(self) -> None:
+        self.primary.join_pending_state_recovery()
+
     def __getattr__(self, name):
         # Delegate backend-specific attributes/methods not explicitly wrapped
         # above (e.g. DSV4's get_unified_swa_loc / get_swa_out_cache_loc, which

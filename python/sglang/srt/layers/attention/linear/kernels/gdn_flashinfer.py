@@ -19,9 +19,7 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.runtime_context import (
-    mamba_cache_chunk_size,
-)
+from sglang.srt.runtime_context import mamba_cache_chunk_size
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -61,7 +59,27 @@ _flashinfer_chunk_gated_delta_rule = None
 _flashinfer_gated_delta_rule_mtp = None
 _flashinfer_gated_delta_rule_decode = None
 _flashinfer_gated_delta_rule_mtp_bf16 = None
+_flashinfer_gated_delta_rule_mtp_wy_output_only = None
+_flashinfer_gdn_wy_output_only_checked = False
 
+
+def _get_flashinfer_gdn_wy_output_only():
+    """Load the output-only verifier independently from full-state kernels."""
+    global \
+        _flashinfer_gated_delta_rule_mtp_wy_output_only, \
+        _flashinfer_gdn_wy_output_only_checked
+    if not _flashinfer_gdn_wy_output_only_checked:
+        _flashinfer_gdn_wy_output_only_checked = True
+        if is_cuda():
+            try:
+                from flashinfer.gdn_kernels import gated_delta_rule_mtp_wy_output_only
+
+                _flashinfer_gated_delta_rule_mtp_wy_output_only = (
+                    gated_delta_rule_mtp_wy_output_only
+                )
+            except (ImportError, RuntimeError):
+                pass
+    return _flashinfer_gated_delta_rule_mtp_wy_output_only
 
 def maybe_build_flashinfer_checkpoint_plan(
     forward_batch: ForwardBatch,
@@ -208,6 +226,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         )
 
         self._alignment_fallback_kernel = TritonGDNKernel()
+        self._wy_output_only_fn = (
+            _get_flashinfer_gdn_wy_output_only() if self.use_state_pool else None
+        )
+        self.supports_none_mode_target_verify = callable(self._wy_output_only_fn)
 
         if sm_major == 9 and self._prefill_fn is None:
             raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
@@ -365,6 +387,16 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             scratch = _empty_aligned_like(template)
             self._verify_intermediate_buffers[key] = scratch
         return scratch, True
+
+    def can_target_verify(self, cache_mode: str) -> bool:
+        """Whether this instance may drive target verification in ``cache_mode``.
+
+        SM120 is intentionally admitted only for the output-only WY path used by
+        RecoverSSM. Full mode therefore keeps its established Triton verifier.
+        """
+        if cache_mode == "none":
+            return self.supports_none_mode_target_verify
+        return self.supports_target_verify
 
     # ---- decode ----
 
@@ -598,6 +630,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
         retrieve_parent_token: torch.Tensor,
+        recover_ssm: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         # MTP verify using FlashInfer gated_delta_rule_mtp kernel (SM90 + SM100+).
@@ -675,10 +708,42 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         b_mtp = self._prepare_dynamic_input(
             "verify_b", b.view(batch_size, draft_token_num, num_v_heads)
         )
-        A_log_fi, dt_bias_fi = self._prepare_gate_parameters(A_log, dt_bias)
-        cache_indices_fi = self._prepare_dynamic_input(
-            "verify_cache_indices", cache_indices
+        use_wy_output_only = recover_ssm and self.supports_none_mode_target_verify
+        A_log_fi, dt_bias_fi = self._prepare_gate_parameters(
+            A_log,
+            dt_bias,
+            A_log_dtype=torch.float32 if use_wy_output_only else None,
         )
+        cache_indices_fi = self._prepare_dynamic_input(
+            "verify_cache_indices", cache_indices[:batch_size]
+        )
+
+        # gdn_mtp_cache_mode=none verify is output-only (state is recovered
+        # separately). On the SM100/SM120 bf16 state pool, route the verify
+        # to the FlashInfer WY output-only kernel (flashinfer PR#3720) — a single
+        # launch over all T draft tokens (T x T GEMM + Neumann inverse on tensor
+        # cores), faster than the per-token state kernel. Recovery is unaffected
+        # (FI cuda-graph path reading the persistent conv-out views on the bf16 state
+        # pool, or Triton with a flat k/v stash otherwise).
+        if use_wy_output_only:
+            output_wy = self._wy_output_only_fn(
+                A_log=A_log_fi,
+                a=a_mtp,
+                dt_bias=dt_bias_fi,
+                q=query_mtp,
+                k=key_mtp,
+                v=value_mtp,
+                b=b_mtp,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices_fi,
+                output_state_indices=None,
+                intermediate_states_buffer=None,
+                disable_state_update=True,
+                use_qk_l2norm_in_kernel=True,
+                scale=None,
+                output=None,
+            )
+            return output_wy.reshape(1, seq_len, num_v_heads, head_v_dim)
 
         output_fi, _ = self._mtp_fn(
             q=query_mtp,
@@ -703,3 +768,20 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             )
 
         return output_fi.view(1, seq_len, num_v_heads, head_v_dim)
+
+
+def fi_recovery_kernel(linear_backend):
+    """Return the FlashInfer GDN decode kernel iff it drives none-mode
+    accepted-state recovery (state-pool recovery), else None.
+
+    Single source of truth for the ``use_fi_recovery`` decision, checked at verify
+    (gdn_backend.forward_extend), accepted-state recovery
+    (HybridLinearAttnBackend._no_cache_mtp_recompute), and recovery-graph capture
+    (HybridLinearAttnBackend.capture_recovery_graphs). Callers that only need the
+    boolean use ``fi_recovery_kernel(...) is not None``.
+    """
+    dispatcher = getattr(linear_backend, "kernel_dispatcher", None)
+    decode_kernel = getattr(dispatcher, "decode_kernel", None)
+    if isinstance(decode_kernel, FlashInferGDNKernel) and decode_kernel.use_state_pool:
+        return decode_kernel
+    return None

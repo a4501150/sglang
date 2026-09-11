@@ -8,6 +8,7 @@ import argparse
 import unittest
 
 from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.validation_hook import validate_gdn_mtp_cache_mode
 from sglang.srt.runtime_context import get_model, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import configure_media_url_security
@@ -127,6 +128,32 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
             with self.subTest(backend=backend):
                 sa = self._parse(["--image-processor-backend", backend])
                 self.assertEqual(sa.image_processor_backend, backend)
+
+    def test_gdn_mtp_cache_mode(self):
+        self.assertEqual(self._parse([]).gdn_mtp_cache_mode, "full")
+
+        no_cache = self._parse(
+            ["--gdn-mtp-cache-mode", "none", "--speculative-eagle-topk", "1"]
+        )
+        self.assertEqual(no_cache.gdn_mtp_cache_mode, "none")
+        validate_gdn_mtp_cache_mode(no_cache)
+
+        with self.assertRaises(ValueError):
+            validate_gdn_mtp_cache_mode(
+                self._parse(
+                    [
+                        "--gdn-mtp-cache-mode",
+                        "none",
+                        "--enable-linear-replayssm",
+                    ]
+                )
+            )
+        with self.assertRaises(ValueError):
+            validate_gdn_mtp_cache_mode(
+                self._parse(
+                    ["--gdn-mtp-cache-mode", "none", "--speculative-eagle-topk", "2"]
+                )
+            )
 
     def test_startup_weight_load_mode(self):
         """The startup loading mode keeps serial as the safe default."""

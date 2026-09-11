@@ -11,6 +11,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -90,8 +91,21 @@ def _make_result():
 
 class TestMambaBoundaryMaskReuse(unittest.TestCase):
     def test_overlap_scheduler_handles_zero_and_one_batch_lookahead(self):
-        for schedule_next_decode, expected_lookahead in ((False, 0), (True, 1)):
-            with self.subTest(schedule_next_decode=schedule_next_decode):
+        cases = (
+            (False, False, 0, 1),
+            (True, False, 1, 0),
+            (True, True, 1, 1),
+        )
+        for (
+            schedule_next_decode,
+            disable_second_overlap,
+            expected_lookahead,
+            expected_recovery_waits,
+        ) in cases:
+            with self.subTest(
+                schedule_next_decode=schedule_next_decode,
+                disable_second_overlap=disable_second_overlap,
+            ):
                 req, batch = _make_batch()
                 processor = _make_processor()
                 result = _make_result()
@@ -104,9 +118,15 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                 scheduler.process_input_requests = MagicMock()
                 scheduler._engine_paused = False
                 scheduler.running_batch = batch
-                scheduler.is_disable_overlap_for_batch = MagicMock(return_value=False)
+                scheduler.is_disable_overlap_for_batch = MagicMock(
+                    side_effect=lambda *_args, **_kwargs: (
+                        disable_second_overlap and plan_count == 2
+                    )
+                )
                 scheduler.run_batch = MagicMock(return_value=result)
                 scheduler._apply_war_barrier = MagicMock()
+                scheduler.model_worker = MagicMock()
+                scheduler.enable_unified_memory = False
                 scheduler.is_generation = False
                 scheduler.last_batch = None
 
@@ -173,10 +193,85 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                         scheduler.event_loop_overlap()
 
                 self.assertEqual(observed_lookahead, [expected_lookahead])
+                self.assertEqual(
+                    scheduler.model_worker.wait_for_pending_state_recovery.call_count,
+                    expected_recovery_waits,
+                )
                 if expected_lookahead == 0:
                     cache_update.assert_not_called()
                 else:
                     self.assertTrue(cache_update.call_args.kwargs["known_boundary"])
+
+    def test_normal_scheduler_waits_before_processing_result(self):
+        _, batch = _make_batch()
+        result = _make_result()
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.gracefully_exit = False
+        scheduler.ingest_requests = MagicMock(side_effect=[[], StopIteration])
+        scheduler._engine_paused = False
+        scheduler.running_batch = batch
+        scheduler.get_next_batch_to_run = MagicMock(
+            return_value=SimpleNamespace(running_batch=batch, batch_to_run=batch)
+        )
+        scheduler.run_batch = MagicMock(return_value=result)
+        scheduler.last_batch = None
+        events = []
+        scheduler.model_worker = MagicMock()
+        scheduler.model_worker.wait_for_pending_state_recovery.side_effect = (
+            lambda: events.append("wait")
+        )
+        scheduler.process_batch_result = MagicMock(
+            side_effect=lambda *_args: events.append("process")
+        )
+
+        with self.assertRaises(StopIteration):
+            scheduler.event_loop_normal()
+
+        self.assertEqual(events, ["wait", "process"])
+
+    def test_deferred_mamba_cow_joins_recovery_before_pool_reads(self):
+        class FakeHybridReqToTokenPool:
+            def __init__(self):
+                self.mamba_pool = MagicMock()
+                self.mamba_ckpt_pool = None
+
+            def translate_mamba_indices(self, indices):
+                return indices
+
+            def wait_for_hicache_load_complete(self):
+                events.append("wait_hicache")
+
+            def copy_mamba_state(self, src, dst):
+                events.append("copy")
+
+        events = []
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.req_to_token_pool = FakeHybridReqToTokenPool()
+        runner.is_draft_worker = False
+        runner.attn_backend = MagicMock()
+        runner.attn_backend.join_pending_state_recovery.side_effect = (
+            lambda: events.append("join")
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_extend=lambda: True,
+                is_target_verify=lambda: False,
+                is_draft_extend_v2=lambda: False,
+            ),
+            mamba_clear_indices=None,
+            mamba_cow_src_indices=torch.tensor([1]),
+            mamba_cow_dst_indices=torch.tensor([2]),
+        )
+
+        with patch(
+            "sglang.srt.model_executor.model_runner.HybridReqToTokenPool",
+            FakeHybridReqToTokenPool,
+        ):
+            runner._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
+
+        self.assertEqual(events, ["join", "wait_hicache", "copy"])
+        self.assertIsNone(forward_batch.mamba_cow_src_indices)
+        self.assertIsNone(forward_batch.mamba_cow_dst_indices)
 
 
 if __name__ == "__main__":

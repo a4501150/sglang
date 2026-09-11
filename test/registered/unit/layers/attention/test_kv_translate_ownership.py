@@ -17,6 +17,7 @@ import ast
 import os
 import re
 import unittest
+from unittest.mock import MagicMock
 
 from sglang.srt.layers.attention import triton_backend as _anchor_module
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -117,6 +118,7 @@ class _Inner(AttentionBackend):
     bodies read off their inners."""
 
     def __init__(self, translator=None):
+        self._recover_ssm = False
         self.kv_index_translator = translator
         self.token_to_kv_pool = None
         self.req_to_token_pool = None
@@ -179,6 +181,20 @@ class TestWrapperBackendsForwardTranslator(CustomTestCase):
         for name, wrapper in _build_wrappers(translator).items():
             with self.subTest(wrapper=name):
                 self.assertIs(wrapper.kv_index_translator, translator)
+
+    def test_tbo_forwards_hybrid_recovery_event_hooks(self):
+        hybrid = _build_wrappers(object())["HybridLinearAttnBackend"]
+        wrapper = TboAttnBackend(hybrid, [_Inner()])
+        event = MagicMock()
+        hybrid._recovery_event = event
+        hybrid._recovery_event_pending = True
+
+        self.assertIs(wrapper.pending_state_recovery_event(), event)
+        self.assertIs(wrapper.pending_state_recovery_event(), event)
+        wrapper.join_pending_state_recovery()
+
+        event.wait.assert_called_once_with()
+        self.assertIsNone(wrapper.pending_state_recovery_event())
 
 
 if __name__ == "__main__":

@@ -1893,6 +1893,9 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
+    def _wait_for_pending_state_recovery(self) -> None:
+        self.model_worker.wait_for_pending_state_recovery()
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -1917,6 +1920,7 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
+                self._wait_for_pending_state_recovery()
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
@@ -1935,8 +1939,10 @@ class Scheduler(
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
-        def pop_and_process():
+        def pop_and_process(*, wait_for_recovery: bool = False):
             # Process the results of the last batch
+            if wait_for_recovery:
+                self._wait_for_pending_state_recovery()
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
@@ -1964,7 +1970,7 @@ class Scheduler(
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
-                pop_and_process()
+                pop_and_process(wait_for_recovery=True)
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
@@ -1987,7 +1993,7 @@ class Scheduler(
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
-                    pop_and_process()
+                    pop_and_process(wait_for_recovery=batch is None)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
