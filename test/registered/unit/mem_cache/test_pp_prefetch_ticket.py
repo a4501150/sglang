@@ -63,6 +63,9 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.prefetch_buffer = Queue()
         c.storage_stop_event = threading.Event()
         c.prefetch_tokens_occupied = 0
+        # _page_transfer gates device-direct IO on this; the fixture builds the
+        # controller via __new__, so __init__'s default must be set by hand.
+        c.storage_device_direct = False
         c.mem_pool_host = Mock(page_size=4)
         c.mem_pool_host.layout_lease.side_effect = nullcontext
         c.mem_pool_host.alloc.side_effect = lambda size, **_: torch.arange(size)

@@ -87,6 +87,8 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             index_page_size=2,
             skip_topk_layers=[False] * 2,
         )
+        index_buffers = [torch.empty((4, 16), dtype=torch.uint8) for _ in range(2)]
+        dsa_device_pool.get_hicache_indexer_page_buffers = lambda: index_buffers
         indexer_host = DSAIndexerPoolHost(
             decl=make_dsa_indexer_pool_decl(dsa_device_pool),
             anchor_host=mla_host,

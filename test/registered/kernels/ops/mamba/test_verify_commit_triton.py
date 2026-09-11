@@ -77,5 +77,24 @@ def test_verify_commit_steps_matches_eager(bs, track_interval, tree_depth):
         assert got_track is None
 
 
+def test_mid_path_crossing_tracks_boundary_step():
+    """Deterministic mirror of the CPU case: pre=62, interval=64, accept_len=5
+    crosses token 64 in the middle of the accepted path and must select
+    accepted step 1 (state at seq_len 64), not step 2, and no-cross gives -1."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    device = "cuda"
+    accept_lens = torch.tensor([5, 3], device=device, dtype=torch.int32)
+    accept_index = torch.tensor(
+        [[0, 1, 2, 3, 4], [5, 6, 7, 0, 0]], device=device, dtype=torch.int32
+    )
+    seq_lens = torch.tensor([62, 64], device=device, dtype=torch.int64)
+    got_last, got_track = fused_commit_track_indices(
+        accept_index, accept_lens, seq_lens, 5, 64
+    )
+    assert torch.equal(got_last, torch.tensor([4, 2], device=device))
+    assert torch.equal(got_track, torch.tensor([1, -1], device=device))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

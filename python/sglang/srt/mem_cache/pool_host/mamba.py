@@ -9,6 +9,8 @@ import numpy as np
 import torch
 
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.hicache_storage import hicache_tensor_digest
 from sglang.srt.mem_cache.pool_host.base import (
     HostKVCache,
     host_memory_budget_bytes,
@@ -56,6 +58,8 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
+_STORAGE_ALIGNMENT_BYTES = 4096
+
 
 _NPU_HICACHE_MAMBA_IO_ENV = "SGLANG_NPU_HICACHE_MAMBA_IO"
 _NPU_HICACHE_MAMBA_IO_MODES = {"sync", "async"}
@@ -78,6 +82,10 @@ class MambaPoolHost(HostKVCache):
     # skip __init__, still read an empty pair rather than raising.
     slot_state_device_tensors: tuple = ()
     slot_state_buffers: tuple = ()
+    slot_state_storage_buffers: tuple = ()
+    slot_state_names: tuple = ()
+    slot_state_elem_sizes: tuple = ()
+    slot_state_storage_bytes: tuple = ()
 
     def __init__(
         self,
@@ -150,7 +158,27 @@ class MambaPoolHost(HostKVCache):
         self.slot_state_device_tensors = [
             buf for info in buffer_infos for buf in info.extra_checkpoint_buffers
         ]
+        # Digest names ride the buffer info so the host pool stays decoupled
+        # from the device pool; storage rows are padded to page alignment so
+        # zero-copy direct storage can address each slot row as one segment.
+        self.slot_state_names = (
+            tuple(getattr(buffer_info, "extra_checkpoint_names", ()) or ())
+            or tuple(f"slot_state_{i}" for i in range(len(self.slot_state_device_tensors)))
+        )
+        self.slot_state_elem_sizes = [
+            int(np.prod(state.shape[1:]))
+            for state in self.slot_state_device_tensors
+        ]
+        self.slot_state_storage_bytes = [
+            (elem_size * state.element_size() + _STORAGE_ALIGNMENT_BYTES - 1)
+            // _STORAGE_ALIGNMENT_BYTES
+            * _STORAGE_ALIGNMENT_BYTES
+            for elem_size, state in zip(
+                self.slot_state_elem_sizes, self.slot_state_device_tensors
+            )
+        ]
         self.slot_state_buffers = []
+        self.slot_state_storage_buffers = []
         self.size_per_token = self.get_size_per_token()
 
         if host_size > 0:
@@ -304,16 +332,39 @@ class MambaPoolHost(HostKVCache):
                 )
         # Side state keeps its own dtype and its own slot axis (axis 0 of the
         # per-layer view the device pool yields).
-        self.slot_state_buffers = [
-            alloc_func(
-                (self.size,) + tuple(state.shape[1:]),
+        self.slot_state_buffers = []
+        self.slot_state_storage_buffers = []
+        for storage_bytes, state, elem_size in zip(
+            self.slot_state_storage_bytes,
+            self.slot_state_device_tensors,
+            self.slot_state_elem_sizes,
+        ):
+            logical_shape = tuple(state.shape[1:])
+            storage_elements = storage_bytes // state.element_size()
+            storage_buffer = alloc_func(
+                (self.size, storage_elements),
                 dtype=state.dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
-            for state in self.slot_state_device_tensors
-        ]
+            logical_strides = []
+            stride = 1
+            for dim in reversed(logical_shape):
+                logical_strides.append(stride)
+                stride *= dim
+            logical_buffer = storage_buffer.as_strided(
+                size=(self.size, *logical_shape),
+                stride=(storage_elements, *reversed(logical_strides)),
+            )
+            # Padded backing rows carry garbage past the logical extent:
+            # zero the buffer explicitly rather than reusing the strides'
+            # running product, which silently ties this to the last loop.
+            logical_bytes = int(np.prod(logical_shape)) * state.element_size()
+            if storage_bytes > logical_bytes:
+                storage_buffer.zero_()
+            self.slot_state_storage_buffers.append(storage_buffer)
+            self.slot_state_buffers.append(logical_buffer)
         # destroy() unregisters via kv_buffer; without this list the pinned
         # registrations leak past the buffers' mmap. 0-element buffers
         # (conv-only models' temporal state) were never registered.
@@ -322,7 +373,7 @@ class MambaPoolHost(HostKVCache):
             for buf in (
                 self.temporal_buffer,
                 *self.conv_buffer,
-                *self.slot_state_buffers,
+                *self.slot_state_storage_buffers,
             )
             if buf.numel() > 0
         ]
@@ -340,7 +391,11 @@ class MambaPoolHost(HostKVCache):
 
     def get_hybrid_pool_buffer(self):
         # Expose all mamba host tensors that need Mooncake buffer registration.
-        return [self.temporal_buffer, *self.conv_buffer, *self.slot_state_buffers]
+        return [
+            self.temporal_buffer,
+            *self.conv_buffer,
+            *self.slot_state_storage_buffers,
+        ]
 
     def _iter_page_tensors(self, index: int):
         if self.layout in ["page_first", "page_first_direct"]:
@@ -352,7 +407,53 @@ class MambaPoolHost(HostKVCache):
             for conv_buf in self.conv_buffer:
                 yield conv_buf[:, index : index + self.page_size]
         for state_buf in self.slot_state_buffers:
-            yield state_buf[index : index + self.page_size]
+            yield state_buf[index]
+
+    def get_debug_page_tensors(self, index: int):
+        yield "mamba_temporal", self.temporal_buffer[index]
+        for conv_idx, conv_buf in enumerate(self.conv_buffer):
+            yield f"mamba_conv_{conv_idx}", conv_buf[index]
+        for name, state_buf in zip(self.slot_state_names, self.slot_state_buffers):
+            yield name, state_buf[index]
+
+    def _iter_device_slot_tensors(self, index: int):
+        yield "mamba_temporal", self.buffer_info.temporal[:, index]
+        for conv_idx, conv_state in enumerate(self.buffer_info.conv):
+            yield f"mamba_conv_{conv_idx}", conv_state[:, index]
+        for name, state in zip(self.slot_state_names, self.slot_state_device_tensors):
+            yield name, state[index]
+
+    def log_transfer_digests(
+        self,
+        direction: str,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+    ) -> None:
+        if not envs.SGLANG_HICACHE_FILE_BACKEND_LOG_PAGE_DIGESTS.get():
+            return
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
+        host_indices_list = host_indices.cpu().tolist()
+        device_indices_list = device_indices.cpu().tolist()
+        for host_index, device_index in zip(host_indices_list, device_indices_list):
+            host_components = dict(self.get_debug_page_tensors(host_index))
+            device_components = dict(self._iter_device_slot_tensors(device_index))
+            for component, host_tensor in host_components.items():
+                host_digest = hicache_tensor_digest(host_tensor)
+                device_digest = hicache_tensor_digest(device_components[component])
+                logger.warning(
+                    "HiCache transfer digest direction=%s component=%s "
+                    "host_page=%d device_slot=%d bytes=%d host_sha256=%s "
+                    "device_sha256=%s exact=%s",
+                    direction,
+                    component,
+                    host_index,
+                    device_index,
+                    host_tensor.numel() * host_tensor.element_size(),
+                    host_digest,
+                    device_digest,
+                    host_digest == device_digest,
+                )
 
     @staticmethod
     def _flatten_tensor_bytes(tensor: torch.Tensor) -> torch.Tensor:
@@ -901,11 +1002,6 @@ class MambaPoolHost(HostKVCache):
         Only page-first layouts are supported for mamba storage zero-copy because
         each page slot in temporal/conv buffers is directly addressable.
         """
-        if self.slot_state_device_tensors:
-            raise NotImplementedError(
-                "Mamba storage zero-copy does not carry registered slot side "
-                "states; use a whole-page storage backend."
-            )
         assert len(indices) % self.page_size == 0
         if self.layout not in ["page_first", "page_first_direct"]:
             raise ValueError(
@@ -918,6 +1014,12 @@ class MambaPoolHost(HostKVCache):
         # Compute base pointers once; each page pointer is offset from these bases.
         temporal_base_ptr = self.temporal_buffer.data_ptr()
         conv_base_ptrs = [buf.data_ptr() for buf in self.conv_buffer]
+        state_storage_buffers = self.slot_state_storage_buffers
+        state_base_ptrs = [buf.data_ptr() for buf in state_storage_buffers]
+        state_element_sizes = [
+            self.page_size * buf.stride(0) * buf.element_size()
+            for buf in state_storage_buffers
+        ]
         # Component sizes are constant across pages, so precompute once as well.
         temporal_element_size = (
             self.page_size
@@ -960,13 +1062,12 @@ class MambaPoolHost(HostKVCache):
                 )
                 ptr_list.append(conv_ptr)
                 element_size_list.append(conv_element_sizes[j])
+            for base_ptr, element_size in zip(state_base_ptrs, state_element_sizes):
+                ptr_list.append(base_ptr + indices[i] * element_size)
+                element_size_list.append(element_size)
         return ptr_list, element_size_list
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
-        if self.slot_state_device_tensors:
-            # Side-state rows are a second, differently-strided buffer: a page is
-            # no longer one contiguous slice, so no zero-copy claim is made.
-            return False
         if self.layout not in ["page_first", "page_first_direct"]:
             return False
         temporal_stride = (
@@ -983,5 +1084,9 @@ class MambaPoolHost(HostKVCache):
             if buf.data_ptr() % page_size_bytes != 0:
                 return False
             if conv_stride % page_size_bytes != 0:
+                return False
+        for buf in self.slot_state_storage_buffers:
+            stride = buf.stride(0) * buf.element_size()
+            if buf.data_ptr() % page_size_bytes != 0 or stride % page_size_bytes != 0:
                 return False
         return True

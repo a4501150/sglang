@@ -22,6 +22,9 @@ class MambaStateBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     temporal: torch.Tensor
     conv: tuple[torch.Tensor, ...]
     extra_checkpoint_buffers: tuple[torch.Tensor, ...] = ()
+    # Digest component names aligned with extra_checkpoint_buffers; each
+    # registered side state contributes one entry per replicated layer.
+    extra_checkpoint_names: tuple[str, ...] = ()
 
     def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
         shape = tuple(self.temporal.shape)

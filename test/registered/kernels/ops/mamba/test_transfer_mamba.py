@@ -45,6 +45,7 @@ def make_device_pool(dtype, device=DEVICE):
         mamba_cache=mamba_cache,
         size=SIZE,
         device=device,
+        _slot_siblings=(),
     )
 
 
@@ -70,6 +71,9 @@ def make_host_pool(dtype, layout):
     host.conv_dtype = dtype
     host.temporal_dtype = dtype
     host.dtype = dtype
+    host.slot_state_device_tensors = ()
+    host.slot_state_names = ()
+    host.slot_state_elem_sizes = ()
     host.size_per_token = host.get_size_per_token()
 
     # Allocate host buffers (page_first layout)
@@ -79,6 +83,8 @@ def make_host_pool(dtype, layout):
     host.conv_buffer = []
     conv_dims = (SIZE, NUM_LAYERS, 1) + CONV_SHAPE
     host.conv_buffer.append(torch.zeros(conv_dims, dtype=dtype).pin_memory())
+    host.slot_state_buffers = []
+    host.slot_state_storage_buffers = []
 
     # Staging buffers and JIT flags
     host.temporal_staging_buffer = None
@@ -133,6 +139,12 @@ def assert_host_mock_complete(host):
         "size_per_token",
         "temporal_buffer",
         "conv_buffer",
+        "slot_state_device_tensors",
+        "slot_state_names",
+        "slot_state_elem_sizes",
+        "slot_state_storage_bytes",
+        "slot_state_buffers",
+        "slot_state_storage_buffers",
         "temporal_staging_buffer",
         "conv_staging_buffers",
         "can_use_write_back_jit",

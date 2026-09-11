@@ -11,7 +11,7 @@ victims -- lives here so the backend stays a plain key/value store.
 
 A backend constructs one evictor and drives it through a small lifecycle::
 
-    touch(key, path)                 # read hit / already-on-disk: bump recency
+    touch(key, path)                 # read hit / already-on-disk: bump recency (index + mtime)
     reserve(key, n_bytes) -> bool    # admit a new write, evicting if needed
         commit(key)                  #   write landed on disk
         abort(key)                   #   write failed; release the reservation
@@ -239,24 +239,36 @@ class LRUFileEvictor:
                 self._total_bytes -= cur
 
     def touch(self, suffixed_key: str, tensor_path: str) -> None:
-        """Mark key as MRU, adopting an untracked on-disk file if needed."""
+        """Mark key as MRU, adopting an untracked on-disk file if needed.
+
+        Refreshes the file mtime too: the startup scan rebuilds the LRU from
+        mtimes, so without a read-time bump a hot page written long ago looks
+        stale after a restart and becomes the first eviction victim.
+        """
         if not self._eviction_enabled:
             return
+        tracked = False
         with self._lock:
             if suffixed_key in self._lru:
                 self._lru.move_to_end(suffixed_key, last=True)
+                tracked = True
+        if not tracked:
+            # Untracked file: stat without holding the lock.
+            try:
+                size = os.path.getsize(tensor_path)
+            except OSError:
                 return
-        # Untracked file: stat without holding the lock.
+            with self._lock:
+                if suffixed_key in self._lru:
+                    self._lru.move_to_end(suffixed_key, last=True)
+                else:
+                    self._lru[suffixed_key] = size
+                    self._total_bytes += size
         try:
-            size = os.path.getsize(tensor_path)
+            # ~1us on a hot inode (measured); a vanished file is benign.
+            os.utime(tensor_path, None)
         except OSError:
-            return
-        with self._lock:
-            if suffixed_key in self._lru:
-                self._lru.move_to_end(suffixed_key, last=True)
-            else:
-                self._lru[suffixed_key] = size
-                self._total_bytes += size
+            pass
 
     def clear(self) -> None:
         """Reset all bookkeeping after the backend has removed the files."""
@@ -296,7 +308,11 @@ class LRUFileEvictor:
         return fs[1] - value_bytes >= self.min_free_bytes
 
     def _scan_existing_files(self) -> None:
-        """Seed LRU index from disk on startup (oldest mtime first)."""
+        """Seed LRU index from disk on startup (oldest mtime first).
+
+        mtime tracks last read or write because ``touch`` refreshes it, so the
+        seeded order reflects access recency, not just write age.
+        """
         try:
             names = os.listdir(self.file_path)
         except FileNotFoundError:

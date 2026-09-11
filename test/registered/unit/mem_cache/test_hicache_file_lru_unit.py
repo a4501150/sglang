@@ -16,7 +16,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+import ctypes
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -27,6 +29,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
+    DIRECT_IO_ALIGNMENT,
     HiCacheFile,
     HiCacheStorageConfig,
     MetadataCache,
@@ -90,6 +93,7 @@ class _BackendBuilder:
         subdir=None,
         metadata_ttl=None,
         enable_metadata_cache=None,
+        io_mode=None,
     ) -> HiCacheFile:
         # Each backend gets its own subdir so MLA / non-MLA tests don't
         # contaminate each other's file_path.
@@ -110,6 +114,7 @@ class _BackendBuilder:
                 "min_free_space": min_free,
                 "metadata_ttl": metadata_ttl,
                 "enable_metadata_cache": enable_metadata_cache,
+                "io_mode": io_mode,
             },
         )
         return HiCacheFile(cfg, file_path=d)
@@ -256,6 +261,43 @@ class TestScanExistingFiles(HiCacheFileLRUTestBase):
         self.assertEqual(keys[1], f"new{suffix}")
 
 
+class TestRestartRescanMru(HiCacheFileLRUTestBase):
+    def test_read_touch_survives_restart_rescan(self):
+        # Simulate a restart: a page written long ago but read recently must
+        # re-enter the rescan-seeded LRU as MRU (touch refreshes mtime), or
+        # the first post-restart eviction would drop the hot page.
+        cfg = _make_config(
+            extra_config={
+                "max_size": "250",
+                "eviction_ratio": 1.0,
+                "min_free_space": "0",
+            }
+        )
+        d = os.path.join(self.tmpdir, "restart")
+        os.makedirs(d)
+        b = HiCacheFile(cfg, file_path=d)
+        self.assertTrue(b.set("hot", _t(100)))
+        self.assertTrue(b.set("cold", _t(100)))
+        # Both pages were written long ago; since then only "hot" is read.
+        stale = time.time() - 100
+        for key in ("hot", "cold"):
+            fp = b._get_component_path(key)
+            os.utime(fp, (stale, stale))
+        self.assertIsNotNone(b.get("hot", target_location=_t(100)))
+        self.assertGreater(os.path.getmtime(b._get_component_path("hot")), stale)
+
+        # A fresh backend rescans the directory and seeds the LRU by mtime:
+        # the read page must sit at the MRU end, not in write-time order.
+        b2 = HiCacheFile(cfg, file_path=d)
+        keys = list(b2._evictor._lru.keys())
+        self.assertEqual(keys[-1], b2._get_suffixed_key("hot"))
+        # A new write evicts the front of the rescan order ("cold") and the
+        # recently read prefix survives.
+        self.assertTrue(b2.set("new", _t(100)))
+        self.assertTrue(b2.exists("hot"))
+        self.assertFalse(b2.exists("cold"))
+
+
 class TestCPSuffix(HiCacheFileLRUTestBase):
     """Distinct CP ranks must not share a file key."""
 
@@ -384,6 +426,217 @@ class TestMinFreeSpaceWatermark(HiCacheFileLRUTestBase):
         self.assertTrue(b.exists("newk"))
 
 
+class TestOrphanSweep(HiCacheFileLRUTestBase):
+    def test_temp_and_probe_leftovers_removed(self):
+        b = self.make_backend(orphan_grace_seconds=0)
+        suffix = b._get_suffixed_key("k")
+        names = [
+            f"{suffix}.bin.tmp.123.456.abcdef",  # direct page write leftover
+            ".abcdef0123456789.tmp",  # buffered set leftover
+            ".odirect_probe.123.456",  # O_DIRECT probe leftover
+        ]
+        for i, name in enumerate(names):
+            self._seed(b, name, size=8 + i)
+        reclaimed = b.sweep_orphans()
+        self.assertEqual(reclaimed, 8 + 9 + 10)
+        for name in names:
+            self.assertFalse(os.path.exists(os.path.join(b.file_path, name)))
+
+    def test_recent_leftovers_protected_by_grace(self):
+        b = self.make_backend(orphan_grace_seconds=600)
+        suffix = b._get_suffixed_key("k")
+        name = f"{suffix}.bin.tmp.1.2.abc"
+        self._seed(b, name, age=10)
+        self.assertEqual(b.sweep_orphans(), 0)
+        self.assertTrue(os.path.exists(os.path.join(b.file_path, name)))
+
+    def test_stale_format_removed_and_other_files_kept(self):
+        b = self.make_backend(orphan_grace_seconds=0)
+        suffix = b._get_suffixed_key("k")
+        identity = suffix.rsplit("_fmt", 1)[0]
+        stale = f"{identity}_fmtdeadbeef"
+        self._seed(b, f"{stale}.bin", size=16)
+        # A different rank of the same model and a different model must
+        # survive: the suffix encodes their ownership.
+        other_rank = f"{identity.replace('_0_1', '_1_1')}_fmt{b.format_fingerprint}"
+        other_model = suffix.replace("testmodel", "othermodel")
+        live = f"{suffix}.bin"
+        for name in (f"{other_rank}.bin", f"{other_model}.bin", live):
+            self._seed(b, name)
+        reclaimed = b.sweep_orphans()
+        self.assertEqual(reclaimed, 16)
+        self.assertFalse(os.path.exists(os.path.join(b.file_path, f"{stale}.bin")))
+        for name in (f"{other_rank}.bin", f"{other_model}.bin", live):
+            self.assertTrue(os.path.exists(os.path.join(b.file_path, name)))
+
+    def test_periodic_hook_respects_interval(self):
+        b = self.make_backend(
+            orphan_grace_seconds=0, orphan_sweep_interval_seconds=3600
+        )
+        name = ".abcdef0123456789.tmp"
+        self._seed(b, name)
+        b._next_orphan_sweep = time.monotonic() + 3600
+        b.maybe_sweep_orphans()
+        self.assertTrue(os.path.exists(os.path.join(b.file_path, name)))
+        b._next_orphan_sweep = time.monotonic() - 1
+        b.maybe_sweep_orphans()
+        self.assertFalse(os.path.exists(os.path.join(b.file_path, name)))
+
+    def test_non_owner_rank_never_sweeps(self):
+        b = self.make_backend(is_mla=True, tp_rank=1, orphan_grace_seconds=0)
+        name = ".abcdef0123456789.tmp"
+        self._seed(b, name)
+        self.assertEqual(b.sweep_orphans(), 0)
+        self.assertTrue(os.path.exists(os.path.join(b.file_path, name)))
+
+
+class TestMinFreeSpaceWatermarkBounded(HiCacheFileLRUTestBase):
+    @staticmethod
+    def _seed_tracked_page(b, key, size):
+        suffixed = b._get_suffixed_key(key)
+        path = os.path.join(b.file_path, f"{suffixed}.bin")
+        with open(path, "wb") as f:
+            f.write(b"v" * size)
+        b._evictor._lru[suffixed] = size
+        b._evictor._total_bytes += size
+        return path
+
+    def test_refuses_without_evicting_when_cache_cannot_help(self):
+        b = self.make_backend(max_size="0", min_free="100")
+        for i in range(2):
+            self._seed_tracked_page(b, f"v{i}", 100)
+        # External pressure: only 30B free. Evicting the whole 200B cache
+        # still could not satisfy the 100B watermark for a 200B write, so the
+        # write is refused up front instead of trashing live entries.
+        b._evictor._fs_stats = lambda: (1024, 30)
+        self.assertFalse(b.set("big", _t(200)))
+        self.assertEqual(len(b._evictor._lru), 2)
+        self.assertEqual(b._evictor._total_bytes, 200)
+        for i in range(2):
+            self.assertTrue(b.exists(f"v{i}"))
+
+    def test_sweep_credits_watermark(self):
+        b = self.make_backend(max_size="0", min_free="100", orphan_grace_seconds=0)
+        orphan = self._seed(b, ".abcdef0123456789.tmp", size=150)
+        # Only 30B free; reclaiming the 150B orphan satisfies a 60B write
+        # without evicting anything.
+        free = [30]
+
+        def tracked_remove(p):
+            if os.path.exists(p):
+                free[0] += os.path.getsize(p)
+            return original_remove(p)
+
+        original_remove = os.remove
+        with (
+            mock.patch.object(
+                b._evictor, "_fs_stats", side_effect=lambda: (1024, free[0])
+            ),
+            mock.patch("os.remove", side_effect=tracked_remove),
+        ):
+            self.assertTrue(b.set("newk", _t(60)))
+        self.assertFalse(os.path.exists(orphan))
+        self.assertEqual(len(b._evictor._lru), 1)
+        self.assertTrue(b.exists("newk"))
+
+
+class TestGroupEviction(HiCacheFileLRUTestBase):
+    KEY = "a" * 64
+
+    def _backend_with_sidecar(self, **kw):
+        # A cap is required so reserve() tracks written pages in the LRU.
+        kw.setdefault("max_size", "10k")
+        kw.setdefault("eviction_ratio", 1.0)
+        b = self.make_backend(**kw)
+        b.register_mem_host_pool_v2(object(), PoolName.MAMBA)
+        return b
+
+    def test_sibling_derivation_symmetric(self):
+        b = self._backend_with_sidecar()
+        kv = b._get_suffixed_key(self.KEY)
+        sidecar = b._get_suffixed_key(f"{self.KEY}.{PoolName.MAMBA}")
+        from_kv = b._group_sibling_keys(kv)
+        from_sidecar = b._group_sibling_keys(sidecar)
+        expected = {kv, sidecar}
+        # Full group from either member; the evictor filters the primary out.
+        self.assertEqual(set(from_kv), expected)
+        self.assertEqual(set(from_sidecar), expected)
+
+    def test_eviction_removes_whole_group(self):
+        b = self._backend_with_sidecar(metadata_ttl=5, enable_metadata_cache=True)
+        sidecar_key = f"{self.KEY}.{PoolName.MAMBA}"
+        self.assertTrue(b.set(self.KEY, _t(64)))
+        self.assertTrue(b.set(sidecar_key, _t(32)))
+        self.assertEqual(len(b._evictor._lru), 2)
+        with b._evictor._lock:
+            outcome, freed = b._evictor._evict_one_lru_locked()
+        self.assertEqual(outcome, "evicted")
+        self.assertEqual(freed, 96)
+        self.assertEqual(len(b._evictor._lru), 0)
+        self.assertEqual(b._evictor._total_bytes, 0)
+        self.assertFalse(b.exists(self.KEY))
+        self.assertFalse(b.exists(sidecar_key))
+        # Metadata cache entries must go with their files.
+        self.assertFalse(b.metadata_cache.contains(b._get_suffixed_key(self.KEY)))
+        self.assertFalse(b.metadata_cache.contains(b._get_suffixed_key(sidecar_key)))
+
+    def test_eviction_removes_untracked_sibling_file(self):
+        b = self._backend_with_sidecar()
+        sidecar_key = f"{self.KEY}.{PoolName.MAMBA}"
+        self.assertTrue(b.set(self.KEY, _t(64)))
+        # A sidecar file on disk that this evictor never tracked (e.g. written
+        # before a restart with a cleared index) still belongs to the group.
+        sidecar_path = os.path.join(
+            b.file_path, f"{b._get_suffixed_key(sidecar_key)}.bin"
+        )
+        with open(sidecar_path, "wb") as f:
+            f.write(b"s" * 32)
+        with b._evictor._lock:
+            outcome, freed = b._evictor._evict_one_lru_locked()
+        self.assertEqual(outcome, "evicted")
+        self.assertEqual(freed, 64)
+        self.assertFalse(os.path.exists(sidecar_path))
+
+    def test_eviction_defers_group_with_pending_sibling(self):
+        b = self._backend_with_sidecar()
+        sidecar_key = f"{self.KEY}.{PoolName.MAMBA}"
+        self.assertTrue(b.set(self.KEY, _t(64)))
+        self.assertTrue(b.set(sidecar_key, _t(32)))
+        kv = b._get_suffixed_key(self.KEY)
+        sidecar = b._get_suffixed_key(sidecar_key)
+        with b._evictor._lock:
+            b._evictor._pending_writes.add(sidecar)
+            outcome, freed = b._evictor._evict_one_lru_locked()
+        self.assertEqual(outcome, "skipped")
+        self.assertEqual(freed, 0)
+        # The KV payload is re-pinned (MRU), not deleted.
+        self.assertIn(kv, b._evictor._lru)
+        self.assertTrue(b.exists(self.KEY))
+        self.assertTrue(b.exists(sidecar_key))
+
+    def test_touch_many_refreshes_recency_and_adopts_untracked_siblings(self):
+        b = self._backend_with_sidecar()
+        k1, k2 = "1" * 64, "2" * 64
+        self.assertTrue(b.set(k1, _t(64)))
+        self.assertTrue(b.set(k2, _t(64)))
+        # k1's sidecar exists on disk but was never tracked by this evictor
+        # (e.g. written before a restart with a cleared index).
+        sidecar_path = os.path.join(
+            b.file_path, f"{b._get_suffixed_key(f'{k1}.{PoolName.MAMBA}')}.bin"
+        )
+        with open(sidecar_path, "wb") as f:
+            f.write(b"s" * 32)
+        b.touch_many([k1])
+        # k2 is now the oldest entry; evicting removes its group while k1's
+        # group (payload + adopted sidecar) survives.
+        with b._evictor._lock:
+            outcome, _ = b._evictor._evict_one_lru_locked()
+        self.assertEqual(outcome, "evicted")
+        self.assertFalse(b.exists(k2))
+        self.assertTrue(b.exists(k1))
+        self.assertTrue(os.path.exists(sidecar_path))
+
+
 class TestPreReservationConcurrency(HiCacheFileLRUTestBase):
     def test_pre_reservation_visible_during_write(self):
         """An in-flight reservation must not be evicted by a concurrent set()."""
@@ -500,26 +753,26 @@ class TestHiCacheFileMetadataIntegration(HiCacheFileLRUTestBase):
         b.set("k1", _t(50))
         b.set("k2", _t(50))
 
-        # Now patch os.scandir and os.path.exists
+        # Now patch os.scandir and os.path.isfile
         with (
             mock.patch("os.scandir") as mock_scandir,
-            mock.patch("os.path.exists") as mock_exists,
+            mock.patch("os.path.isfile") as mock_isfile,
         ):
-            mock_exists.return_value = True
+            mock_isfile.return_value = True
 
-            # batch_exists_v2 for k1 and k2 should hit the metadata cache and NOT call os.scandir or os.path.exists
+            # batch_exists_v2 for k1 and k2 should hit the metadata cache and NOT call os.scandir or os.path.isfile
             res = b.batch_exists_v2(["k1", "k2"])
             self.assertEqual(res.kv_hit_pages, 2)
             mock_scandir.assert_not_called()
-            mock_exists.assert_not_called()
+            mock_isfile.assert_not_called()
 
-            # Querying "k3" (miss) should fall back to os.path.exists once but still NOT call os.scandir
+            # Querying "k3" (miss) should fall back to os.path.isfile once but still NOT call os.scandir
             res = b.batch_exists_v2(["k3"])
             self.assertEqual(
                 res.kv_hit_pages, 1
-            )  # since mock_exists returns True, k3 exists physically
+            )  # since mock_isfile returns True, k3 exists physically
             mock_scandir.assert_not_called()
-            mock_exists.assert_called_once()
+            mock_isfile.assert_called_once()
 
 
 class TestUncachedBatchExists(HiCacheFileLRUTestBase):
@@ -538,6 +791,546 @@ class TestUncachedBatchExists(HiCacheFileLRUTestBase):
             os.remove(os.path.join(b.file_path, f"{b._get_component_key('k1')}.bin"))
             self.assertEqual(b.batch_exists_v2(keys).kv_hit_pages, 0)
             self.assertEqual(b.batch_exists_v2([]).kv_hit_pages, 0)
+
+
+# ---------------------------------------------------------------------------
+# io_mode configuration and direct (O_DIRECT) segment I/O
+# ---------------------------------------------------------------------------
+
+
+def _direct_io_supported(dir_path: str) -> bool:
+    """True when this filesystem accepts a page-aligned O_DIRECT read."""
+    if not hasattr(os, "O_DIRECT"):
+        return False
+    probe = os.path.join(dir_path, ".odirect_probe")
+    try:
+        with open(probe, "wb") as f:
+            f.truncate(DIRECT_IO_ALIGNMENT)
+        raw = (ctypes.c_char * (2 * DIRECT_IO_ALIGNMENT))()
+        off = (-ctypes.addressof(raw)) % DIRECT_IO_ALIGNMENT
+        buf = memoryview(raw).cast("B")[off : off + DIRECT_IO_ALIGNMENT]
+        fd = os.open(probe, os.O_RDONLY | os.O_DIRECT)
+        try:
+            return os.preadv(fd, [buf], 0) == DIRECT_IO_ALIGNMENT
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+    finally:
+        try:
+            os.remove(probe)
+        except OSError:
+            pass
+
+
+class _StubPool:
+    """CPU stand-in for a page_first host pool.
+
+    One ctypes buffer laid out as num_pages x seg_bytes with page_size=1, so
+    slot j maps to exactly one segment. Also implements the copy-based v2 API
+    on the same bytes for the buffered-path tests.
+    """
+
+    def __init__(
+        self,
+        num_pages: int,
+        seg_bytes: int,
+        layout: str = "page_first",
+        force_unaligned: bool = False,
+    ):
+        self.page_size = 1
+        self.layout = layout
+        self.seg_bytes = seg_bytes
+        raw = (ctypes.c_char * (num_pages * seg_bytes + DIRECT_IO_ALIGNMENT))()
+        off = (-ctypes.addressof(raw)) % DIRECT_IO_ALIGNMENT
+        if force_unaligned:
+            off += 1
+        self._raw = raw
+        self._view = memoryview(raw).cast("B")
+        self._off = off
+        self.base = ctypes.addressof(raw) + off
+
+    def get_page_buffer_meta(self, indices):
+        idxs = [int(i) for i in indices]
+        return (
+            [self.base + j * self.seg_bytes for j in idxs],
+            [self.seg_bytes] * len(idxs),
+        )
+
+    def is_stride_page_aligned(self, page_size_bytes: int = DIRECT_IO_ALIGNMENT):
+        return (
+            self.layout in ("page_first", "page_first_direct")
+            and self.base % page_size_bytes == 0
+            and (self.page_size * self.seg_bytes) % page_size_bytes == 0
+        )
+
+    def fill_slot(self, slot: int, fill: int):
+        self._view[
+            self._off + slot * self.seg_bytes : self._off + (slot + 1) * self.seg_bytes
+        ] = bytes([fill]) * self.seg_bytes
+
+    def write_slot(self, slot: int, data: bytes):
+        start = self._off + slot * self.seg_bytes
+        self._view[start : start + len(data)] = data
+
+    def read_slot(self, slot: int) -> bytes:
+        start = self._off + slot * self.seg_bytes
+        return bytes(self._view[start : start + self.seg_bytes])
+
+    # Copy-based (buffered v2) path API
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        return torch.frombuffer(
+            bytearray(self.read_slot(int(index))), dtype=torch.uint8
+        )
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        return torch.zeros(self.seg_bytes, dtype=torch.uint8)
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        self.write_slot(int(index), bytes(data_page.numpy().tobytes()))
+
+
+class TestIoModeConfig(HiCacheFileLRUTestBase):
+    def test_default_is_buffered(self):
+        b = self.make_backend()
+        self.assertEqual(b.io_mode, "buffered")
+        self.assertFalse(b.supports_zero_copy_page_io)
+        self.assertEqual(b._o_direct, 0)
+
+    def test_env_default_is_buffered(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_IO_MODE", None)
+            self.assertEqual(envs.SGLANG_HICACHE_FILE_BACKEND_IO_MODE.get(), "buffered")
+
+    def test_extra_config_wins_over_env(self):
+        with envs.SGLANG_HICACHE_FILE_BACKEND_IO_MODE.override("direct"):
+            b = self.make_backend(io_mode="buffered")
+            self.assertEqual(b.io_mode, "buffered")
+
+    def test_invalid_extra_config_raises(self):
+        with self.assertRaises(ValueError):
+            self.make_backend(io_mode="streaming")
+        with self.assertRaises(ValueError):
+            self.make_backend(io_mode=42)
+
+    def test_invalid_env_raises(self):
+        with envs.SGLANG_HICACHE_FILE_BACKEND_IO_MODE.override("weird"):
+            with self.assertRaises(ValueError):
+                self.make_backend()
+
+
+class DirectIoTestBase(HiCacheFileLRUTestBase):
+    """Shared setup for the strict direct-mode tests.
+
+    Only the actual O_DIRECT filesystem interactions are skipped when the
+    platform/FS lacks O_DIRECT; production behavior stays strict.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if not _direct_io_supported(self.tmpdir):
+            self.skipTest("filesystem rejects an aligned O_DIRECT probe")
+
+    def _direct_backend(self, **kw):
+        return self.make_backend(io_mode="direct", **kw)
+
+    def _file(self, b, stem):
+        return os.path.join(b.file_path, f"{stem}{b.config_suffix}.bin")
+
+
+class TestDirectStrictValidation(DirectIoTestBase):
+    def test_direct_reports_zero_copy_capability(self):
+        b = self._direct_backend()
+        self.assertEqual(b.io_mode, "direct")
+        self.assertTrue(b.supports_zero_copy_page_io)
+
+    def test_anchor_wrong_layout_rejected(self):
+        b = self._direct_backend()
+        with self.assertRaises(ValueError):
+            b.register_mem_pool_host(
+                _StubPool(2, DIRECT_IO_ALIGNMENT, layout="layer_first")
+            )
+
+    def test_anchor_missing_page_buffer_meta_rejected(self):
+        class NoMeta(_StubPool):
+            get_page_buffer_meta = None
+
+        b = self._direct_backend()
+        with self.assertRaises(ValueError):
+            b.register_mem_pool_host(NoMeta(2, DIRECT_IO_ALIGNMENT))
+
+    def test_anchor_unaligned_stride_rejected(self):
+        b = self._direct_backend()
+        pool = _StubPool(2, DIRECT_IO_ALIGNMENT, force_unaligned=True)
+        self.assertFalse(pool.is_stride_page_aligned(DIRECT_IO_ALIGNMENT))
+        with self.assertRaises(ValueError):
+            b.register_mem_pool_host(pool)
+
+    def test_sidecar_pools_validated_including_mamba(self):
+        b = self._direct_backend()
+        b.register_mem_pool_host(_StubPool(1, DIRECT_IO_ALIGNMENT))
+        with self.assertRaises(ValueError):
+            b.register_mem_host_pool_v2(
+                _StubPool(1, DIRECT_IO_ALIGNMENT, layout="layer_first"), PoolName.MAMBA
+            )
+        with self.assertRaises(ValueError):
+            b.register_mem_host_pool_v2(
+                _StubPool(1, DIRECT_IO_ALIGNMENT, force_unaligned=True), PoolName.MAMBA
+            )
+        # A conforming sidecar registers fine.
+        b.register_mem_host_pool_v2(_StubPool(1, DIRECT_IO_ALIGNMENT), PoolName.MAMBA)
+        self.assertIs(b.registered_pools[PoolName.MAMBA].layout, "page_first")
+
+
+class TestDirectSegmentRoundtrip(DirectIoTestBase):
+    def test_v1_roundtrip_returns_per_page_booleans(self):
+        seg = 2 * DIRECT_IO_ALIGNMENT
+        b = self._direct_backend()
+        src = _StubPool(2, seg)
+        src.fill_slot(0, 0xAB)
+        src.fill_slot(1, 0xCD)
+        b.register_mem_pool_host(src)
+
+        self.assertEqual(
+            b.batch_set_v1(["p0", "p1"], torch.tensor([0, 1])), [True, True]
+        )
+        for k in ("p0", "p1"):
+            path = self._file(b, k)
+            self.assertTrue(os.path.exists(path))
+            self.assertEqual(os.path.getsize(path), seg)
+
+        dst = _StubPool(2, seg)
+        b.register_mem_pool_host(dst)
+        res = b.batch_get_v1(["p0", "p1", "absent"], torch.tensor([0, 1, 0]))
+        self.assertEqual(res, [True, True, False])
+        self.assertEqual(dst.read_slot(0), bytes([0xAB]) * seg)
+        self.assertEqual(dst.read_slot(1), bytes([0xCD]) * seg)
+
+    def test_v1_write_uses_o_direct_fd(self):
+        seg = DIRECT_IO_ALIGNMENT
+        b = self._direct_backend()
+        pool = _StubPool(1, seg)
+        b.register_mem_pool_host(pool)
+        seen = []
+        real_open = os.open
+
+        def spy(path, flags, *args, **kwargs):
+            seen.append(flags)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch("os.open", side_effect=spy):
+            self.assertTrue(b.batch_set_v1(["od"], torch.tensor([0]))[0])
+        self.assertTrue(any(f & os.O_DIRECT for f in seen))
+
+    def test_v1_read_requires_exact_file_length(self):
+        seg = 2 * DIRECT_IO_ALIGNMENT
+        b = self._direct_backend()
+        pool = _StubPool(1, seg)
+        b.register_mem_pool_host(pool)
+        # A truncated file must be rejected, not partially consumed.
+        with open(self._file(b, "half"), "wb") as f:
+            f.write(b"z" * (seg - DIRECT_IO_ALIGNMENT))
+        dst = _StubPool(1, seg)
+        b.register_mem_pool_host(dst)
+        self.assertEqual(b.batch_get_v1(["half"], torch.tensor([0])), [False])
+        self.assertEqual(dst.read_slot(0), b"\x00" * seg)
+
+    def test_aligned_short_read_advances_through_iovecs(self):
+        seg = 2 * DIRECT_IO_ALIGNMENT
+        b = self._direct_backend()
+        pool = _StubPool(1, seg)
+        pool.fill_slot(0, 0x5A)
+        b.register_mem_pool_host(pool)
+        self.assertTrue(b.batch_set_v1(["sh"], torch.tensor([0]))[0])
+
+        dst = _StubPool(1, seg)
+        b.register_mem_pool_host(dst)
+        real_preadv = os.preadv
+        calls = []
+
+        def halving(fd, views, off):
+            calls.append(sum(len(v) for v in views))
+            # Emulate an aligned short read: request at most one page.
+            capped = [views[0][:DIRECT_IO_ALIGNMENT]]
+            return real_preadv(fd, capped, off)
+
+        with mock.patch("os.preadv", side_effect=halving):
+            self.assertEqual(b.batch_get_v1(["sh"], torch.tensor([0])), [True])
+        self.assertGreater(len(calls), 1)
+        self.assertEqual(dst.read_slot(0), bytes([0x5A]) * seg)
+
+    def test_nonaligned_short_read_rejected(self):
+        seg = 2 * DIRECT_IO_ALIGNMENT
+        b = self._direct_backend()
+        pool = _StubPool(1, seg)
+        b.register_mem_pool_host(pool)
+        self.assertTrue(b.batch_set_v1(["ns"], torch.tensor([0]))[0])
+        dst = _StubPool(1, seg)
+        b.register_mem_pool_host(dst)
+        with mock.patch("os.preadv", return_value=DIRECT_IO_ALIGNMENT - 1):
+            self.assertEqual(b.batch_get_v1(["ns"], torch.tensor([0])), [False])
+
+    def test_eof_before_completion_rejected(self):
+        seg = 2 * DIRECT_IO_ALIGNMENT
+        b = self._direct_backend()
+        pool = _StubPool(1, seg)
+        b.register_mem_pool_host(pool)
+        self.assertTrue(b.batch_set_v1(["ef"], torch.tensor([0]))[0])
+        dst = _StubPool(1, seg)
+        b.register_mem_pool_host(dst)
+        with mock.patch("os.preadv", return_value=None):
+            self.assertEqual(b.batch_get_v1(["ef"], torch.tensor([0])), [False])
+
+    def test_direct_writes_go_through_lru_evictor(self):
+        seg = 2 * DIRECT_IO_ALIGNMENT
+        b = self._direct_backend(max_size="100000")
+        pool = _StubPool(1, seg)
+        b.register_mem_pool_host(pool)
+        self.assertTrue(b.batch_set_v1(["lru"], torch.tensor([0]))[0])
+        self.assertIn(b._get_suffixed_key("lru"), b._evictor._lru)
+        self.assertNotIn(b._get_suffixed_key("lru"), b._evictor._pending_writes)
+        self.assertEqual(b._evictor._total_bytes, seg)
+
+    def test_v2_kv_and_mamba_component_separation(self):
+        kv_seg, mb_seg = 2 * DIRECT_IO_ALIGNMENT, DIRECT_IO_ALIGNMENT
+        b = self._direct_backend()
+        b.register_mem_pool_host(_StubPool(1, kv_seg))
+        kv_src = _StubPool(1, kv_seg)
+        mb_src = _StubPool(1, mb_seg)
+        kv_src.fill_slot(0, 0x11)
+        mb_src.fill_slot(0, 0x22)
+        b.register_mem_host_pool_v2(kv_src, PoolName.KV)
+        b.register_mem_host_pool_v2(mb_src, PoolName.MAMBA)
+        transfers = [
+            PoolTransfer(name=PoolName.KV, host_indices=torch.tensor([0]), keys=["c0"]),
+            PoolTransfer(
+                name=PoolName.MAMBA, host_indices=torch.tensor([0]), keys=["c0"]
+            ),
+        ]
+        res = b.batch_set_v2(transfers)
+        self.assertEqual(res, {PoolName.KV: [True], PoolName.MAMBA: [True]})
+
+        kv_path = self._file(b, "c0")
+        mb_path = self._file(b, "c0.mamba")
+        self.assertTrue(os.path.exists(kv_path))
+        self.assertTrue(os.path.exists(mb_path))
+        with open(kv_path, "rb") as f:
+            self.assertEqual(f.read(), bytes([0x11]) * kv_seg)
+        with open(mb_path, "rb") as f:
+            self.assertEqual(f.read(), bytes([0x22]) * mb_seg)
+
+        kv_dst = _StubPool(1, kv_seg)
+        mb_dst = _StubPool(1, mb_seg)
+        b.register_mem_host_pool_v2(kv_dst, PoolName.KV)
+        b.register_mem_host_pool_v2(mb_dst, PoolName.MAMBA)
+        res = b.batch_get_v2(transfers)
+        self.assertEqual(res, {PoolName.KV: [True], PoolName.MAMBA: [True]})
+        self.assertEqual(kv_dst.read_slot(0), bytes([0x11]) * kv_seg)
+        self.assertEqual(mb_dst.read_slot(0), bytes([0x22]) * mb_seg)
+
+
+class TestBufferedCompatibility(HiCacheFileLRUTestBase):
+    """Buffered mode must keep working without any O_DIRECT requirement."""
+
+    def test_v1_buffered_roundtrip_without_alignment(self):
+        # 1000-byte unaligned segments: fine for buffered, rejected in direct.
+        b = self.make_backend()
+        pool = _StubPool(2, 1000, force_unaligned=True)
+        pool.fill_slot(0, 0x77)
+        b.register_mem_pool_host(pool)
+        self.assertEqual(b.batch_set_v1(["b0"], torch.tensor([0])), [True])
+        dst = _StubPool(2, 1000, force_unaligned=True)
+        b.register_mem_pool_host(dst)
+        self.assertEqual(b.batch_get_v1(["b0"], torch.tensor([0])), [True])
+        self.assertEqual(dst.read_slot(0), bytes([0x77]) * 1000)
+
+    def test_v2_buffered_keeps_copy_page_path(self):
+        b = self.make_backend()
+        src = _StubPool(1, 1000)
+        src.fill_slot(0, 0x33)
+        b.register_mem_host_pool_v2(src, PoolName.KV)
+        transfers = [
+            PoolTransfer(name=PoolName.KV, host_indices=torch.tensor([0]), keys=["z0"])
+        ]
+        res = b.batch_set_v2(transfers)
+        self.assertEqual(res, {PoolName.KV: [True]})
+        with open(self._file_name(b, "z0"), "rb") as f:
+            self.assertEqual(f.read(), bytes([0x33]) * 1000)
+
+        dst = _StubPool(1, 1000)
+        b.register_mem_host_pool_v2(dst, PoolName.KV)
+        res = b.batch_get_v2(transfers)
+        self.assertEqual(res, {PoolName.KV: [True]})
+        self.assertEqual(dst.read_slot(0), bytes([0x33]) * 1000)
+
+    @staticmethod
+    def _file_name(b, stem):
+        return os.path.join(b.file_path, f"{stem}{b.config_suffix}.bin")
+
+
+class _ComponentStubPool(_StubPool):
+    """A stub pool whose debug tensors expose named components."""
+
+    def get_debug_page_tensors(self, index):
+        page = self.get_data_page(index)
+        return (
+            ("kv_k", page[: self.seg_bytes // 2]),
+            ("kv_v", page[self.seg_bytes // 2 :]),
+        )
+
+
+class TestPageDigestLogging(HiCacheFileLRUTestBase):
+    """Page-digest emission on the v2 write/read paths.
+
+    The lines must stay parseable by the bench digest checker, so the
+    regex here mirrors PAGE_RE in super-quant's hicache_digest_check.py.
+    """
+
+    # Mirrors PAGE_RE in scripts/hicache_digest_check.py; keep in sync.
+    _PAGE_DIGEST_RE = re.compile(
+        r"HiCache page digest direction=(\w+) pool=(\S+) component=(\S+) "
+        r"key=(\S+) host_page=(\d+) bytes=(\d+) sha256=([0-9a-f]{64})"
+    )
+
+    @staticmethod
+    def _digest_lines(logs):
+        return [line for line in logs.output if "page digest" in line]
+
+    def test_kv_write_and_read_digests_pair_and_match_bytes(self):
+        import hashlib
+
+        with envs.SGLANG_HICACHE_FILE_BACKEND_LOG_PAGE_DIGESTS.override(True):
+            b = self.make_backend()
+            src = _StubPool(1, 1000)
+            src.fill_slot(0, 0x33)
+            b.register_mem_host_pool_v2(src, PoolName.KV)
+            transfers = [
+                PoolTransfer(
+                    name=PoolName.KV, host_indices=torch.tensor([0]), keys=["d0"]
+                )
+            ]
+            with self.assertLogs(
+                "sglang.srt.mem_cache.hicache_storage", level="WARNING"
+            ) as write_logs:
+                self.assertEqual(b.batch_set_v2(transfers), {PoolName.KV: [True]})
+
+            dst = _StubPool(1, 1000)
+            b.register_mem_host_pool_v2(dst, PoolName.KV)
+            with self.assertLogs(
+                "sglang.srt.mem_cache.hicache_storage", level="WARNING"
+            ) as read_logs:
+                self.assertEqual(b.batch_get_v2(transfers), {PoolName.KV: [True]})
+            self.assertEqual(dst.read_slot(0), bytes([0x33]) * 1000)
+
+        write_lines = self._digest_lines(write_logs)
+        read_lines = self._digest_lines(read_logs)
+        self.assertEqual(len(write_lines), 1)
+        self.assertEqual(len(read_lines), 1)
+
+        write_match = self._PAGE_DIGEST_RE.search(write_lines[0])
+        read_match = self._PAGE_DIGEST_RE.search(read_lines[0])
+        self.assertIsNotNone(write_match, write_lines[0])
+        self.assertIsNotNone(read_match, read_lines[0])
+
+        expected_digest = hashlib.sha256(bytes([0x33]) * 1000).hexdigest()
+        for match, direction in ((write_match, "write"), (read_match, "read")):
+            self.assertEqual(match.group(1), direction)
+            self.assertEqual(match.group(2), str(PoolName.KV))
+            self.assertEqual(match.group(3), str(PoolName.KV))
+            self.assertEqual(match.group(4), "d0")
+            self.assertEqual(match.group(5), "0")
+            self.assertEqual(match.group(6), "1000")
+            self.assertEqual(match.group(7), expected_digest)
+        # The restored page's read digest must equal the written page's digest.
+        self.assertEqual(write_match.group(7), read_match.group(7))
+
+    def test_mamba_sidecar_and_multi_component_digests(self):
+        import hashlib
+
+        with envs.SGLANG_HICACHE_FILE_BACKEND_LOG_PAGE_DIGESTS.override(True):
+            b = self.make_backend()
+            kv_src = _StubPool(1, 1000)
+            mb_src = _StubPool(1, 500)
+            kv_src.fill_slot(0, 0x11)
+            mb_src.fill_slot(0, 0x22)
+            b.register_mem_host_pool_v2(kv_src, PoolName.KV)
+            b.register_mem_host_pool_v2(mb_src, PoolName.MAMBA)
+            transfers = [
+                PoolTransfer(
+                    name=PoolName.KV, host_indices=torch.tensor([0]), keys=["c0"]
+                ),
+                PoolTransfer(
+                    name=PoolName.MAMBA, host_indices=torch.tensor([0]), keys=["c0"]
+                ),
+            ]
+            with self.assertLogs(
+                "sglang.srt.mem_cache.hicache_storage", level="WARNING"
+            ) as write_logs:
+                self.assertEqual(
+                    b.batch_set_v2(transfers),
+                    {PoolName.KV: [True], PoolName.MAMBA: [True]},
+                )
+
+            # A pool with named debug components logs one line per component
+            # under the plain pool key (the bench parser's per-component
+            # pairing input).
+            comp = self.make_backend()
+            comp_src = _ComponentStubPool(1, 1000)
+            comp_src.fill_slot(0, 0x44)
+            comp.register_mem_host_pool_v2(comp_src, PoolName.KV)
+            comp_transfers = [
+                PoolTransfer(
+                    name=PoolName.KV, host_indices=torch.tensor([0]), keys=["c0"]
+                )
+            ]
+            with self.assertLogs(
+                "sglang.srt.mem_cache.hicache_storage", level="WARNING"
+            ) as comp_logs:
+                self.assertEqual(
+                    comp.batch_set_v2(comp_transfers), {PoolName.KV: [True]}
+                )
+
+        def digests_by_key_component(lines):
+            by_key = {}
+            for line in lines:
+                match = self._PAGE_DIGEST_RE.search(line)
+                self.assertIsNotNone(match, line)
+                by_key[(match.group(4), match.group(3))] = match
+            return by_key
+
+        sidecar = digests_by_key_component(self._digest_lines(write_logs))
+        self.assertEqual(
+            sidecar[("c0.mamba", str(PoolName.MAMBA))].group(7),
+            hashlib.sha256(bytes([0x22]) * 500).hexdigest(),
+        )
+        self.assertEqual(sidecar[("c0.mamba", str(PoolName.MAMBA))].group(6), "500")
+        self.assertEqual(
+            sidecar[("c0", str(PoolName.KV))].group(7),
+            hashlib.sha256(bytes([0x11]) * 1000).hexdigest(),
+        )
+
+        components = digests_by_key_component(self._digest_lines(comp_logs))
+        self.assertEqual(sorted(k for _, k in components), ["kv_k", "kv_v"])
+        half = bytes([0x44]) * 500
+        self.assertEqual(
+            components[("c0", "kv_k")].group(7), hashlib.sha256(half).hexdigest()
+        )
+        self.assertEqual(
+            components[("c0", "kv_v")].group(7), hashlib.sha256(half).hexdigest()
+        )
+
+    def test_disabled_by_default_emits_nothing(self):
+        b = self.make_backend()
+        src = _StubPool(1, 1000)
+        src.fill_slot(0, 0x33)
+        b.register_mem_host_pool_v2(src, PoolName.KV)
+        transfers = [
+            PoolTransfer(name=PoolName.KV, host_indices=torch.tensor([0]), keys=["q0"])
+        ]
+        with self.assertNoLogs("sglang.srt.mem_cache.hicache_storage", level="WARNING"):
+            self.assertEqual(b.batch_set_v2(transfers), {PoolName.KV: [True]})
+        with self.assertNoLogs("sglang.srt.mem_cache.hicache_storage", level="WARNING"):
+            self.assertEqual(b.batch_get_v2(transfers), {PoolName.KV: [True]})
 
 
 if __name__ == "__main__":

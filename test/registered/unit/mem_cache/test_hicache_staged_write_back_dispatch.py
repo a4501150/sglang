@@ -567,6 +567,11 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 f"{MHA_POOL_HOST_MODULE}.can_use_write_back_jit_kernel",
                 return_value=True,
             ) as can_use_write_back_jit_kernel,
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.common."
+                "can_use_host_pointer_for_registered_mem",
+                return_value=True,
+            ),
         ):
             host.backup_from_device_all_layer(
                 device_pool, host_indices, device_indices, io_backend="kernel"
@@ -759,6 +764,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         host.layout = "page_first"
         host.num_mamba_layers = num_layers
+        host.slot_state_device_tensors = ()
+        host.slot_state_buffers = ()
         host.device_pool = SimpleNamespace(device="cpu")
         host.temporal_buffer = torch.zeros(8, num_layers, 1, 3, dtype=torch.uint8)
         host.conv_buffer = [
@@ -850,6 +857,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         host.layout = "page_first_direct"
         host.num_mamba_layers = num_layers
+        host.slot_state_device_tensors = ()
+        host.slot_state_buffers = ()
         host.temporal_state_elem_size = 3
         host.temporal_buffer = torch.zeros(8, num_layers, 1, 3, dtype=torch.float32)
         host.conv_state_shapes = [(2,)]
@@ -1043,7 +1052,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         expected = [buffer[device_page_indices].clone() for buffer in device_layers]
         device_pool = _device_pool_stub(
             layer_num=layer_num,
-            index_k_with_scale_buffer=device_layers,
+            get_hicache_indexer_page_buffers=lambda: device_layers,
         )
 
         host = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)

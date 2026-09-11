@@ -107,6 +107,9 @@ class StorageBackupSpec(NamedTuple):
     hash_value: list[str]
     prefix_keys: Optional[list[str]]
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
+    # VRAM slots backing this node while it is still resident in L1. A
+    # device-direct storage backup reads them and skips the L2 payload copy.
+    device_value: Optional[torch.Tensor] = None
 
 
 class UnifiedTreeNode:
@@ -1408,6 +1411,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if component.component_type != BASE_COMPONENT_TYPE
         )
 
+    def needs_incremental_component_backup(self, node_id: NodeId) -> bool:
+        return self._needs_incremental_component_backup(self.node_by_id(node_id))
+
     def _should_backup_after_insert(self, state: _InsertWalkState) -> bool:
         """Check whether the insert target needs a Host backup."""
         if state.is_new_leaf:
@@ -2310,6 +2316,49 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def set_host_memory_buffer_only(self) -> None:
         self.is_host_memory_buffer_only = True
 
+    def _walk_matched_prefix(
+        self,
+        node: UnifiedTreeNode,
+        key: RadixKey,
+        value: torch.Tensor,
+        hash_value: list[str],
+        on_matched_node: Optional[Callable[..., None]] = None,
+    ):
+        """Shared descend/match/split walk of insert_host/insert_device.
+
+        Advances the request-side key/value/hash past every matched node,
+        splitting partial matches, and returns ``(node, matched_length,
+        cache_actions, key, value, hash_value)`` with the remainders. Split
+        inputs never depend on the request-side advancement and the matched
+        slices are captured before it, so match -> split -> advance ->
+        ``on_matched_node`` is equivalent to the historical orderings of both
+        callers. ``on_matched_node`` (host insert only) receives the
+        post-split node, the matched length, and the matched value/hash
+        slices.
+        """
+        child_key = key.child_key(self.page_size)
+        matched_length = 0
+        cache_actions: list[CacheAction | ComponentAction] = []
+        while len(key) > 0 and child_key in node.children:
+            node = node.children[child_key]
+            self._touch_node(node)
+            prefix_len = node.key.match(key, page_size=self.page_size)
+            matched_value = value[:prefix_len]
+            matched_hash = hash_value[: prefix_len // self.page_size]
+            if prefix_len < len(node.key):
+                node, action = self._split_node(node.key, node, prefix_len)
+                if action is not None:
+                    cache_actions.append(action)
+            key = key[prefix_len:]
+            value = value[prefix_len:]
+            hash_value = hash_value[prefix_len // self.page_size :]
+            matched_length += prefix_len
+            if on_matched_node is not None:
+                on_matched_node(node, prefix_len, matched_value, matched_hash)
+            if len(key):
+                child_key = key.child_key(self.page_size)
+        return node, matched_length, cache_actions, key, value, hash_value
+
     def insert_host(
         self,
         node_id: NodeId,
@@ -2324,50 +2373,34 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if total_len == 0:
             return InsertResult(prefix_len=0, mamba_exist=True)
 
-        child_key = key.child_key(self.page_size)
-        matched_length = 0
         host_prefix_len = 0
         refilled_host_node = None
-        cache_actions: list[CacheAction | ComponentAction] = []
-        while len(key) > 0 and child_key in node.children:
-            node = node.children[child_key]
-            self._touch_node(node)
-            prefix_len = node.key.match(key, page_size=self.page_size)
 
-            matched_host_value = host_value[:prefix_len]
-            matched_hash_value = hash_value[: prefix_len // self.page_size]
+        def refill(node, prefix_len, matched_host_value, matched_hash_value):
+            nonlocal host_prefix_len, refilled_host_node
+            if self.is_write_back:
+                return
+            full_data = node.component_data[BASE_COMPONENT_TYPE]
+            if full_data.host_value is None:
+                full_data.host_value = matched_host_value.clone()
+                if node.hash_value is None:
+                    node.hash_value = list(matched_hash_value)
+                self.kv_events.record_store(node, medium=StorageMedium.CPU)
+                self._update_evictable_leaf_sets(node)
+                if node.parent is not None:
+                    self._update_evictable_leaf_sets(node.parent)
+                self._update_duplicate_tracking(node)
+                refilled_host_node = node
+            else:
+                assert refilled_host_node is None, (
+                    "write-through host-prefix invariant broken: encountered "
+                    f"backed node {node.id} below a refilled host tombstone"
+                )
+                host_prefix_len += prefix_len
 
-            key = key[prefix_len:]
-            host_value = host_value[prefix_len:]
-            hash_value = hash_value[prefix_len // self.page_size :]
-            matched_length += prefix_len
-
-            if prefix_len < len(node.key):
-                node, action = self._split_node(node.key, node, prefix_len)
-                if action is not None:
-                    cache_actions.append(action)
-
-            if not self.is_write_back:
-                full_data = node.component_data[BASE_COMPONENT_TYPE]
-                if full_data.host_value is None:
-                    full_data.host_value = matched_host_value.clone()
-                    if node.hash_value is None:
-                        node.hash_value = list(matched_hash_value)
-                    self.kv_events.record_store(node, medium=StorageMedium.CPU)
-                    self._update_evictable_leaf_sets(node)
-                    if node.parent is not None:
-                        self._update_evictable_leaf_sets(node.parent)
-                    self._update_duplicate_tracking(node)
-                    refilled_host_node = node
-                else:
-                    assert refilled_host_node is None, (
-                        "write-through host-prefix invariant broken: encountered "
-                        f"backed node {node.id} below a refilled host tombstone"
-                    )
-                    host_prefix_len += prefix_len
-
-            if len(key):
-                child_key = key.child_key(self.page_size)
+        node, matched_length, cache_actions, key, host_value, hash_value = (
+            self._walk_matched_prefix(node, key, host_value, hash_value, refill)
+        )
 
         result = InsertResult(
             prefix_len=(matched_length if self.is_write_back else host_prefix_len),
@@ -2399,11 +2432,58 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             _set_tlru_lens_and_raise_history(new_node, node)
         new_node.hash_value = hash_value
         new_node.component_data[BASE_COMPONENT_TYPE].host_value = host_value.clone()
-        node.children[child_key] = new_node
+        # The walker consumed the loop-local child_key; the remainder's
+        # first page addresses the new leaf.
+        node.children[key.child_key(self.page_size)] = new_node
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(node)
         result.inserted_host_node = new_node.id
         self.kv_events.record_store(new_node, medium=StorageMedium.CPU)
+        return result
+
+    #: Only the Python tree core can splice device-resident paths
+    #: (``insert_device``); the Rust core keeps prefetches on the host path.
+    supports_device_insert = True
+
+    def insert_device(
+        self,
+        node_id: NodeId,
+        key: RadixKey,
+        device_value: torch.Tensor,
+        hash_value: list[str],
+    ) -> InsertResult:
+        """Insert a device-resident tree path descending from the given node.
+
+        Used by device-direct (GDS) prefetch splices: the payload lands in
+        VRAM slots the caller allocated and never touches host pages. The
+        walked prefix duplicates live tree data and the caller frees it;
+        a new leaf adopts the suffix slots and gets a write-through backup
+        action. The Python TreeCore only; FULL component (KV + KV-derived
+        sidecars) trees."""
+        node = self.node_by_id(node_id)
+        total_len = len(key)
+        self._touch_node(node)
+        if total_len == 0:
+            return InsertResult(prefix_len=0, mamba_exist=True)
+
+        node, matched_length, cache_actions, key, device_value, hash_value = (
+            self._walk_matched_prefix(node, key, device_value, hash_value)
+        )
+
+        result = InsertResult(
+            prefix_len=matched_length,
+            total_len=total_len,
+            cache_actions=cache_actions,
+        )
+        result.last_device_node = node.id
+        if len(key) == 0:
+            return result
+
+        new_node = self._add_new_node(node, key, device_value, priority=node.priority)
+        new_node.hash_value = hash_value
+        cache_actions.append(self._build_backup_kv_action(new_node))
+        result.inserted_host_node = new_node.id
+        result.last_device_node = new_node.id
         return result
 
     def build_backup_spec(self, node_id: NodeId):
@@ -2464,6 +2544,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 comp_xfers[comp.component_type] = transfers
         return StorageBackupSpec(
             host_value=node.component_data[BASE_COMPONENT_TYPE].host_value,
+            device_value=node.component_data[BASE_COMPONENT_TYPE].value,
             token_ids=node.key.token_ids,
             hash_value=node.hash_value,
             prefix_keys=prefix_keys,
