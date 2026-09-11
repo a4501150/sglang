@@ -2220,7 +2220,13 @@ class PreshardedModelLoader(DefaultModelLoader):
             if conv1d is None:
                 continue
             cweight = getattr(conv1d, "weight", None)
-            if cweight is not None and hasattr(attn, "conv_weights"):
+            if (
+                cweight is not None
+                and hasattr(attn, "conv_weights")
+                # A module-backed conv_weights derives its view fresh from the
+                # current parameter on every access — nothing to rebind.
+                and getattr(attn, "_conv_source", None) is not conv1d
+            ):
                 if cweight.dim() == 3 and cweight.size(1) == 1:
                     attn.conv_weights = cweight.view(cweight.size(0), cweight.size(2))
                 else:

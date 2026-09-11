@@ -18,6 +18,8 @@ No torch.compile.
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -26,6 +28,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -159,6 +162,15 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
         self._capture_inputs[shape_key] = capture_inputs
 
+    @staticmethod
+    def _lpo_fields(output: LogitsProcessorOutput):
+        """(name, tensor) pairs of the tensor-valued fields of a LogitsProcessorOutput."""
+        return [
+            (f.name, v)
+            for f in dataclasses.fields(output)
+            if torch.is_tensor(v := getattr(output, f.name))
+        ]
+
     def _output_rows(self, output: Any, cap: int) -> int:
         """Leading-dim row count actually produced by the body, clamped to ``cap``.
 
@@ -175,6 +187,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return min([cap, *rows])
         if isinstance(output, (list, tuple)) and output:
             return min(self._output_rows(o, cap) for o in output if o is not None)
+        if isinstance(output, LogitsProcessorOutput):
+            rows = [t.shape[0] for _, t in self._lpo_fields(output)]
+            return min([cap, *rows]) if rows else cap
         return cap
 
     def _alloc_full_buffer(self, output: Any, size: int) -> Any:
@@ -194,6 +209,11 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return tuple(self._alloc_full_buffer(o, size) for o in output)
         if isinstance(output, list):
             return [self._alloc_full_buffer(o, size) for o in output]
+        if isinstance(output, LogitsProcessorOutput):
+            buf = copy.copy(output)
+            for name, t in self._lpo_fields(output):
+                setattr(buf, name, t.new_empty((size, *t.shape[1:])))
+            return buf
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _slice_output(self, output: Any, num_tokens: int) -> Any:
@@ -207,6 +227,11 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
             return [self._slice_output(item, num_tokens) for item in output]
+        if isinstance(output, LogitsProcessorOutput):
+            out = copy.copy(output)
+            for name, t in self._lpo_fields(output):
+                setattr(out, name, t[:num_tokens])
+            return out
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _copy_output_to_buffer(
@@ -245,6 +270,20 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 )
             for item, buffer in zip(output, output_buffer):
                 self._copy_output_to_buffer(item, buffer, num_tokens)
+            return
+        if isinstance(output, LogitsProcessorOutput) and isinstance(
+            output_buffer, LogitsProcessorOutput
+        ):
+            for name, t in self._lpo_fields(output):
+                b = getattr(output_buffer, name, None)
+                if torch.is_tensor(b):
+                    b[:num_tokens].copy_(t[:num_tokens])
+                else:
+                    setattr(output_buffer, name, t)
+            for f in dataclasses.fields(output):
+                v = getattr(output, f.name)
+                if not torch.is_tensor(v):
+                    setattr(output_buffer, f.name, v)
             return
         raise TypeError(
             "Unsupported BCG output buffer pair: "

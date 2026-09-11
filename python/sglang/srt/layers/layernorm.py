@@ -1090,8 +1090,24 @@ class GemmaRMSNorm(BaseFusedOp):
     def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
+        # gemma_weight is a non-persistent buffer, so it is NOT moved along
+        # when --cpu-offload-gb places the parameter on the CPU; re-derive it
+        # on the parameter's device instead of failing the add below.
+        if self.gemma_weight.device != param.data.device:
+            self.gemma_weight = torch.empty_like(param.data)
         # Keep storage stable for CUDA graphs or fused paths that capture this buffer.
         torch.add(param.data, 1.0, out=self.gemma_weight)
+
+    def _gemma_weight_for(self, ref: torch.Tensor) -> torch.Tensor:
+        """gemma_weight on the device of ``ref``.
+
+        The offloader brings the parameter back to the GPU for the forward
+        pass but not the buffer. Without offload this is a plain comparison
+        with no copy.
+        """
+        if self.gemma_weight.device != ref.device:
+            self.gemma_weight = self.weight.data.to(ref.device) + 1.0
+        return self.gemma_weight
 
     def _forward_impl(
         self,
@@ -1166,7 +1182,7 @@ class GemmaRMSNorm(BaseFusedOp):
             # keep Gemma RMSNorm on native torch math for correctness.
             return self.forward_native(x, residual, post_residual_addition)
         else:
-            w = self.gemma_weight
+            w = self._gemma_weight_for(x)
             # vllm API: rms_norm(out, input, weight, eps) -> None (in-place)
             #           fused_add_rms_norm(out, input, residual_out, residual, weight, eps)
             if not x.is_contiguous():
@@ -1215,7 +1231,7 @@ class GemmaRMSNorm(BaseFusedOp):
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
             if x.shape[-1] > _NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE:
-                gamma = self.gemma_weight.to(x.dtype)
+                gamma = self._gemma_weight_for(x).to(x.dtype)
                 norm_out, _, residual = torch_npu.npu_add_rms_norm(
                     residual, x, gamma, self.variance_epsilon
                 )
@@ -1259,7 +1275,7 @@ class GemmaRMSNorm(BaseFusedOp):
             x,
             residual,
             post_residual_addition,
-            self.gemma_weight,
+            self._gemma_weight_for(x),
             use_attn_tp_group=True,
         )
 
@@ -1276,7 +1292,7 @@ class GemmaRMSNorm(BaseFusedOp):
             self,
             x,
             residual,
-            self.gemma_weight,
+            self._gemma_weight_for(x),
             group_size,
             use_attn_tp_group,
             keep_bf16,

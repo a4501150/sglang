@@ -86,13 +86,20 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         layer.register_parameter("weight_scale", weight_scale)
 
         input_global_scale = PerTensorScaleParameter(
-            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+            # Ones is the "not in checkpoint" sentinel for W4A16 checkpoints.
+            data=torch.ones(len(output_partition_sizes), dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("input_global_scale", input_global_scale)
 
     def process_weights_after_loading(self, layer) -> None:
         global_input_scale = layer.input_global_scale.max().to(torch.float32)
+        layer._w4a16_mode = bool(global_input_scale == 1.0)
+        if layer._w4a16_mode:
+            logger.info(
+                "NVFP4 W4A16 mode: input_global_scale not in checkpoint, "
+                "using dynamic activation quantization"
+            )
         layer.input_global_scale = Parameter(global_input_scale, requires_grad=False)
 
         layer.weight_global_scale = Parameter(
@@ -142,7 +149,12 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         output_shape = [x.shape[0], w_n]
 
         # quantize BF16 or FP16 to (FP4 and interleaved block scale)
-        x_fp4, x_blockscale = fp4_quantize(x, layer.input_global_scale)
+        # W4A16: no calibrated input scale — quantize with dynamic per-block
+        # scales instead of a global one.
+        global_scale = (
+            None if getattr(layer, "_w4a16_mode", False) else layer.input_global_scale
+        )
+        x_fp4, x_blockscale = fp4_quantize(x, global_scale)
 
         assert x_fp4.dtype == torch.uint8
         assert layer.weight_packed.dtype == torch.uint8

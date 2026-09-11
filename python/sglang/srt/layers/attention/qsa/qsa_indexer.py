@@ -23,6 +23,29 @@ from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
 
+
+def _qsa_ensure_rope(rotary_emb, positions: torch.Tensor) -> None:
+    """Grow the cos/sin cache without a device sync on the hot path.
+
+    positions.max().item() synchronizes the device once per QSA layer. The
+    cache only ever needs to reach the server context length, so size it to
+    that once (a Python-side comparison afterwards) and fall back to the
+    synchronizing path only if a position somehow exceeds it.
+    """
+    from sglang.srt.runtime_context import get_model
+
+    try:
+        ctx = int(getattr(get_model(), "context_length", 0) or 0)
+    except ValueError:
+        # config bags raise until publish has projected them.
+        ctx = 0
+    if ctx > 0:
+        if int(rotary_emb.cos_sin_cache.shape[0]) <= ctx:
+            rotary_emb._ensure_cos_sin_cache_length(ctx)
+        return
+    rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
+
+
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
@@ -175,9 +198,7 @@ class QSAIndexer(MultiPlatformOp):
             if not get_is_capture_mode() and hasattr(
                 self.rotary_emb, "_ensure_cos_sin_cache_length"
             ):
-                self.rotary_emb._ensure_cos_sin_cache_length(
-                    int(positions.max().item())
-                )
+                _qsa_ensure_rope(self.rotary_emb, positions)
             key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
             q = qsa_index_q_norm_rope_store(
                 qk,
@@ -401,7 +422,7 @@ class QSAIndexer(MultiPlatformOp):
         if not get_is_capture_mode() and hasattr(
             self.rotary_emb, "_ensure_cos_sin_cache_length"
         ):
-            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
+            _qsa_ensure_rope(self.rotary_emb, positions)
 
         # position_cos/position_sin repeat cos/sin to the full rotary width;
         # apply_rotary_emb consumes one half.

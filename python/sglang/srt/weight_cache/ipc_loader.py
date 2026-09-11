@@ -261,9 +261,12 @@ class IpcModelLoader(BaseModelLoader):
             attn = getattr(module, "attn", None)
             if conv1d is not None and isinstance(attn, RadixLinearAttention):
                 if hasattr(conv1d, "weight") and conv1d.weight is not None:
-                    attn.conv_weights = conv1d.weight.view(
-                        conv1d.weight.size(0), conv1d.weight.size(2)
-                    )
+                    if getattr(attn, "_conv_source", None) is not conv1d:
+                        # A module-backed conv_weights derives its view fresh
+                        # from the replaced parameter — nothing to rebuild.
+                        attn.conv_weights = conv1d.weight.view(
+                            conv1d.weight.size(0), conv1d.weight.size(2)
+                        )
                     if hasattr(conv1d, "bias") and conv1d.bias is not None:
                         attn.bias = conv1d.bias
                     count += 1

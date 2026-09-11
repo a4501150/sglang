@@ -192,7 +192,13 @@ class OffloaderV1(BaseOffloader):
             def forward(*args, **kwargs):
                 module.forward = original_forward
                 device_state = _get_offloaded_device_state(module, device)
-                output = functional_call(module, device_state, args=args, kwargs=kwargs)
+                output = functional_call(
+                    module,
+                    device_state,
+                    args=args,
+                    kwargs=kwargs,
+                    tie_weights=False,
+                )
                 module.forward = forward
                 return output
 
@@ -312,7 +318,11 @@ def _hook_module_forward_raw(module, on_forward_end, get_parameter_and_buffer_di
     def forward(*args, **kwargs):
         module.forward = original_forward
         output = functional_call(
-            module, get_parameter_and_buffer_dicts(), args=args, kwargs=kwargs
+            module,
+            get_parameter_and_buffer_dicts(),
+            args=args,
+            kwargs=kwargs,
+            tie_weights=False,
         )
         on_forward_end()
         module.forward = forward
