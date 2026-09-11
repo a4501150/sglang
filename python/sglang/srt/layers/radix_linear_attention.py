@@ -49,8 +49,11 @@ class RadixLinearAttention(nn.Module):
         head_q_dim: int,
         head_k_dim: int,
         head_v_dim: int,
-        # GDN KDA Shared Weights
-        conv_weights: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]] = None,
+        # GDN KDA Shared Weights. An nn.Module (e.g. the nn.Conv1d) may be
+        # passed instead of a tensor; the 2D view is then derived on access.
+        conv_weights: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, ...], nn.Module]
+        ] = None,
         bias: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]] = None,
         activation: str = "silu",
         A_log: Optional[torch.Tensor] = None,
@@ -69,13 +72,29 @@ class RadixLinearAttention(nn.Module):
         self.k_dim = num_k_heads * head_k_dim
         self.v_dim = num_v_heads * head_v_dim
 
-        self.conv_weights = conv_weights
+        self._conv_source = conv_weights
         self.bias = bias
         self.activation = activation
 
         self.A_log = A_log
         self.dt_bias = dt_bias
         self.lower_bound = lower_bound
+
+    @property
+    def conv_weights(self):
+        """Convolution weights, derived fresh on every access.
+
+        When an nn.Module (nn.Conv1d) is passed, the 2D view is built from the
+        CURRENT parameter. This is required because --cpu-offload-gb replaces
+        param.data; a view stored once then points at stale memory. Tensors
+        and tuples pass through unchanged so other models (KDA, ShortConv,
+        Lightning) are unaffected.
+        """
+        src = self._conv_source
+        if isinstance(src, nn.Module):
+            w = src.weight
+            return w.view(w.size(0), w.size(2))
+        return src
 
     def forward(
         self,

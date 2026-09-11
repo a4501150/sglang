@@ -144,8 +144,9 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         set_weight_attrs(w2_weight_scale_2, extra_weight_attrs)
 
         # Input Global Scales
+        # Ones is the "not in checkpoint" sentinel for W4A16 checkpoints.
         w13_input_scale = torch.nn.Parameter(
-            torch.empty(num_experts, 2, dtype=torch.float32), requires_grad=False
+            torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
         )
         layer.register_parameter("w13_input_global_scale", w13_input_scale)
         extra_weight_attrs.update(
@@ -154,7 +155,7 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         set_weight_attrs(w13_input_scale, extra_weight_attrs)
 
         w2_input_scale = torch.nn.Parameter(
-            torch.empty(num_experts, dtype=torch.float32), requires_grad=False
+            torch.ones(num_experts, dtype=torch.float32), requires_grad=False
         )
         layer.register_parameter("w2_input_global_scale", w2_input_scale)
         extra_weight_attrs.update(
@@ -163,6 +164,12 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if torch.all(layer.w13_input_global_scale == 1.0).item():
+            logger.warning_once(
+                "NVFP4 MoE W4A16: input_global_scale not in checkpoint. "
+                "Using scale=1.0 — per-block SF handles dynamic range. "
+                "Run calibration for optimal quality."
+            )
         # From packed to weight
         layer.w13_weight = torch.nn.Parameter(
             layer.w13_weight_packed.data, requires_grad=False
