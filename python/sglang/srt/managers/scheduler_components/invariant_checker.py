@@ -196,10 +196,37 @@ class SchedulerInvariantChecker:
             uncached,
         )
 
-    def _check_mamba_pool(self, ps: PoolStats) -> Tuple[bool, str]:
+    def _mamba_slot_census(self, allocator) -> Tuple[bool, str, set, set]:
+        """Diagnostic ownership census over one Mamba slot space.
+
+        The tensors can live on the compute device, so callers must restrict
+        this census to an existing diagnostic synchronization point.
+        """
+        free_slot_list = allocator.free_slots.tolist()
+        cached_value_list = self.tree_cache.all_mamba_values_flatten().tolist()
+        free_pages = set(free_slot_list)
+        cached_pages = set(cached_value_list)
+        dup_owned = len(cached_value_list) - len(cached_pages)
+        dup_free = len(free_slot_list) - len(free_pages)
+        free_and_referenced = free_pages & cached_pages
+        bad = bool(dup_owned or dup_free or free_and_referenced)
+        msg = ""
+        if bad:
+            msg = (
+                f", mamba_census[dup_owned_refs={dup_owned}, "
+                f"dup_free={dup_free}, "
+                f"free_and_referenced={sorted(free_and_referenced) or None}]"
+            )
+        return bad, msg, free_pages, cached_pages
+
+    def _check_mamba_pool(
+        self, ps: PoolStats, *, run_census: bool = False
+    ) -> Tuple[bool, str]:
         ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
         if ckpt_pool is not None:
-            return self._check_mamba_pool_with_int8(ps, ckpt_pool)
+            return self._check_mamba_pool_with_int8(
+                ps, ckpt_pool, run_census=run_census
+            )
         leak, msg = self._check_pool_invariant(
             "mamba",
             ps.mamba_available_size,
@@ -208,9 +235,14 @@ class SchedulerInvariantChecker:
             self.pool_stats_observer.session_held_mamba_slots(),
             self.req_to_token_pool.mamba_pool.size,
         )
+        free_mamba_pages = cached_mamba_pages = None
+        if leak or run_census:
+            census_bad, census_msg, free_mamba_pages, cached_mamba_pages = (
+                self._mamba_slot_census(self.req_to_token_pool.mamba_allocator)
+            )
+            leak = leak or census_bad
+            msg += census_msg
         if leak:
-            # Pools without a page free list return None; skip the census rather
-            # than crash the watchdog thread that runs this dump.
             free_pages = self.token_to_kv_pool_allocator.get_all_free_pages()
             if free_pages is None:
                 return leak, msg
@@ -230,12 +262,14 @@ class SchedulerInvariantChecker:
                     expected_full_pages - free_full_pages - cached_full_pages
                 )
                 full_page_msg = f", leaked_full_pages={leaked_full_pages or None}"
-            mamba_allocator = self.req_to_token_pool.mamba_allocator
-            free_mamba_pages = set(mamba_allocator.free_slots.tolist())
-            cached_mamba_pages = set(
-                self.tree_cache.all_mamba_values_flatten().tolist()
+            if free_mamba_pages is None or cached_mamba_pages is None:
+                _, census_msg, free_mamba_pages, cached_mamba_pages = (
+                    self._mamba_slot_census(self.req_to_token_pool.mamba_allocator)
+                )
+                msg += census_msg
+            expected_mamba_pages = set(
+                range(1, self.req_to_token_pool.mamba_allocator.size + 1)
             )
-            expected_mamba_pages = set(range(1, mamba_allocator.size + 1))
             leaked_mamba_pages = (
                 expected_mamba_pages - free_mamba_pages - cached_mamba_pages
             )
@@ -243,7 +277,9 @@ class SchedulerInvariantChecker:
             msg += f", leaked_mamba_pages={leaked_mamba_pages or None}"
         return leak, msg
 
-    def _check_mamba_pool_with_int8(self, ps: PoolStats, ckpt_pool) -> Tuple[bool, str]:
+    def _check_mamba_pool_with_int8(
+        self, ps: PoolStats, ckpt_pool, *, run_census: bool = False
+    ) -> Tuple[bool, str]:
         """Two-pool invariant for int8 mamba checkpoints.
 
         The radix-cached states live in the int8 checkpoint pool, NOT the active
@@ -272,7 +308,13 @@ class SchedulerInvariantChecker:
             0,
             ckpt_pool.num_slots,
         )
-        return active_leak or int8_leak, active_msg + "\n" + int8_msg
+        leak = active_leak or int8_leak
+        msg = active_msg + "\n" + int8_msg
+        if int8_leak or run_census:
+            census_bad, census_msg, _, _ = self._mamba_slot_census(ckpt_pool.allocator)
+            leak = leak or census_bad
+            msg += census_msg
+        return leak, msg
 
     def _get_total_uncached_sizes(
         self,
@@ -496,7 +538,7 @@ class SchedulerInvariantChecker:
         )
 
     def _check_all_pools(
-        self, ps: PoolStats, uncached: int = 0
+        self, ps: PoolStats, uncached: int = 0, *, run_mamba_census: bool = False
     ) -> Tuple[bool, List[str]]:
         """Check memory invariant across all pools. Returns (has_leak, messages)."""
         has_leak = False
@@ -512,7 +554,9 @@ class SchedulerInvariantChecker:
             messages.append(swa_msg)
 
         if self.is_hybrid_ssm and self.tree_cache.supports_mamba():
-            mamba_leak, mamba_msg = self._check_mamba_pool(ps)
+            mamba_leak, mamba_msg = self._check_mamba_pool(
+                ps, run_census=run_mamba_census
+            )
             has_leak |= mamba_leak
             messages.append(mamba_msg)
 
@@ -537,6 +581,7 @@ def create_scheduler_watchdog(
             return ""
         _, messages = scheduler.invariant_checker._check_all_pools(
             scheduler.pool_stats_observer.get_pool_stats(),
+            run_mamba_census=True,
         )
         return (
             f"{scheduler.cur_batch_for_debug.batch_size()=}\n"

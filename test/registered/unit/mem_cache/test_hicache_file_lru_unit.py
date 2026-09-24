@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     MetadataCache,
     PoolName,
     PoolTransfer,
+    hicache_format_fingerprint,
 )
 from sglang.srt.mem_cache.storage.file.lru_file_evictor import _parse_size_to_bytes
 from sglang.test.test_utils import CustomTestCase
@@ -55,6 +56,7 @@ def _make_config(
     is_mla=False,
     model="testmodel",
     extra_config=None,
+    format_spec=None,
 ) -> HiCacheStorageConfig:
     return HiCacheStorageConfig(
         tp_rank=tp_rank,
@@ -68,6 +70,7 @@ def _make_config(
         is_page_first_layout=True,
         model_name=model,
         extra_config=extra_config,
+        format_spec=format_spec,
     )
 
 
@@ -93,6 +96,7 @@ class _BackendBuilder:
         metadata_ttl=None,
         enable_metadata_cache=None,
         io_mode=None,
+        format_spec=None,
     ) -> HiCacheFile:
         # Each backend gets its own subdir so MLA / non-MLA tests don't
         # contaminate each other's file_path.
@@ -107,6 +111,7 @@ class _BackendBuilder:
             attn_cp_size=attn_cp_size,
             is_mla=is_mla,
             model=model,
+            format_spec=format_spec,
             extra_config={
                 "max_size": max_size,
                 "eviction_ratio": eviction_ratio,
@@ -259,7 +264,7 @@ class TestScanExistingFiles(HiCacheFileLRUTestBase):
             extra_config={"max_size": "1000", "min_free_space": "0"},
         )
         # Files must end with the expected suffix for the rank/model.
-        suffix = f"_seedmodel_0_1"
+        suffix = f"_seedmodel_0_1_fmt{hicache_format_fingerprint(None)}"
         # Create older "old.bin" first, then newer "new.bin".
         old_path = os.path.join(d, f"old{suffix}.bin")
         new_path = os.path.join(d, f"new{suffix}.bin")
@@ -326,8 +331,8 @@ class TestCPSuffix(HiCacheFileLRUTestBase):
         b0 = self.make_backend(attn_cp_rank=0, attn_cp_size=8, subdir="cp")
         b1 = self.make_backend(attn_cp_rank=1, attn_cp_size=8, subdir="cp")
         self.assertNotEqual(b0.config_suffix, b1.config_suffix)
-        self.assertTrue(b0.config_suffix.endswith("_cp0_8"))
-        self.assertTrue(b1.config_suffix.endswith("_cp1_8"))
+        self.assertIn("_cp0_8_fmt", b0.config_suffix)
+        self.assertIn("_cp1_8_fmt", b1.config_suffix)
         # Same logical key maps to different files per CP rank -> no write race.
         self.assertNotEqual(b0._get_suffixed_key("k"), b1._get_suffixed_key("k"))
 
@@ -335,9 +340,35 @@ class TestCPSuffix(HiCacheFileLRUTestBase):
         # MLA drops tp from the suffix; the CP tag keeps ranks isolated.
         b0 = self.make_backend(is_mla=True, attn_cp_rank=0, attn_cp_size=4, subdir="m")
         b1 = self.make_backend(is_mla=True, attn_cp_rank=3, attn_cp_size=4, subdir="m")
-        self.assertTrue(b0.config_suffix.endswith("_cp0_4"))
-        self.assertTrue(b1.config_suffix.endswith("_cp3_4"))
+        self.assertIn("_cp0_4_fmt", b0.config_suffix)
+        self.assertIn("_cp3_4_fmt", b1.config_suffix)
         self.assertNotEqual(b0.config_suffix, b1.config_suffix)
+
+
+class TestFormatFingerprint(HiCacheFileLRUTestBase):
+    def test_canonical_format_spec_is_stable(self):
+        first = self.make_backend(
+            subdir="format",
+            format_spec={"layout": "page_first", "pools": ["kv", "mamba"]},
+        )
+        second = self.make_backend(
+            subdir="format",
+            format_spec={"pools": ["kv", "mamba"], "layout": "page_first"},
+        )
+        self.assertEqual(first.format_fingerprint, second.format_fingerprint)
+        self.assertEqual(first.config_suffix, second.config_suffix)
+
+    def test_changed_raw_format_cannot_see_old_pages(self):
+        old = self.make_backend(
+            subdir="format-miss", format_spec={"layout": "page_first"}
+        )
+        self.assertTrue(old.set("shared-key", _t(100, fill=7)))
+
+        changed = self.make_backend(
+            subdir="format-miss", format_spec={"layout": "layer_first"}
+        )
+        self.assertNotEqual(old.format_fingerprint, changed.format_fingerprint)
+        self.assertFalse(changed.exists("shared-key"))
 
 
 class TestMLAOwnerGating(HiCacheFileLRUTestBase):
@@ -505,7 +536,7 @@ class TestHiCacheFileMetadataIntegration(HiCacheFileLRUTestBase):
             model="seedmodel",
             extra_config={"metadata_ttl": 5.0, "enable_metadata_cache": True},
         )
-        suffix = f"_seedmodel_0_1"
+        suffix = f"_seedmodel_0_1_fmt{hicache_format_fingerprint(None)}"
 
         # Pre-create a suffixed bin file on disk
         with open(os.path.join(d, f"k1{suffix}.bin"), "wb") as f:
@@ -931,6 +962,22 @@ class TestBufferedCompatibility(HiCacheFileLRUTestBase):
         b.register_mem_pool_host(dst)
         self.assertEqual(b.batch_get_v1(["b0"], torch.tensor([0])), [True])
         self.assertEqual(dst.read_slot(0), bytes([0x77]) * 1000)
+
+    def test_v1_buffered_rejects_nonexact_file_sizes(self):
+        b = self.make_backend()
+        src = _StubPool(1, 1000)
+        src.fill_slot(0, 0x44)
+        b.register_mem_pool_host(src)
+        self.assertEqual(b.batch_set_v1(["bad"], torch.tensor([0])), [True])
+        path = self._file_name(b, "bad")
+
+        for payload in (bytes(999), bytes(1001)):
+            with self.subTest(size=len(payload)):
+                with open(path, "wb") as f:
+                    f.write(payload)
+                dst = _StubPool(1, 1000)
+                b.register_mem_pool_host(dst)
+                self.assertEqual(b.batch_get_v1(["bad"], torch.tensor([0])), [False])
 
     def test_v2_buffered_keeps_copy_page_path(self):
         b = self.make_backend()

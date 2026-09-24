@@ -1827,14 +1827,16 @@ class UnifiedRadixCacheSuite:
             )
 
         prompt_aligned = (len(prompt_ids) // ps) * ps
-        # Thinking+answer must not be reachable past the prompt.
+        # A Mamba checkpoint for the removed suffix cannot be attached to the
+        # retained prompt. Unified restore is all-or-nothing, so that case
+        # safely skips the whole insertion.
+        expected_cached = 0 if self.cfg.has_mamba else prompt_aligned
         m = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", prompt_ids + output_ids)))
         )
-        self.assertEqual(len(m.device_indices), prompt_aligned)
-        # Only prompt-aligned pages remain owned by the tree.
+        self.assertEqual(len(m.device_indices), expected_cached)
         self.assertEqual(
-            allocator.available_size(), avail_before + kv_len - prompt_aligned
+            allocator.available_size(), avail_before + kv_len - expected_cached
         )
         cache.sanity_check()
 
@@ -2036,10 +2038,13 @@ class UnifiedRadixCacheSuite:
         avail_before = allocator.available_size()
         cache.cache_finished_req(req, is_insert=True, owned_kv_len=req.owned_kv_len())
 
-        self.assertEqual(allocator.available_size(), avail_before + tail_extra)
         aligned = input_ids[: (len(input_ids) // ps) * ps]
+        expected_cached = 0 if self.cfg.has_mamba else len(aligned)
+        self.assertEqual(
+            allocator.available_size(), avail_before + kv_len - expected_cached
+        )
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", aligned))))
-        self.assertEqual(len(m.device_indices), len(aligned))
+        self.assertEqual(len(m.device_indices), expected_cached)
         cache.sanity_check()
 
     def test_mamba_evict_only(self):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import logging
 import os
 import threading
@@ -23,6 +24,23 @@ logger = logging.getLogger(__name__)
 
 # Max pages per batched storage IO call.
 STORAGE_BATCH_SIZE = 128
+HICACHE_FILE_FORMAT_VERSION = 1
+
+
+def hicache_format_fingerprint(format_spec: Optional[dict]) -> str:
+    payload = {
+        "schema": HICACHE_FILE_FORMAT_VERSION,
+        "format": format_spec or {},
+    }
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()[:16]
+
 
 # Minimum alignment (bytes) for O_DIRECT segment I/O in HiCacheFile
 # direct io_mode. 4 KiB is the safe lower bound every supported FS accepts.
@@ -46,6 +64,7 @@ class HiCacheStorageConfig:
     # with dp-attention, tp_rank is attention-group-local; dp_rank disambiguates
     dp_rank: int = 0
     extra_config: Optional[dict] = None
+    format_spec: Optional[dict] = None
 
 
 @dataclass
@@ -448,6 +467,13 @@ class HiCacheFile(HiCacheStorage):
         # page, so give each rank its own file key to avoid a cross-rank write race.
         if attn_cp_size > 1:
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+        self.format_fingerprint = hicache_format_fingerprint(storage_config.format_spec)
+        self.config_suffix += f"_fmt{self.format_fingerprint}"
+        logger.info(
+            "HiCacheFile format fingerprint=%s suffix=%s",
+            self.format_fingerprint,
+            self.config_suffix,
+        )
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
@@ -907,6 +933,17 @@ class HiCacheFile(HiCacheStorage):
         try:
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
+                actual = os.fstat(f.fileno()).st_size
+                if actual != expected:
+                    logger.warning(
+                        "HiCacheFile: wrong file size for %s: expected %d, got %d",
+                        tensor_path,
+                        expected,
+                        actual,
+                    )
+                    if self.metadata_cache is not None:
+                        self.metadata_cache.remove(suffixed)
+                    return None
                 buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
                 if f.readinto(buf) != expected:
                     raise IOError(f"Short read for {suffixed}")

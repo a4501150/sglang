@@ -296,6 +296,7 @@ class HybridCacheController(BaseHiCacheController):
                 prefetch_threshold=prefetch_threshold,
                 model_name=model_name,
                 storage_backend_extra_config=storage_backend_extra_config,
+                host_pools=host_pools,
             )
         except Exception:
             if self.pp_prefetch_command_group is not None:

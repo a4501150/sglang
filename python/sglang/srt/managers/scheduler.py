@@ -294,7 +294,7 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.utils import get_hash_str
+from sglang.srt.mem_cache.utils import get_hash_str, storage_namespace_seed
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -3155,8 +3155,12 @@ class Scheduler(
                 )
                 last_hash = tree_cache.get_last_hash_value(last_host_node)
                 if envs.SGLANG_HICACHE_FILE_BACKEND_LOG_PAGE_DIGESTS.get():
+                    namespace_seed = storage_namespace_seed(
+                        req.extra_key, req.cache_salt
+                    )
                     full_hashes = get_hash_str(
                         req.full_untruncated_fill_ids[:match_end],
+                        namespace_seed,
                         page_size=self.page_size,
                     )
                     anchor_page_count = matched_len // self.page_size
@@ -3173,8 +3177,8 @@ class Scheduler(
                     logger.warning(
                         "HiCache token-span anchor req=%s node=%s device_tokens=%d "
                         "host_tokens=%d matched=%d aligned=%s match_end=%d "
-                        "last_hash=%s expected_last_hash=%s anchor_exact=%s "
-                        "requested_pages=%d expected_suffix_exact=%s",
+                        "namespace_seed=%s last_hash=%s expected_last_hash=%s "
+                        "anchor_exact=%s requested_pages=%d expected_suffix_exact=%s",
                         req.rid,
                         last_host_node,
                         len(req.prefix_indices),
@@ -3182,6 +3186,7 @@ class Scheduler(
                         matched_len,
                         matched_len % self.page_size == 0,
                         match_end,
+                        namespace_seed,
                         last_hash,
                         expected_last_hash,
                         last_hash == expected_last_hash,
@@ -4972,6 +4977,7 @@ class Scheduler(
             if not self.enable_hisparse and not deferred_pending:
                 has_leak, messages = self.invariant_checker._check_all_pools(
                     self.pool_stats_observer.get_pool_stats(),
+                    run_mamba_census=envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get(),
                 )
                 if has_leak:
                     self.invariant_checker._report_leak("pool", "\n".join(messages))
