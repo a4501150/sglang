@@ -1332,6 +1332,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if component.component_type != BASE_COMPONENT_TYPE
         )
 
+    def needs_incremental_component_backup(self, node_id: NodeId) -> bool:
+        return self._needs_incremental_component_backup(self.node_by_id(node_id))
+
     def _should_backup_after_insert(self, state: _InsertWalkState) -> bool:
         """Check whether the insert target needs a Host backup."""
         if state.is_new_leaf:

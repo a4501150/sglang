@@ -9398,6 +9398,7 @@ class TestResumableInsertWalk(_InsertWalkSuite):
             finish_write_through=lambda nodes, ack: calls.append(
                 ("finish", tuple(nodes), ack)
             ),
+            needs_incremental_component_backup=lambda node: False,
         )
         cache.ongoing_write_through = {
             7: _OngoingWriteThrough(10, DecLockRefParams(), [5, 10])
@@ -9426,6 +9427,82 @@ class TestResumableInsertWalk(_InsertWalkSuite):
                 ("dec_host", 10, "host-10"),
             ],
         )
+
+    def test_write_through_ack_backs_up_new_mamba_state_before_storage(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.buffer_pipeline = None
+        cache.ongoing_write_through = {
+            7: _OngoingWriteThrough(10, DecLockRefParams(), [5, 10])
+        }
+        calls = []
+        cache.tree_core = SimpleNamespace(
+            enable_storage=True,
+            finish_write_through=lambda nodes, ack: calls.append(("finish", ack)),
+            needs_incremental_component_backup=lambda node: node == 10,
+        )
+        cache.inc_host_lock_ref = lambda node: SimpleNamespace(
+            to_dec_params=lambda: f"host-{node}"
+        )
+        cache.dec_host_lock_ref = lambda node, params: calls.append(
+            ("release_host", node)
+        )
+        cache.dec_lock_ref = lambda node, params: calls.append(
+            ("release_device", node)
+        )
+        cache.write_backup_storage = lambda node: calls.append(("store", node))
+        cache._execute_and_commit_kv_backup = lambda action: calls.append(
+            ("backup", action.node_ids)
+        )
+
+        cache._finish_write_through_ack(7)
+
+        self.assertEqual(
+            calls,
+            [
+                ("finish", 7),
+                ("release_device", 10),
+                ("store", 5),
+                ("backup", [10]),
+                ("release_host", 5),
+                ("release_host", 10),
+            ],
+        )
+
+    def test_write_back_drain_includes_checkpoint_backup_enqueued_by_ack(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.ongoing_write_through = {7: mock.sentinel.original}
+        first = SimpleNamespace(
+            node_ids=[7], finish_event=SimpleNamespace(synchronize=mock.Mock())
+        )
+        second = SimpleNamespace(
+            node_ids=[8], finish_event=SimpleNamespace(synchronize=mock.Mock())
+        )
+        queue = []
+        writes = []
+
+        def start_writing():
+            writes.append(len(writes))
+            queue.append(first if len(writes) == 1 else second)
+
+        cache.cache_controller = SimpleNamespace(
+            start_writing=start_writing, ack_write_queue=queue
+        )
+
+        def finish_ack(ack_id):
+            del cache.ongoing_write_through[ack_id]
+            if ack_id == 7:
+                cache.ongoing_write_through[8] = mock.sentinel.checkpoint
+
+        cache._finish_write_through_ack = finish_ack
+        cache._log_write_ack_metrics = mock.Mock()
+
+        cache.writing_check(write_back=True)
+
+        self.assertEqual(len(writes), 2)
+        self.assertEqual(queue, [])
+        self.assertFalse(cache.ongoing_write_through)
+        first.finish_event.synchronize.assert_called_once_with()
+        second.finish_event.synchronize.assert_called_once_with()
 
     def test_write_through_handoff_releases_partial_locks_on_failure(self):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)

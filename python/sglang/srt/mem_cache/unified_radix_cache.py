@@ -1740,7 +1740,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 # Back up each fragment: after a split, lock_node only holds the
                 # suffix; the prefix fragment must be persisted as well.
                 for node_id in publish_node_ids:
-                    self.write_backup_storage(node_id)
+                    if self.tree_core.needs_incremental_component_backup(node_id):
+                        self._execute_and_commit_kv_backup(BackupKV(node_ids=[node_id]))
+                    else:
+                        self.write_backup_storage(node_id)
         finally:
             if lock_params is not None and not write_through_lock_released:
                 self.dec_lock_ref(lock_node_id, lock_params)
@@ -3449,17 +3452,19 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         if write_back:
-            # Blocking: submit what is still queued, then wait for every ack.
-            cc.start_writing()
+            # An ack can enqueue a newly materialized component checkpoint.
+            # Drain that follow-up backup before returning to the caller.
             while self.ongoing_write_through:
-                for ack in cc.ack_write_queue:
+                cc.start_writing()
+                acks = list(cc.ack_write_queue)
+                del cc.ack_write_queue[: len(acks)]
+                assert acks, "Write-through backup has no pending acknowledgement"
+                for ack in acks:
                     ack.finish_event.synchronize()
                     for ack_id in ack.node_ids:
                         if ack_id in self.ongoing_write_through:
                             self._finish_write_through_ack(ack_id)
                     self._log_write_ack_metrics(ack)
-                cc.ack_write_queue.clear()
-                assert len(self.ongoing_write_through) == 0
             return
 
         if finish_count is None:
