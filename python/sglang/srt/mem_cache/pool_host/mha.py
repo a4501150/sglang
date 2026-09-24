@@ -38,6 +38,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
+    MHATokenToKVPoolDynamicFP8,
     MHATokenToKVPoolMXFP8,
 )
 from sglang.srt.mem_cache.pool_host.base import (
@@ -1647,6 +1648,17 @@ def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
     ``AsymmetricMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
     (e.g. MiMo-V2), else the default ``MHATokenToKVPoolHost``.
     """
+    if isinstance(device_pool, MHATokenToKVPoolDynamicFP8):
+        if device_pool.head_dim != device_pool.v_head_dim:
+            raise NotImplementedError(
+                "Dynamic FP8 HiCache does not support asymmetric K/V head dimensions yet."
+            )
+
+        from sglang.srt.mem_cache.pool_host.mha_dynamic_fp8 import (
+            MHATokenToKVPoolDynamicFP8Host,
+        )
+
+        return MHATokenToKVPoolDynamicFP8Host
     if isinstance(device_pool, MHATokenToKVPoolMXFP8):
         if device_pool.head_dim != device_pool.v_head_dim:
             raise NotImplementedError(
