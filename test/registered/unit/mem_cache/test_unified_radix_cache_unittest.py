@@ -2027,11 +2027,21 @@ class UnifiedRadixCacheSuite:
             )
 
         prompt_aligned = (len(prompt_ids) // ps) * ps
-        # Thinking+answer must not be reachable past the prompt.
+        # Without the ping-pong pair, a Mamba checkpoint for the removed
+        # suffix cannot be attached to the retained prompt. Unified restore is
+        # all-or-nothing, so that case safely skips the whole insertion; the
+        # extra-buffer pair keeps a prompt-aligned checkpoint to donate.
+        expected_cached = (
+            0
+            if self.cfg.has_mamba and not self.cfg.enable_mamba_extra_buffer
+            else prompt_aligned
+        )
         m = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", prompt_ids + output_ids)))
         )
-        self.assertEqual(m.device_prefix_len, prompt_aligned)
+        # Without the extra-buffer pair there is no prompt-aligned Mamba
+        # checkpoint to donate, so the unified insertion is skipped entirely.
+        self.assertEqual(m.device_prefix_len, expected_cached)
         if self.cfg.has_mamba and self.cfg.enable_mamba_extra_buffer:
             node_value = cache.tree_core.get_component_device_value(
                 m.last_device_node, ComponentType.MAMBA
@@ -2042,9 +2052,12 @@ class UnifiedRadixCacheSuite:
                     prompt_slot.reshape(-1),
                 )
             )
-        # Only prompt-aligned pages remain owned by the tree.
+        # Only pages through the effective cache depth remain owned by the tree.
         self.assertEqual(
-            allocator.available_size(), avail_before + kv_len - prompt_aligned
+            len(cache.path_device_indices(m.last_device_node)), expected_cached
+        )
+        self.assertEqual(
+            allocator.available_size(), avail_before + kv_len - expected_cached
         )
         cache.sanity_check()
 
@@ -2233,10 +2246,16 @@ class UnifiedRadixCacheSuite:
         avail_before = allocator.available_size()
         finish_req(cache, req, req.owned_kv_len())
 
-        self.assertEqual(allocator.available_size(), avail_before + tail_extra)
         aligned = input_ids[: (len(input_ids) // ps) * ps]
+        expected_cached = 0 if self.cfg.has_mamba else len(aligned)
+        self.assertEqual(
+            allocator.available_size(), avail_before + kv_len - expected_cached
+        )
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", aligned))))
-        self.assertEqual(m.device_prefix_len, len(aligned))
+        # A Mamba component whose checkpoint cannot be donated (misaligned
+        # depth) makes the unified insertion all-or-nothing: nothing is
+        # retained, matching the allocator expectation above.
+        self.assertEqual(m.device_prefix_len, expected_cached)
         cache.sanity_check()
 
     def test_mamba_evict_only(self):
@@ -9476,7 +9495,44 @@ class TestMambaFinishedOvershootCheckpoint(CustomTestCase):
         indices = allocator.alloc(len(tokens))
         self.assertIsNotNone(indices)
         pool.write((req.kv.req_pool_idx, slice(0, len(tokens))), indices)
+        req._refresh_fill_ids()
         return req, tokens
+
+    def test_finish_preserves_checkpoint_published_after_admission(self):
+        cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=4)
+        req, tokens = self._build_req(allocator, pool, None)
+        req.last_node = cache.root_node_handle()
+        for depth in (4, 8):
+            req.kv.mamba_last_track_seqlen = depth
+            cache.insert_req(req, up_to=depth)
+            self.assertEqual(req.kv.cache_protected_len, depth)
+        req.cached_tokens = 4
+        self.assertIsNone(req.kv.mamba_last_track_seqlen)
+
+        finish_req(cache, req, len(tokens))
+
+        self.assertEqual(req.kv.cache_protected_len, 8)
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(len(cache.path_device_indices(match.last_device_node)), 8)
+        self.assertEqual(allocator.available_size(), self.cfg.kv_size - 8)
+        cache.sanity_check()
+
+    def test_previous_checkpoint_below_protected_prefix_is_not_donated(self):
+        cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=4)
+        req, tokens = self._build_req(allocator, pool, None)
+        req.last_node = cache.root_node_handle()
+        req.kv.mamba_last_track_seqlen = 8
+        cache.insert_req(req, up_to=8)
+        req.kv.mamba_last_track_seqlen = 12
+        req.kv.mamba_prev_track_seqlen = 4
+
+        finish_req(cache, req, 11)
+
+        self.assertEqual(req.kv.cache_protected_len, 8)
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(len(cache.path_device_indices(match.last_device_node)), 8)
+        self.assertIsNone(req.kv.mamba_pool_idx)
+        cache.sanity_check()
 
     def test_previous_checkpoint_or_no_donation(self):
         for previous_len, expected_len in ((8, 8), (None, 0), (12, 0)):
