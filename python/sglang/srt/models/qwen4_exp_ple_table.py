@@ -23,21 +23,36 @@ rows straight from a host pointer. Two backends provide that pointer:
     page-cache folios and the table would otherwise creep towards full
     residency (see ``PleFileRssTrimmer``).
 
-This module has no Triton or CUDA-kernel imports so that its allocator and
-prefetcher can be unit-tested on CPU.
+``safetensors`` direct (``SGLANG_QWEN4_PLE_SAFETENSORS``, see
+``build_ple_safetensors_table`` below)
+    No staging and no pinned memory at all: the gather-time reader maps the
+    checkpoint's own ``*.ngram_embedding.shard_N.weight`` tensors to physical
+    (file, byte offset) descriptors parsed once from
+    ``model.safetensors.index.json`` and the safetensors headers, and copies
+    requested rows to the device. Small batches fetch through a parallel
+    ``pread`` pool, bulk gathers use two-dimensional shard views over the source
+    ``mmap``, and the existing background trimmer bounds mapped residency while
+    leaving hot data in the page cache.
+
+This module has no Triton or CUDA-kernel imports so that its allocator,
+prefetcher and safetensors descriptors can be unit-tested on CPU.
 """
 
 from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import json
 import logging
 import os
 import re
+import struct
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Optional, Sequence
 
+import numpy as np
 import torch
 
 from sglang.srt.environ import envs
@@ -481,3 +496,484 @@ def _mapping_rss_bytes(
     except OSError:
         return None
     return total
+
+
+# ---------------------------------------------------------------------------
+# Direct checkpoint backend (SGLANG_QWEN4_PLE_SAFETENSORS)
+# ---------------------------------------------------------------------------
+
+# The checkpoint stores the PLE n-gram table as ``<prefix>.ngram_embedding.
+# shard_N.weight`` tensors; N is the sync-shard index and N * shard_size its
+# first global row. The regex is deliberately layout-agnostic: within a
+# safetensors file the physical data offsets follow the *lexical* order of the
+# tensor names (shard 10 sits right after shard 1, and shard 2 can live in a
+# later file after shard 127), so every row address comes from the parsed
+# header, never from positional arithmetic over the file.
+PLE_SHARD_TENSOR_RE = re.compile(r".*\.ngram_embedding\.shard_(\d+)\.weight$")
+
+# Supported on-disk dtypes (safetensors header spelling) -> storage dtype.
+_SAFETENSORS_DTYPES = {
+    "BF16": torch.bfloat16,
+    "F8_E4M3": torch.float8_e4m3fn,
+}
+
+# Gathers up to this many rows are decode-sized: fetch them through a parallel
+# pread pool (GIL released); larger gathers fancy-index per-file mmap views.
+PLE_DIRECT_PREAD_MAX_ROWS = 64
+PLE_DIRECT_PREAD_THREADS = 16
+
+
+@dataclass(frozen=True)
+class PleSafetensorsShard:
+    """Validated numeric descriptor of one checkpoint n-gram shard."""
+
+    shard_index: int
+    row_start: int  # global row id of this shard's first row
+    rows: int  # row count actually present in the tensor
+    file_index: int  # index into PleSafetensorsTable.files
+    offset: int  # byte offset of the tensor data inside the file
+
+
+def _read_safetensors_header(path: str) -> tuple[dict, int]:
+    """Parse one safetensors header.
+
+    Returns ``(entries, data_base)``; data_offsets in the entries are relative
+    to ``data_base`` (the end of the header), which is where the numeric
+    descriptors' absolute byte offsets come from."""
+    try:
+        with open(path, "rb") as f:
+            prefix = f.read(8)
+            if len(prefix) != 8:
+                raise ValueError(f"{path}: truncated safetensors header length")
+            (header_bytes,) = struct.unpack("<Q", prefix)
+            file_size = os.fstat(f.fileno()).st_size
+            if header_bytes == 0 or header_bytes > file_size - 8:
+                raise ValueError(
+                    f"{path}: invalid safetensors header size {header_bytes}"
+                )
+            raw = f.read(header_bytes)
+    except OSError as exc:
+        raise ValueError(f"{path}: cannot read safetensors header ({exc})") from exc
+    if len(raw) != header_bytes:
+        raise ValueError(f"{path}: truncated safetensors header")
+    try:
+        header = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"{path}: malformed safetensors header ({exc})") from exc
+    if not isinstance(header, dict):
+        raise ValueError(f"{path}: safetensors header is not an object")
+    return header, 8 + header_bytes
+
+
+def build_ple_safetensors_table(
+    directory: str,
+    *,
+    shard_size: int,
+    expected_dim: Optional[int] = None,
+    expected_rows: Optional[int] = None,
+) -> PleSafetensorsTable:
+    """Parse a checkpoint into validated numeric shard descriptors, once.
+
+    Uses ``model.safetensors.index.json`` when present to locate the PLE shard
+    tensors (otherwise every ``*.safetensors`` file in the directory is
+    scanned), then opens the header of each file holding one exactly once.
+    Shard ``N`` describes global rows ``[N * shard_size, N * shard_size +
+    rows)``; the row count and byte offset come from the tensor's own header
+    entry, so multi-file layouts and the lexical physical order are handled
+    without positional assumptions.
+
+    The shard *set* must be complete: ids consecutive from 0 (a missing shard
+    is a checkpoint error, not a zero-fill row) and, with ``expected_rows``
+    (the embedding's global ``org_vocab_size``), every row up to it present --
+    all shards full except a final tensor shortened exactly as
+    ``ceil(expected_rows / shard_size)`` geometry implies. Gaps *within* the
+    files are fine: PLE tensors may interleave with other tensors and span
+    any file layout.
+    """
+    directory = os.path.expanduser(directory)
+    if not os.path.isdir(directory):
+        raise ValueError(
+            f"SGLANG_QWEN4_PLE_SAFETENSORS: {directory!r} is not a directory"
+        )
+    if int(shard_size) <= 0:
+        raise ValueError(f"shard_size must be > 0, got {shard_size}")
+    shard_size = int(shard_size)
+
+    # name -> file name, from the index when it exists.
+    wanted: dict[str, list[tuple[int, str]]] = {}  # path -> [(shard, tensor)]
+    scanned_headers: dict[str, tuple[dict, int]] = {}
+    index_path = os.path.join(directory, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        try:
+            with open(index_path) as f:
+                weight_map = json.load(f)["weight_map"]
+        except (OSError, ValueError, KeyError) as exc:
+            raise ValueError(f"{index_path}: unreadable index ({exc})") from exc
+        for name, file_name in weight_map.items():
+            match = PLE_SHARD_TENSOR_RE.match(name)
+            if match is not None:
+                path = os.path.join(directory, file_name)
+                wanted.setdefault(path, []).append((int(match.group(1)), name))
+        if not wanted:
+            raise ValueError(
+                f"{index_path}: no *.ngram_embedding.shard_N.weight tensors in "
+                "the weight map; this checkpoint cannot serve the direct PLE "
+                "table"
+            )
+    else:
+        for file_name in sorted(os.listdir(directory)):
+            if not file_name.endswith(".safetensors"):
+                continue
+            path = os.path.join(directory, file_name)
+            header, data_base = _read_safetensors_header(path)
+            matches = [
+                (int(m.group(1)), name)
+                for name in header
+                if (m := PLE_SHARD_TENSOR_RE.match(name)) is not None
+            ]
+            if matches:
+                wanted[path] = matches
+                scanned_headers[path] = (header, data_base)
+        if not wanted:
+            raise ValueError(
+                f"{directory}: no *.safetensors file holds an "
+                "*.ngram_embedding.shard_N.weight tensor"
+            )
+
+    files: list[str] = []
+    file_indices: dict[str, int] = {}
+    by_shard: dict[int, PleSafetensorsShard] = {}
+    dtype_str: Optional[str] = None
+    dim: Optional[int] = None
+    for path in sorted(wanted):
+        matches = wanted[path]
+        header, data_base = scanned_headers.get(path) or _read_safetensors_header(path)
+        try:
+            file_size = os.path.getsize(path)
+        except OSError as exc:
+            raise ValueError(f"{path}: unreadable shard file ({exc})") from exc
+        for shard_index, name in matches:
+            entry = header.get(name)
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"{path}: index lists {name!r} but the header omits it"
+                )
+            on_disk = entry.get("dtype")
+            if on_disk not in _SAFETENSORS_DTYPES:
+                raise ValueError(
+                    f"{name}: unsupported PLE dtype {on_disk!r}; direct PLE "
+                    f"table supports {sorted(_SAFETENSORS_DTYPES)}"
+                )
+            if dtype_str is None:
+                dtype_str = on_disk
+            elif dtype_str != on_disk:
+                raise ValueError(
+                    f"{name}: PLE dtype {on_disk!r} disagrees with the other "
+                    f"PLE shards ({dtype_str!r})"
+                )
+            shape = entry.get("shape")
+            if (
+                not isinstance(shape, list)
+                or len(shape) != 2
+                or not all(isinstance(d, int) and d > 0 for d in shape)
+            ):
+                raise ValueError(f"{name}: PLE tensor must be 2-D, got {shape!r}")
+            rows, tensor_dim = int(shape[0]), int(shape[1])
+            if dim is None:
+                dim = tensor_dim
+            elif dim != tensor_dim:
+                raise ValueError(
+                    f"{name}: PLE dim {tensor_dim} disagrees with the other "
+                    f"PLE shards ({dim})"
+                )
+            if expected_dim is not None and tensor_dim != int(expected_dim):
+                raise ValueError(
+                    f"{name}: PLE dim {tensor_dim} does not match "
+                    f"embedding_dim={expected_dim}"
+                )
+            offsets = entry.get("data_offsets")
+            if (
+                not isinstance(offsets, list)
+                or len(offsets) != 2
+                or not all(isinstance(o, int) and o >= 0 for o in offsets)
+            ):
+                raise ValueError(f"{name}: invalid data_offsets {offsets!r}")
+            begin, end = data_base + int(offsets[0]), data_base + int(offsets[1])
+            itemsize = torch.empty(0, dtype=_SAFETENSORS_DTYPES[on_disk]).element_size()
+            if (
+                begin >= end
+                or end > file_size
+                or end - begin != rows * tensor_dim * itemsize
+            ):
+                raise ValueError(
+                    f"{name}: data offsets [{begin}, {end}) do not cover "
+                    f"{rows} x {tensor_dim} x {itemsize} bytes in {path} "
+                    f"({file_size} bytes)"
+                )
+            row_start = shard_index * shard_size
+            if row_start + rows > (shard_index + 1) * shard_size:
+                raise ValueError(
+                    f"{name}: {rows} rows at global row {row_start} overflow "
+                    f"the {shard_size}-row shard slot"
+                )
+            if shard_index in by_shard:
+                other = by_shard[shard_index]
+                raise ValueError(
+                    f"{name}: duplicate PLE shard {shard_index}, already "
+                    f"described by {files[other.file_index]!r}"
+                )
+            if path not in file_indices:
+                file_indices[path] = len(files)
+                files.append(path)
+            by_shard[shard_index] = PleSafetensorsShard(
+                shard_index=shard_index,
+                row_start=row_start,
+                rows=rows,
+                file_index=file_indices[path],
+                offset=begin,
+            )
+
+    ordered = sorted(by_shard.values(), key=lambda s: s.shard_index)
+    if [s.shard_index for s in ordered] != list(range(len(ordered))):
+        missing = sorted(set(range(ordered[-1].shard_index + 1)) - set(by_shard))
+        raise ValueError(
+            f"{directory}: PLE shard ids must be consecutive starting at 0; "
+            f"missing shard(s) {missing} (checkpoint holds {sorted(by_shard)})"
+        )
+    if expected_rows is not None:
+        expected_rows = int(expected_rows)
+        if expected_rows <= 0:
+            raise ValueError(f"expected_rows must be > 0, got {expected_rows}")
+        expected_shards = -(-expected_rows // shard_size)
+        if len(ordered) != expected_shards:
+            raise ValueError(
+                f"{directory}: {len(ordered)} PLE shard(s) of {shard_size} "
+                f"rows cannot cover org_vocab_size={expected_rows} "
+                f"(expected {expected_shards} shards)"
+            )
+        for shard in ordered[:-1]:
+            if shard.rows != shard_size:
+                raise ValueError(
+                    f"{directory}: PLE shard {shard.shard_index} holds "
+                    f"{shard.rows} of {shard_size} rows at global row "
+                    f"{shard.row_start}; org_vocab_size={expected_rows} "
+                    "leaves no missing-row gaps before the final shard"
+                )
+        last = ordered[-1]
+        if last.row_start + last.rows != expected_rows:
+            raise ValueError(
+                f"{directory}: PLE shards end at global row "
+                f"{last.row_start + last.rows}, expected "
+                f"org_vocab_size={expected_rows}"
+            )
+    shards = tuple(ordered)
+    table = PleSafetensorsTable(
+        files=files, shards=shards, dtype=_SAFETENSORS_DTYPES[dtype_str], dim=dim
+    )
+    logger.info(
+        "PLE table: direct safetensors from %s (%d shards covering %d rows "
+        "x %d, %s, in %d file(s))",
+        directory,
+        len(shards),
+        table.num_rows,
+        dim,
+        dtype_str,
+        len(files),
+    )
+    return table
+
+
+class PleSafetensorsTable:
+    """Row reads straight from the checkpoint's safetensors shards.
+
+    Holds the validated numeric descriptors built by
+    ``build_ple_safetensors_table`` plus lazily opened read fds and mmap views
+    (one per shard file). Rows are addressed by *global* row id, which under
+    TP is just the token id the gather was asked for, so no per-rank
+    re-basing ever happens; ids a rank does not own are zero-filled by the
+    caller. Not thread-safe for reads on purpose: gathers are serialized by
+    the model runner.
+    """
+
+    def __init__(
+        self,
+        *,
+        files: Sequence[str],
+        shards: Sequence[PleSafetensorsShard],
+        dtype: torch.dtype,
+        dim: int,
+    ) -> None:
+        if not shards:
+            raise ValueError("empty PLE shard descriptor set")
+        self.files = tuple(files)
+        self.shards = tuple(sorted(shards, key=lambda shard: shard.row_start))
+        self.dtype = dtype
+        self.dim = int(dim)
+        self.row_bytes = self.dim * torch.empty(0, dtype=dtype).element_size()
+        self.num_rows = int(self.shards[-1].row_start + self.shards[-1].rows)
+        self._starts = np.array(
+            [shard.row_start for shard in self.shards], dtype=np.int64
+        )
+        self._rows = np.array([shard.rows for shard in self.shards], dtype=np.int64)
+        self._offsets = np.array(
+            [shard.offset for shard in self.shards], dtype=np.int64
+        )
+        self._file_of = np.array(
+            [shard.file_index for shard in self.shards], dtype=np.int64
+        )
+        self._fds: list[Optional[int]] = [None] * len(files)
+        self._views: dict[int, np.memmap] = {}
+        self._shard_views: dict[int, np.ndarray] = {}
+        self._trimmers: dict[int, PleFileRssTrimmer] = {}
+        self._pool: Optional[ThreadPoolExecutor] = None
+
+    def read_rows(self, rows: torch.Tensor) -> torch.Tensor:
+        """Rows as an ``(n, row_bytes)`` uint8 tensor, global row ids in.
+
+        Row ids outside every checkpoint shard (table padding past the last
+        saved shard) come back as zero bytes.
+        """
+        ids = rows.reshape(-1).to(torch.int64).numpy()
+        pos, valid, byte_offsets = self._locate(ids)
+        if ids.size <= PLE_DIRECT_PREAD_MAX_ROWS:
+            return self._pread_fetch(ids.size, pos, valid, byte_offsets)
+        return self._mmap_fetch(ids.size, pos, valid, byte_offsets)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+            self._pool = None
+        for trimmer in self._trimmers.values():
+            trimmer.close()
+        self._trimmers.clear()
+        for i, fd in enumerate(self._fds):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                self._fds[i] = None
+        self._shard_views.clear()
+        for view in self._views.values():
+            view._mmap.close()
+        self._views.clear()
+
+    # -- internals ---------------------------------------------------------
+
+    def _locate(self, ids: np.ndarray):
+        """Global row ids -> (shard position, valid, byte offset), vectorized.
+
+        The searchsorted-over-row-starts lookup handles multi-file and
+        nonuniform shards and is indifferent to the physical order of the
+        files and of the tensors inside them."""
+        pos = np.searchsorted(self._starts, ids, side="right") - 1
+        valid = pos >= 0
+        pos = np.where(valid, pos, 0)
+        local = ids - self._starts[pos]
+        valid &= local < self._rows[pos]
+        return pos, valid, self._offsets[pos] + local * self.row_bytes
+
+    def _fd(self, file_index: int) -> int:
+        fd = self._fds[file_index]
+        if fd is None:
+            fd = os.open(self.files[file_index], os.O_RDONLY)
+            try:
+                # Random row offsets: stop the readahead a sequential hint
+                # would pull around every cold row.
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
+            except OSError:
+                pass
+            self._fds[file_index] = fd
+        return fd
+
+    def _view(self, file_index: int) -> np.memmap:
+        view = self._views.get(file_index)
+        if view is None:
+            view = np.memmap(self.files[file_index], dtype=np.uint8, mode="r")
+            try:
+                import mmap as mmap_module
+
+                view._mmap.madvise(mmap_module.MADV_RANDOM)
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "PLE table: direct madvise(MADV_RANDOM) on %s failed: %s",
+                    self.files[file_index],
+                    exc,
+                )
+            self._views[file_index] = view
+            total_budget_gb = float(envs.SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB.get())
+            if (
+                total_budget_gb > 0
+                and _mapping_rss_bytes(view.ctypes.data, view.nbytes) is not None
+            ):
+                trimmer = PleFileRssTrimmer(
+                    addr=view.ctypes.data,
+                    nbytes=view.nbytes,
+                    budget_bytes=int(total_budget_gb * 2**30 / len(self.files)),
+                    interval_s=float(envs.SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S.get()),
+                )
+                trimmer.start()
+                self._trimmers[file_index] = trimmer
+        return view
+
+    def _shard_view(self, shard_position: int) -> np.ndarray:
+        view = self._shard_views.get(shard_position)
+        if view is None:
+            shard = self.shards[shard_position]
+            view = np.ndarray(
+                shape=(shard.rows, self.row_bytes),
+                dtype=np.uint8,
+                buffer=self._view(shard.file_index),
+                offset=shard.offset,
+            )
+            self._shard_views[shard_position] = view
+        return view
+
+    def _pread_fetch(self, n: int, pos, valid, byte_offsets) -> torch.Tensor:
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(max_workers=PLE_DIRECT_PREAD_THREADS)
+        out = bytearray(self.row_bytes * n)
+        jobs = [
+            (i, self._fd(int(self._file_of[p])), int(off))
+            for i, (p, ok, off) in enumerate(zip(pos, valid, byte_offsets))
+            if ok
+        ]
+
+        def _read(job):
+            i, fd, off = job
+            buf = os.pread(fd, self.row_bytes, off)
+            if len(buf) != self.row_bytes:
+                raise ValueError(
+                    f"PLE table: short pread at {off}: {len(buf)} of "
+                    f"{self.row_bytes} bytes"
+                )
+            return i, buf
+
+        for i, buf in self._pool.map(_read, jobs):
+            base = i * self.row_bytes
+            out[base : base + self.row_bytes] = buf
+        return torch.frombuffer(out, dtype=torch.uint8).reshape(n, self.row_bytes)
+
+    def _mmap_fetch(self, n: int, pos, valid, byte_offsets) -> torch.Tensor:
+        out = np.zeros((n, self.row_bytes), dtype=np.uint8)
+        valid_indices = np.flatnonzero(valid)
+        if not valid_indices.size:
+            return torch.from_numpy(out)
+
+        order = np.argsort(pos[valid_indices], kind="stable")
+        ordered_indices = valid_indices[order]
+        ordered_positions = pos[ordered_indices]
+        boundaries = np.flatnonzero(np.diff(ordered_positions)) + 1
+        for indices in np.split(ordered_indices, boundaries):
+            shard_position = int(pos[indices[0]])
+            local_rows = (
+                byte_offsets[indices] - self._offsets[shard_position]
+            ) // self.row_bytes
+            out[indices] = self._shard_view(shard_position)[local_rows]
+        return torch.from_numpy(out)
