@@ -1845,7 +1845,6 @@ class UnifiedRadixCacheSuite:
         m = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", prompt_ids + output_ids)))
         )
-        self.assertEqual(len(m.device_indices), prompt_aligned)
         if self.cfg.has_mamba and self.cfg.enable_mamba_extra_buffer:
             node_value = cache.tree_core.get_component_device_value(
                 m.last_device_node, ComponentType.MAMBA
@@ -1856,8 +1855,7 @@ class UnifiedRadixCacheSuite:
                     prompt_slot.reshape(-1),
                 )
             )
-        # Only prompt-aligned pages remain owned by the tree.
-        # Only prompt-aligned pages remain owned by the tree.
+        # Only pages through the effective cache depth remain owned by the tree.
         self.assertEqual(len(m.device_indices), expected_cached)
         self.assertEqual(
             allocator.available_size(), avail_before + kv_len - expected_cached
@@ -9593,9 +9591,7 @@ class TestResumableInsertWalk(_InsertWalkSuite):
         cache.dec_host_lock_ref = lambda node, params: calls.append(
             ("release_host", node)
         )
-        cache.dec_lock_ref = lambda node, params: calls.append(
-            ("release_device", node)
-        )
+        cache.dec_lock_ref = lambda node, params: calls.append(("release_device", node))
         cache.write_backup_storage = lambda node: calls.append(("store", node))
         cache._execute_and_commit_kv_backup = lambda action: calls.append(
             ("backup", action.node_ids)

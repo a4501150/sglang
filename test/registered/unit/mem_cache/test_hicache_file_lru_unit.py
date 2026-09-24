@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
     MetadataCache,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     hicache_format_fingerprint,
@@ -357,6 +358,28 @@ class TestFormatFingerprint(HiCacheFileLRUTestBase):
         )
         self.assertEqual(first.format_fingerprint, second.format_fingerprint)
         self.assertEqual(first.config_suffix, second.config_suffix)
+
+    def test_checkpoint_and_kv_mode_are_isolated(self):
+        orca_unit = hicache_format_fingerprint(
+            {"runtime": {"model_path": "/models/orca", "kv_cache_dtype": "fp8_e4m3"}}
+        )
+        orca_dynamic = hicache_format_fingerprint(
+            {
+                "runtime": {
+                    "model_path": "/models/orca",
+                    "kv_cache_dtype": "fp8_e4m3_dynamic",
+                }
+            }
+        )
+        lambsea_dynamic = hicache_format_fingerprint(
+            {
+                "runtime": {
+                    "model_path": "/models/lambsea",
+                    "kv_cache_dtype": "fp8_e4m3_dynamic",
+                }
+            }
+        )
+        self.assertEqual(len({orca_unit, orca_dynamic, lambsea_dynamic}), 3)
 
     def test_changed_raw_format_cannot_see_old_pages(self):
         old = self.make_backend(
@@ -950,6 +973,53 @@ class TestDirectSegmentRoundtrip(DirectIoTestBase):
 
 class TestBufferedCompatibility(HiCacheFileLRUTestBase):
     """Buffered mode must keep working without any O_DIRECT requirement."""
+
+    @staticmethod
+    def _touch_component(backend, key, pool_name=PoolName.KV):
+        component_key = backend._get_component_key(key, pool_name)
+        open(os.path.join(backend.file_path, f"{component_key}.bin"), "wb").close()
+
+    def test_trailing_mamba_requirement_rejects_kv_only_chain(self):
+        backend = self.make_backend()
+        keys = ["k0", "k1", "k2"]
+        for key in keys:
+            self._touch_component(backend, key)
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=["checkpoint"],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+
+        with self.assertLogs(
+            "sglang.srt.mem_cache.hicache_storage", level="WARNING"
+        ) as logs:
+            result = backend.batch_exists_v2(keys, [transfer])
+
+        self.assertEqual(result.kv_hit_pages, 0)
+        self.assertEqual(result.extra_pool_hit_pages, {PoolName.KV: 3})
+        self.assertIn(
+            "3 KV pages but no trailing mamba sidecar", "\n".join(logs.output)
+        )
+
+    def test_trailing_mamba_requirement_accepts_latest_sidecar(self):
+        backend = self.make_backend()
+        keys = ["k0", "k1", "k2"]
+        for key in keys:
+            self._touch_component(backend, key)
+        self._touch_component(backend, keys[-1], PoolName.MAMBA)
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=["checkpoint"],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+
+        result = backend.batch_exists_v2(keys, [transfer])
+
+        self.assertEqual(result.kv_hit_pages, 3)
+        self.assertEqual(
+            result.extra_pool_hit_pages,
+            {PoolName.KV: 3, PoolName.MAMBA: 3},
+        )
 
     def test_v1_buffered_roundtrip_without_alignment(self):
         # 1000-byte unaligned segments: fine for buffered, rejected in direct.
