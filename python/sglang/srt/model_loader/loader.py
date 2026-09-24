@@ -27,6 +27,7 @@ from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Generator,
     Iterable,
@@ -107,6 +108,7 @@ DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
     CheckpointFilePrefetchHandle,
+    _filter_prefetch_files,
     _prefetch_all_checkpoints,
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
@@ -409,6 +411,12 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
+        weight_loader_prefetch_exclude_files: Optional[list[str]] = None
+        """Checkpoint files the initialized model serves itself at gather time."""
+
+        weight_loader_skip_tensor: Optional[Callable[[str], bool]] = None
+        """Return true for checkpoint tensors served outside normal loading."""
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
             return cls(
@@ -420,6 +428,13 @@ class DefaultModelLoader(BaseModelLoader):
                     model, "allow_patterns_overrides", None
                 ),
                 model_config=model_config,
+                weight_loader_prefetch_exclude_files=getattr(
+                    model, "weight_loader_prefetch_exclude_files", None
+                )
+                or None,
+                weight_loader_skip_tensor=getattr(
+                    model, "weight_loader_skip_tensor", None
+                ),
             )
 
     @dataclasses.dataclass(frozen=True)
@@ -642,6 +657,15 @@ class DefaultModelLoader(BaseModelLoader):
             weight_loader_drop_cache_after_load = (
                 get_model().weight_loader_drop_cache_after_load
             )
+            if source.weight_loader_skip_tensor is not None and (
+                weight_loader_disable_mmap
+                or self.load_config.load_format == LoadFormat.FASTSAFETENSORS
+            ):
+                raise ValueError(
+                    "Model-provided tensor skipping requires the mmap safetensors "
+                    "loader; disable --weight-loader-disable-mmap and do not use "
+                    "--load-format fastsafetensors."
+                )
 
             # Prefetch and multi-threaded loading both read the same shards,
             # competing for I/O on shared/network storage. When prefetch is
@@ -688,6 +712,10 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    prefetch_exclude_files=(
+                        source.weight_loader_prefetch_exclude_files
+                    ),
+                    skip_tensor=source.weight_loader_skip_tensor,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -696,6 +724,10 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    prefetch_exclude_files=(
+                        source.weight_loader_prefetch_exclude_files
+                    ),
+                    skip_tensor=source.weight_loader_skip_tensor,
                 )
 
         else:
@@ -805,7 +837,14 @@ class DefaultModelLoader(BaseModelLoader):
                 "Startup weight-loading overlap requires safetensors checkpoints"
             )
         weight_files = sorted(
-            {path for source in resolved_sources for path in source.weight_files}
+            {
+                path
+                for source in resolved_sources
+                for path in _filter_prefetch_files(
+                    list(source.weight_files),
+                    source.source.weight_loader_prefetch_exclude_files,
+                )
+            }
         )
         return _prefetch_all_checkpoints(weight_files, num_threads=num_threads)
 

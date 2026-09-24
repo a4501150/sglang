@@ -695,6 +695,42 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self._resolved(self._construct(*qwen4), "ple_offload_embedding")
             )
 
+    def test_qwen4_ple_safetensors_suppresses_pinned_offload_auto(self):
+        # The direct checkpoint table needs no pinned host memory, so the
+        # override must not auto-enable the pinned offload beside it.
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        with (
+            override_platform(is_cuda=True),
+            envs.SGLANG_QWEN4_PLE_SAFETENSORS.override("/models/checkpoint"),
+        ):
+            sa = self._construct(*qwen4)
+            self.assertIsNone(self._resolved(sa, "ple_offload_embedding"))
+            declared = {f for _s, d in sa._resolved_overrides for f in d}
+            self.assertNotIn("ple_offload_embedding", declared)
+            # An explicit offload request never combines with the direct
+            # backend: it would copy the same checkpoint bytes into a host
+            # table the direct backend never reads, prefetch or not.
+            with self.assertRaisesRegex(ValueError, "ple-offload-embedding"):
+                self._construct(*qwen4, ple_offload_embedding=True)
+            with self.assertRaisesRegex(ValueError, "ple-offload-embedding"):
+                self._construct(
+                    *qwen4,
+                    ple_offload_embedding=True,
+                    weight_loader_prefetch_checkpoints=True,
+                )
+            # Direct mode plus checkpoint prefetch alone is allowed: the
+            # loader excludes just the PLE shard files from prefetching.
+            sa = self._construct(*qwen4, weight_loader_prefetch_checkpoints=True)
+            self.assertIsNone(self._resolved(sa, "ple_offload_embedding"))
+        # Without direct mode the combination is unconstrained again.
+        with override_platform(is_cuda=True):
+            sa = self._construct(
+                *qwen4,
+                ple_offload_embedding=True,
+                weight_loader_prefetch_checkpoints=True,
+            )
+            self.assertTrue(self._resolved(sa, "ple_offload_embedding"))
+
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")
         self.assertTrue(self._resolved(sa, "enable_tf32_matmul"))

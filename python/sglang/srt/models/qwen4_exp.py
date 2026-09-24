@@ -58,6 +58,9 @@ from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
@@ -67,6 +70,7 @@ from sglang.srt.models.qwen3_5 import (
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen4_exp_ple_table import (
+    PLE_SHARD_TENSOR_RE,
     allocate_ple_host_table,
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
@@ -79,6 +83,24 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
+
+
+def _is_ple_shard_tensor(name: str) -> bool:
+    return PLE_SHARD_TENSOR_RE.match(name) is not None
+
+
+def _ple_checkpoint_shard_size(config: Any, org_vocab_size: int) -> int:
+    text_config = getattr(config, "text_config", config)
+    shard_count = int(
+        getattr(
+            text_config,
+            "split_ngram_parts",
+            getattr(config, "split_ngram_parts", 512),
+        )
+    )
+    if shard_count <= 0:
+        raise ValueError(f"split_ngram_parts must be positive, got {shard_count}")
+    return (int(org_vocab_size) + shard_count - 1) // shard_count
 
 
 def _ple_table_is_fp8(
@@ -513,9 +535,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         ngram_prefix = f"{prefix}.ngram_embedding" if prefix else "ngram_embedding"
         offload_embedding = bool(config.ple_offload_embedding)
-        # Offload only needs this embedding's metadata: build it on meta so the
-        # shard is never allocated on the device.
-        with torch.device("meta") if offload_embedding else nullcontext():
+        direct_safetensors = bool(envs.SGLANG_QWEN4_PLE_SAFETENSORS.get())
+        with (
+            torch.device("meta")
+            if offload_embedding or direct_safetensors
+            else nullcontext()
+        ):
             ngram_embedding = VocabParallelEmbedding(
                 padded_vocab_size,
                 self.head_dim_per_ngram,
@@ -926,6 +951,142 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         return self.reduce(self.gather(input_ids))
 
 
+class Qwen4ExpSafetensorsEmbedding(nn.Module):
+    """PLE table served directly from the checkpoint's safetensors shards.
+
+    ``Qwen4ExpPinnedHostEmbedding`` keeps the table in host memory the gather
+    kernel dereferences, which needs the device to read host pointers; this
+    variant instead reads the required rows straight from the model
+    checkpoint the server is loading -- no staged extraction, no pinned host
+    memory, and no pageable-GPU-access support, because rows are copied to
+    the device. The VocabParallelEmbedding it replaces is built on "meta" in
+    this mode, so the table is never allocated, and the model-provided weight
+    filter skips PLE tensors before the normal loader materializes them.
+
+    Enabled via SGLANG_QWEN4_PLE_SAFETENSORS, pointing at the checkpoint
+    directory (the one holding ``model.safetensors.index.json``, or bare
+    ``*.safetensors`` files). ``build_ple_safetensors_table`` parses the
+    index and headers once into validated numeric shard descriptors; rows are
+    fetched by global row id (= the token id under TP) with parallel pread
+    for small batches and grouped vectorized mmap reads for bulk gathers.
+    The weight_scale buffer is retained from the replaced embedding because
+    the scale does not survive into the quantized checkpoint.
+    """
+
+    _COPIED_ATTRIBUTES = (
+        "quant_config",
+        "enable_tp",
+        "use_attn_tp_group",
+        "tp_size",
+        "num_embeddings",
+        "org_vocab_size",
+        "padding_size",
+        "num_added_embeddings",
+        "use_presharded_weights",
+        "org_vocab_size_padded",
+        "num_embeddings_padded",
+        "shard_indices",
+        "embedding_dim",
+        "num_embeddings_per_partition",
+        "num_org_embeddings_per_partition",
+        "num_added_embeddings_per_partition",
+    )
+
+    def __init__(
+        self,
+        embedding: VocabParallelEmbedding,
+        directory: str,
+        *,
+        shard_size: int,
+    ) -> None:
+        from sglang.srt.models.qwen4_exp_ple_table import (
+            build_ple_safetensors_table,
+        )
+
+        nn.Module.__init__(self)
+        for name in self._COPIED_ATTRIBUTES:
+            setattr(self, name, getattr(embedding, name))
+        # Exclude this checkpoint-backed table so the generic loader does not
+        # stage it back to GPU unnecessarily.
+        self.quant_method = None
+
+        self._table = build_ple_safetensors_table(
+            directory,
+            shard_size=int(shard_size),
+            expected_dim=self.embedding_dim,
+            expected_rows=int(self.org_vocab_size),
+        )
+        self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
+        if hasattr(embedding, "weight"):
+            del embedding.weight
+
+    @property
+    def weight_loader_prefetch_exclude_files(self) -> list:
+        """Checkpoint files this table reads itself at gather time."""
+        return list(self._table.files)
+
+    def allocate_output(
+        self, shape: Tuple[int, ...], device: torch.device
+    ) -> torch.Tensor:
+        allocation_context = nullcontext()
+        if self.tp_size > 1:
+            allocation_context = use_symmetric_memory(
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
+            )
+        with allocation_context, torch.inference_mode(False):
+            # The gather emits bf16 rows regardless of the table dtype.
+            return torch.empty(shape, dtype=torch.bfloat16, device=device)
+
+    def gather(
+        self, input_ids: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        expected_shape = (*input_ids.shape, self.embedding_dim)
+        if out is None:
+            output = self.allocate_output(expected_shape, input_ids.device)
+        else:
+            if tuple(out.shape) != expected_shape:
+                raise ValueError(
+                    f"invalid PLE prefetch output shape: {tuple(out.shape)} != "
+                    f"{expected_shape}"
+                )
+            if out.dtype != torch.bfloat16 or out.device != input_ids.device:
+                raise ValueError(
+                    "PLE prefetch output must be bfloat16 on the id device"
+                )
+            output = out
+
+        flat = input_ids.reshape(-1)
+        if not flat.numel():
+            return output
+        start = self.shard_indices.org_vocab_start_index
+        end = self.shard_indices.org_vocab_end_index
+        ids = flat.to("cpu", torch.int64)
+        inside = (ids >= start) & (ids < end)
+        # Checkpoint rows are addressed by global row id, which is exactly the
+        # token id; out-of-shard ids read row 0 and are zeroed below.
+        rows = torch.where(inside, ids, torch.zeros_like(ids))
+        data = self._table.read_rows(rows)
+        vals = data.view(self._table.dtype).to(torch.bfloat16)
+        vals = torch.where(
+            inside.unsqueeze(1), vals, torch.zeros((), dtype=torch.bfloat16)
+        )
+        output.copy_(vals.reshape(expected_shape).to(output.device, non_blocking=True))
+        return output
+
+    def reduce(self, output: torch.Tensor) -> torch.Tensor:
+        if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
+            if self.use_attn_tp_group:
+                return attn_tp_all_reduce(output)
+            return tensor_model_parallel_all_reduce(output)
+        return output
+
+    @eager_on_graph(True)
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # Under --cuda-graph-backend-decode breakable this lookup is the one
+        # eager break on the decode path: host-side reads cannot be captured.
+        return self.reduce(self.gather(input_ids))
+
+
 class Qwen4ExpPLELayer(nn.Module):
     def __init__(
         self,
@@ -949,6 +1110,19 @@ class Qwen4ExpPLELayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.ple_embedding" if prefix else "ple_embedding",
         )
+        ple_safetensors_dir = envs.SGLANG_QWEN4_PLE_SAFETENSORS.get()
+        if ple_safetensors_dir and config.ple_offload_embedding:
+            raise ValueError(
+                "SGLANG_QWEN4_PLE_SAFETENSORS cannot be combined with "
+                "built-in PLE offload"
+            )
+        if ple_safetensors_dir:
+            ngram = self.ple_embedding.ngram_embedding
+            self.ple_embedding.ngram_embedding = Qwen4ExpSafetensorsEmbedding(
+                ngram,
+                ple_safetensors_dir,
+                shard_size=_ple_checkpoint_shard_size(config, ngram.org_vocab_size),
+            )
         self.short_conv_dilation = self.ple_embedding.ngram_size
         self.short_conv_state_len = (
             self.conv_kernel_size - 1
@@ -1828,6 +2002,31 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
         return embed, head
 
+    @property
+    def weight_loader_prefetch_exclude_files(self) -> Optional[list]:
+        """Distinct checkpoint files the direct PLE backend serves itself.
+
+        ``DefaultModelLoader.Source.init_new`` copies this attribute into the
+        source so the iterator prefetch and the startup-overlap prefetch skip
+        exactly these files. None without a direct embedding: the built-in pinned/file offloads
+        read from their own allocations, not from the checkpoint, so nothing
+        is excluded from prefetching for them."""
+        files: list = []
+        seen: set = set()
+        for module in self.modules():
+            if isinstance(module, Qwen4ExpSafetensorsEmbedding):
+                for path in module.weight_loader_prefetch_exclude_files:
+                    if path not in seen:
+                        seen.add(path)
+                        files.append(path)
+        return files or None
+
+    @property
+    def weight_loader_skip_tensor(self):
+        if self.weight_loader_prefetch_exclude_files is None:
+            return None
+        return _is_ple_shard_tensor
+
     @torch.no_grad()
     def forward(
         self,
@@ -1977,9 +2176,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         def load_qwen4_exp_ple_shard(name: str, loaded_weight: torch.Tensor) -> bool:
             if ".ngram_embedding.shard_" not in name:
                 return False
-            import re
-
-            match = re.search(r"\.ngram_embedding\.shard_(\d+)\.weight$", name)
+            match = PLE_SHARD_TENSOR_RE.match(name)
             if not match:
                 return False
             shard_idx = int(match.group(1))
@@ -1988,6 +2185,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if ple_mod is None:
                 return False
             emb = ple_mod.ngram_embedding
+            if isinstance(emb, Qwen4ExpSafetensorsEmbedding):
+                # the direct backend reads these checkpoint shards itself
+                return True
             if (
                 loaded_weight.dtype == torch.float8_e4m3fn
                 and emb.weight.dtype != torch.float8_e4m3fn
@@ -2029,9 +2229,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         "downcasting is lossy",
                         loaded_weight.dtype,
                     )
-            shard_size = (
-                emb.org_vocab_size + ple_num_sync_shards - 1
-            ) // ple_num_sync_shards
+            shard_size = _ple_checkpoint_shard_size(self.config, emb.org_vocab_size)
             shard_start = shard_idx * shard_size
             actual_rows = loaded_weight.shape[0]
             shard_end = shard_start + actual_rows
@@ -2047,14 +2245,6 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             for mod_name, mod in self.named_modules()
             if isinstance(mod, Qwen4ExpNGramEmbedding)
         }
-        text_config = getattr(self.config, "text_config", self.config)
-        ple_num_sync_shards = int(
-            getattr(
-                text_config,
-                "split_ngram_parts",
-                getattr(self.config, "split_ngram_parts", 512),
-            )
-        )
         loaded_params: Set[str] = set()
         loaded_buffers: Set[str] = set()
         loaded_shard_params: Set[str] = set()

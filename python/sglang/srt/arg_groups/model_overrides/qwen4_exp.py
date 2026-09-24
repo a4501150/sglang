@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -39,12 +40,26 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
         raise ValueError("Qwen4-Exp does not support --enable-unified-memory yet")
     overrides: Dict[str, Any] = {}
 
-    if cfg.ple_offload_embedding is None:
+    # The direct safetensors backend (SGLANG_QWEN4_PLE_SAFETENSORS) reads the
+    # table from the checkpoint with no pinned host memory, so leave the
+    # default at None (falsy) instead of auto-enabling the pinned offload.
+    ple_direct = envs.SGLANG_QWEN4_PLE_SAFETENSORS.get()
+    if cfg.ple_offload_embedding is None and not ple_direct:
         import torch
 
         overrides["ple_offload_embedding"] = (
             get_platform().is_cuda
             and model_config_of(server_args).dtype == torch.bfloat16
+        )
+    if ple_direct and cfg.ple_offload_embedding:
+        raise ValueError(
+            "SGLANG_QWEN4_PLE_SAFETENSORS serves the PLE table from the "
+            "checkpoint itself at gather time, so --ple-offload-embedding "
+            "has no table to hold: it would copy the same checkpoint bytes "
+            "into a host table the direct backend never reads. Drop "
+            "--ple-offload-embedding, or unset SGLANG_QWEN4_PLE_SAFETENSORS "
+            "to use the offload. (Checkpoint prefetching is unaffected: the "
+            "loader skips only the PLE shard files and prefetches the rest.)"
         )
 
     text_config = getattr(hf_config, "text_config", hf_config)

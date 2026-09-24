@@ -304,6 +304,12 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Direct safetensors PLE table: checkpoint directory whose own
+    # *.ngram_embedding.shard_N.weight tensors serve the table (index/headers
+    # parsed once; parallel pread for small batches, grouped mmap for bulk, and
+    # background RSS trimming). It uses no staged copy or pinned host memory
+    # and cannot be combined with --ple-offload-backend.
+    SGLANG_QWEN4_PLE_SAFETENSORS = EnvStr(None)
     # --ple-offload-backend file: where the sparse, file-backed PLE table lives
     # (deterministic name, reused across restarts), whether prefill-sized
     # gathers hint the page cache first, and an escape hatch for the device
@@ -1906,6 +1912,9 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         note="One workspace per process is now an invariant, not a limit."
     ),
     # Removed without replacement.
+    "SGLANG_QWEN4_PLE_MMAP": _DeprecatedEnv(
+        note="Use SGLANG_QWEN4_PLE_SAFETENSORS with the original checkpoint; the extracted ple.bin/ple.json format is no longer supported."
+    ),
     "SGLANG_ENABLE_CP_V2": _DeprecatedEnv(
         note="Strategy-based prefill context parallelism is now the only generic implementation."
     ),

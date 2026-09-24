@@ -81,6 +81,7 @@ def _get_flashinfer_gdn_wy_output_only():
                 pass
     return _flashinfer_gated_delta_rule_mtp_wy_output_only
 
+
 def maybe_build_flashinfer_checkpoint_plan(
     forward_batch: ForwardBatch,
     forward_metadata: ForwardMetadata,
@@ -595,6 +596,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=state_checkpoint_cu_starts,
             checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+            # FlashInfer CP cannot emit checkpoints; skip its warn-and-fallback probe.
+            use_cp=False if state_checkpoints is not None else "auto",
         )
 
         # Write back state to pool
