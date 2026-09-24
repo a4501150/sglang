@@ -9495,7 +9495,7 @@ class TestMambaFinishedOvershootCheckpoint(CustomTestCase):
         indices = allocator.alloc(len(tokens))
         self.assertIsNotNone(indices)
         pool.write((req.kv.req_pool_idx, slice(0, len(tokens))), indices)
-        req._refresh_fill_ids()
+        req.refresh_fill_ids()
         return req, tokens
 
     def test_finish_preserves_checkpoint_published_after_admission(self):
@@ -9504,7 +9504,7 @@ class TestMambaFinishedOvershootCheckpoint(CustomTestCase):
         req.last_node = cache.root_node_handle()
         for depth in (4, 8):
             req.kv.mamba_last_track_seqlen = depth
-            cache.insert_req(req, up_to=depth)
+            cache.checkpoint(req, up_to=depth)
             self.assertEqual(req.kv.cache_protected_len, depth)
         req.cached_tokens = 4
         self.assertIsNone(req.kv.mamba_last_track_seqlen)
@@ -9522,7 +9522,7 @@ class TestMambaFinishedOvershootCheckpoint(CustomTestCase):
         req, tokens = self._build_req(allocator, pool, None)
         req.last_node = cache.root_node_handle()
         req.kv.mamba_last_track_seqlen = 8
-        cache.insert_req(req, up_to=8)
+        cache.checkpoint(req, up_to=8)
         req.kv.mamba_last_track_seqlen = 12
         req.kv.mamba_prev_track_seqlen = 4
 
@@ -10343,9 +10343,7 @@ class TestResumableInsertWalk(_InsertWalkSuite):
         cache.dec_host_lock_ref = lambda node, params: calls.append(
             ("release_host", node)
         )
-        cache.dec_lock_ref = lambda node, params: calls.append(
-            ("release_device", node)
-        )
+        cache.dec_lock_ref = lambda node, params: calls.append(("release_device", node))
         cache.write_backup_storage = lambda node: calls.append(("store", node))
         cache._execute_and_commit_kv_backup = lambda action: calls.append(
             ("backup", action.node_ids)

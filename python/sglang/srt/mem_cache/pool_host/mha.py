@@ -5,7 +5,6 @@ import threading
 from typing import Sequence
 
 import torch
-
 from sglang.kernels.ops.kvcache.hicache import (
     can_use_hicache_jit_kernel,
     can_use_write_back_jit_kernel,
@@ -28,14 +27,10 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
-from sglang.kernels.ops.kvcache.hicache import (
-    transfer_hicache_page_first_to_layer_dma as jit_transfer_hicache_page_first_to_layer_dma,
-)
-from sglang.srt.environ import envs
-from sglang.srt.mem_cache.hicache_storage import hicache_tensor_digest
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
+    MHATokenToKVPoolDynamicFP8,
     MHATokenToKVPoolMXFP8,
 )
 from sglang.srt.mem_cache.pool_host.base import (
@@ -46,11 +41,12 @@ from sglang.srt.mem_cache.pool_host.base import (
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_unregister,
-    can_use_host_pointer_for_registered_mem,
     get_allocator_from_storage,
+    log_hicache_transfer_digests,
     make_kernel_ptr_table,
     transfer_kv_all_layer_direct_lf_pf,
     transfer_kv_per_layer_direct_pf_lf,
+    transfer_layers_pf_dma,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.platforms import current_platform
@@ -333,22 +329,25 @@ class MHATokenToKVPoolHost(HostKVCache):
         return self.kv_buffer[1]
 
     def _validate_page_runs(self, name: str, indices: torch.Tensor) -> list[int]:
-        values = indices.detach().cpu().tolist()
-        if len(values) % self.page_size:
+        flat = indices.detach().cpu().reshape(-1)
+        if flat.numel() % self.page_size:
             raise RuntimeError(
-                f"HiCache KV {name} index count {len(values)} is not a multiple "
+                f"HiCache KV {name} index count {flat.numel()} is not a multiple "
                 f"of page_size={self.page_size}"
             )
-        for offset in range(0, len(values), self.page_size):
-            run = values[offset : offset + self.page_size]
-            expected = list(range(run[0], run[0] + self.page_size))
-            if run[0] % self.page_size or run != expected:
-                raise RuntimeError(
-                    f"HiCache KV {name} page run is not aligned and contiguous: "
-                    f"offset={offset} first={run[0]} last={run[-1]} "
-                    f"page_size={self.page_size}"
-                )
-        return values
+        runs = flat.reshape(-1, self.page_size)
+        bad = runs[:, 0] % self.page_size != 0
+        if self.page_size > 1:
+            bad = bad | (runs.diff(dim=1) != 1).any(dim=1)
+        if bool(bad.any()):
+            page = bad.nonzero()[0].item() * self.page_size
+            raise RuntimeError(
+                f"HiCache KV {name} page run is not aligned and contiguous: "
+                f"offset={page} first={runs[page // self.page_size, 0].item()} "
+                f"last={runs[page // self.page_size, -1].item()} "
+                f"page_size={self.page_size}"
+            )
+        return flat.tolist()
 
     def log_transfer_digests(
         self,
@@ -356,49 +355,36 @@ class MHATokenToKVPoolHost(HostKVCache):
         host_indices: torch.Tensor,
         device_indices: torch.Tensor,
     ) -> None:
-        if not envs.SGLANG_HICACHE_FILE_BACKEND_LOG_PAGE_DIGESTS.get():
-            return
-        if torch.cuda.is_available():
-            torch.cuda.current_stream().synchronize()
-        host_values = self._validate_page_runs("host", host_indices)
-        device_values = self._validate_page_runs("device", device_indices)
-        for offset in range(0, len(host_values), self.page_size):
-            host_page = host_values[offset] // self.page_size
-            device_index = device_values[offset]
-            host_components = {
-                "kv_k": self.k_buffer[host_page, : self.target_layer_num],
-                "kv_v": self.v_buffer[host_page, : self.target_layer_num],
-            }
-            device_components = {
-                "kv_k": torch.stack(
-                    [
-                        layer[device_index : device_index + self.page_size]
-                        for layer in self.device_pool.k_buffer
-                    ]
-                ),
-                "kv_v": torch.stack(
-                    [
-                        layer[device_index : device_index + self.page_size]
-                        for layer in self.device_pool.v_buffer
-                    ]
-                ),
-            }
-            for component, host_tensor in host_components.items():
-                host_digest = hicache_tensor_digest(host_tensor)
-                device_digest = hicache_tensor_digest(device_components[component])
-                logger.warning(
-                    "HiCache KV transfer digest direction=%s component=%s "
-                    "host_page=%d device_index=%d bytes=%d host_sha256=%s "
-                    "device_sha256=%s exact=%s",
-                    direction,
-                    component,
+        def _pairs():
+            host_values = self._validate_page_runs("host", host_indices)
+            device_values = self._validate_page_runs("device", device_indices)
+            for offset in range(0, len(host_values), self.page_size):
+                host_page = host_values[offset] // self.page_size
+                device_index = device_values[offset]
+                yield (
                     host_page,
                     device_index,
-                    host_tensor.numel() * host_tensor.element_size(),
-                    host_digest,
-                    device_digest,
-                    host_digest == device_digest,
+                    {
+                        "kv_k": self.k_buffer[host_page, : self.target_layer_num],
+                        "kv_v": self.v_buffer[host_page, : self.target_layer_num],
+                    },
+                    {
+                        "kv_k": torch.stack(
+                            [
+                                layer[device_index : device_index + self.page_size]
+                                for layer in self.device_pool.k_buffer
+                            ]
+                        ),
+                        "kv_v": torch.stack(
+                            [
+                                layer[device_index : device_index + self.page_size]
+                                for layer in self.device_pool.v_buffer
+                            ]
+                        ),
+                    },
                 )
+
+        log_hicache_transfer_digests(direction, "index", _pairs())
 
     def load_to_device_per_layer(
         self,
@@ -444,52 +430,47 @@ class MHATokenToKVPoolHost(HostKVCache):
                         item_size=self.token_stride_size,
                     )
             elif self.layout == "page_first":
-                if _is_cuda and not can_use_host_pointer_for_registered_mem(
-                    torch.cuda.current_device()
-                ):
-                    jit_transfer_hicache_page_first_to_layer_dma(
-                        src=self.k_buffer,
-                        dst=device_pool.k_buffer[device_layer_id],
-                        src_indices=host_indices,
-                        dst_indices=device_indices,
-                        layer_id=host_layer_id,
-                        page_size=self.page_size,
-                    )
-                    jit_transfer_hicache_page_first_to_layer_dma(
-                        src=self.v_buffer,
-                        dst=device_pool.v_buffer[device_layer_id],
-                        src_indices=host_indices,
-                        dst_indices=device_indices,
-                        layer_id=host_layer_id,
-                        page_size=self.page_size,
-                    )
-                elif self.can_use_jit:
-                    # Transpose [page, layer, ...] -> [layer, page, ...] then
-                    # index by layer_id to get a per-layer view with strided layout.
-                    # The kernel handles different src/dst strides automatically.
-                    jit_transfer_hicache_one_layer(
-                        page_size=self.page_size,
-                        k_cache_dst=device_k,
-                        v_cache_dst=device_v,
-                        k_cache_src=self.k_data_refs[host_layer_id],
-                        v_cache_src=self.v_data_refs[host_layer_id],
-                        indices_dst=device_indices,
-                        indices_src=host_indices,
-                        element_dim=self.element_dim,
-                    )
-                else:
-                    self._require_packed_device_rows("transfer_kv_per_layer_pf_lf")
-                    transfer_kv_per_layer_pf_lf(
-                        src_k=self.k_buffer,
-                        dst_k=device_k,
-                        src_v=self.v_buffer,
-                        dst_v=device_v,
-                        src_indices=host_indices,
-                        dst_indices=device_indices,
-                        layer_id=host_layer_id,
-                        item_size=self.token_stride_size,
-                        src_layout_dim=self.layout_dim,
-                    )
+
+                def _pf_fallback():
+                    if self.can_use_jit:
+                        # Transpose [page, layer, ...] -> [layer, page, ...] then
+                        # index by layer_id to get a per-layer view with strided layout.
+                        # The kernel handles different src/dst strides automatically.
+                        jit_transfer_hicache_one_layer(
+                            page_size=self.page_size,
+                            k_cache_dst=device_k,
+                            v_cache_dst=device_v,
+                            k_cache_src=self.k_data_refs[host_layer_id],
+                            v_cache_src=self.v_data_refs[host_layer_id],
+                            indices_dst=device_indices,
+                            indices_src=host_indices,
+                            element_dim=self.element_dim,
+                        )
+                    else:
+                        self._require_packed_device_rows("transfer_kv_per_layer_pf_lf")
+                        transfer_kv_per_layer_pf_lf(
+                            src_k=self.k_buffer,
+                            dst_k=device_k,
+                            src_v=self.v_buffer,
+                            dst_v=device_v,
+                            src_indices=host_indices,
+                            dst_indices=device_indices,
+                            layer_id=host_layer_id,
+                            item_size=self.token_stride_size,
+                            src_layout_dim=self.layout_dim,
+                        )
+
+                transfer_layers_pf_dma(
+                    [
+                        (self.k_buffer, device_k),
+                        (self.v_buffer, device_v),
+                    ],
+                    host_layer_id,
+                    host_indices,
+                    device_indices,
+                    self.page_size,
+                    _pf_fallback,
+                )
             elif self.layout == "page_head":
                 self._require_packed_device_rows("transfer_kv_per_layer_ph_lf")
                 transfer_kv_per_layer_ph_lf(
@@ -1055,36 +1036,36 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
                         item_size=self.token_stride_size,
                     )
             elif self.layout == "page_first":
-                if _is_cuda and not can_use_host_pointer_for_registered_mem(
-                    torch.cuda.current_device()
-                ):
-                    jit_transfer_hicache_page_first_to_layer_dma(
-                        src=self.k_buffer,
-                        dst=device_pool.k_buffer[layer_id],
-                        src_indices=host_indices,
-                        dst_indices=device_indices,
-                        layer_id=layer_id,
-                        page_size=self.page_size,
-                    )
-                elif self.can_use_jit:
-                    jit_transfer_hicache_one_layer_mla(
-                        page_size=self.page_size,
-                        cache_dst=device_pool.k_buffer[layer_id],
-                        cache_src=self.k_data_refs[layer_id],
-                        indices_dst=device_indices,
-                        indices_src=host_indices,
-                        element_dim=self.element_dim,
-                    )
-                else:
-                    transfer_kv_per_layer_mla_pf_lf(
-                        src=self.k_buffer,
-                        dst=device_pool.k_buffer[layer_id],
-                        src_indices=host_indices,
-                        dst_indices=device_indices,
-                        layer_id=layer_id,
-                        item_size=self.token_stride_size,
-                        src_layout_dim=self.layout_dim,
-                    )
+
+                def _pf_fallback():
+                    if self.can_use_jit:
+                        jit_transfer_hicache_one_layer_mla(
+                            page_size=self.page_size,
+                            cache_dst=device_pool.k_buffer[layer_id],
+                            cache_src=self.k_data_refs[layer_id],
+                            indices_dst=device_indices,
+                            indices_src=host_indices,
+                            element_dim=self.element_dim,
+                        )
+                    else:
+                        transfer_kv_per_layer_mla_pf_lf(
+                            src=self.k_buffer,
+                            dst=device_pool.k_buffer[layer_id],
+                            src_indices=host_indices,
+                            dst_indices=device_indices,
+                            layer_id=layer_id,
+                            item_size=self.token_stride_size,
+                            src_layout_dim=self.layout_dim,
+                        )
+
+                transfer_layers_pf_dma(
+                    [(self.k_buffer, device_pool.k_buffer[layer_id])],
+                    layer_id,
+                    host_indices,
+                    device_indices,
+                    self.page_size,
+                    _pf_fallback,
+                )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
@@ -1427,26 +1408,8 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                     f"Unsupported layout for models with head_dim != v_head_dim "
                     f"and io_backend='kernel': {self.layout}; expected 'page_first'."
                 )
-            if _is_cuda and not can_use_host_pointer_for_registered_mem(
-                torch.cuda.current_device()
-            ):
-                jit_transfer_hicache_page_first_to_layer_dma(
-                    src=self.k_buffer,
-                    dst=device_k,
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    layer_id=host_layer_id,
-                    page_size=self.page_size,
-                )
-                jit_transfer_hicache_page_first_to_layer_dma(
-                    src=self.v_buffer,
-                    dst=device_v,
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    layer_id=host_layer_id,
-                    page_size=self.page_size,
-                )
-            else:
+
+            def _pf_fallback():
                 transfer_kv_per_layer_mla_pf_lf(
                     src=self.k_buffer,
                     dst=device_k,
@@ -1465,6 +1428,18 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                     item_size=self._v_token_stride_size(),
                     src_layout_dim=self._v_layout_dim(),
                 )
+
+            transfer_layers_pf_dma(
+                [
+                    (self.k_buffer, device_k),
+                    (self.v_buffer, device_v),
+                ],
+                host_layer_id,
+                host_indices,
+                device_indices,
+                self.page_size,
+                _pf_fallback,
+            )
         elif io_backend == "direct":
             if self.layout != "page_first_direct":
                 raise ValueError(
@@ -1671,6 +1646,17 @@ def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
     ``AsymmetricMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
     (e.g. MiMo-V2), else the default ``MHATokenToKVPoolHost``.
     """
+    if isinstance(device_pool, MHATokenToKVPoolDynamicFP8):
+        if device_pool.head_dim != device_pool.v_head_dim:
+            raise NotImplementedError(
+                "Dynamic FP8 HiCache does not support asymmetric K/V head dimensions yet."
+            )
+
+        from sglang.srt.mem_cache.pool_host.mha_dynamic_fp8 import (
+            MHATokenToKVPoolDynamicFP8Host,
+        )
+
+        return MHATokenToKVPoolDynamicFP8Host
     if isinstance(device_pool, MHATokenToKVPoolMXFP8):
         if device_pool.head_dim != device_pool.v_head_dim:
             raise NotImplementedError(

@@ -10,15 +10,89 @@ from collections import defaultdict
 from functools import cache, lru_cache
 
 import torch
-
+from sglang.kernels.ops.kvcache.hicache import (
+    transfer_hicache_page_first_to_layer_dma as jit_transfer_hicache_page_first_to_layer_dma,
+)
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.hicache_storage import hicache_tensor_digest
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.runtime_context import get_memory
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
+_is_cuda = is_cuda()
+
+
+def log_hicache_transfer_digests(
+    direction: str,
+    device_label: str,
+    pairs,
+) -> None:
+    """Log one digest line per (page, component) host<->device copy pair.
+
+    ``pairs`` must be lazy (a generator): component tensors are only touched
+    when digest logging is enabled, so the disabled path stays free of syncs
+    and tensor work. The line format is pinned by super-quant's
+    hicache_digest_check.py; keep any field change in sync with its parser.
+    """
+    if not envs.SGLANG_HICACHE_FILE_BACKEND_LOG_PAGE_DIGESTS.get():
+        return
+    if torch.cuda.is_available():
+        torch.cuda.current_stream().synchronize()
+    for host_page, device_index, host_components, device_components in pairs:
+        for component, host_tensor in host_components.items():
+            host_digest = hicache_tensor_digest(host_tensor)
+            device_digest = hicache_tensor_digest(device_components[component])
+            logger.warning(
+                "HiCache KV transfer digest direction=%s component=%s "
+                "host_page=%d device_%s=%d bytes=%d host_sha256=%s "
+                "device_sha256=%s exact=%s",
+                direction,
+                component,
+                host_page,
+                device_label,
+                device_index,
+                host_tensor.numel() * host_tensor.element_size(),
+                host_digest,
+                device_digest,
+                host_digest == device_digest,
+            )
+
+
+def transfer_layers_pf_dma(
+    buffer_pairs,
+    host_layer_id: int,
+    host_indices: torch.Tensor,
+    device_indices: torch.Tensor,
+    page_size: int,
+    fallback,
+) -> None:
+    """Per-layer page-first host->device load dispatch, shared by the MHA
+    host pools: async-DMA through the JIT kernel when the device cannot
+    address registered host memory directly, else the caller's fallback
+    transfer chain. Each ``(src_host, dst_device)`` pair moves one buffer
+    (k and v, or a k-only cache)."""
+    if _is_cuda and not can_use_host_pointer_for_registered_mem(
+        torch.cuda.current_device()
+    ):
+        # One index D2H per batch: the JIT wrapper would otherwise convert
+        # the same index tensors once per buffer pair (k and v).
+        host_indices_cpu = host_indices.cpu()
+        device_indices_cpu = device_indices.cpu()
+        for src, dst in buffer_pairs:
+            jit_transfer_hicache_page_first_to_layer_dma(
+                src=src,
+                dst=dst,
+                src_indices=host_indices_cpu,
+                dst_indices=device_indices_cpu,
+                layer_id=host_layer_id,
+                page_size=page_size,
+            )
+        return
+    fallback()
+
 
 _CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
 _CUDA_DEV_ATTR_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM = 91

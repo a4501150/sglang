@@ -177,7 +177,7 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
 
         with (
             mock.patch(
-                "sglang.srt.mem_cache.pool_host.mha.can_use_host_pointer_for_registered_mem",
+                "sglang.srt.mem_cache.pool_host.common.can_use_host_pointer_for_registered_mem",
                 return_value=True,
             ),
             mock.patch(
@@ -308,7 +308,7 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
                 side_effect=staged_copy,
             ),
             mock.patch(
-                "sglang.srt.mem_cache.pool_host.mha.can_use_host_pointer_for_registered_mem",
+                "sglang.srt.mem_cache.pool_host.common.can_use_host_pointer_for_registered_mem",
                 return_value=True,
             ),
             mock.patch(
