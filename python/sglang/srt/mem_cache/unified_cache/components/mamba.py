@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -58,6 +59,9 @@ if TYPE_CHECKING:
     )
 
 
+logger = logging.getLogger(__name__)
+
+
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
 
@@ -73,9 +77,8 @@ class MambaComponent(TreeComponent):
             )
         super().__init__(cache, params)
         self.mamba_cache_chunk_size = mamba_cache_chunk_size()
-        # params.page_size is the tree page the allocator actually uses, already
-        # widened by dcp_size, so it is the one grid a checkpoint depth can land on.
         self.mamba_checkpoint_grid = mamba_checkpoint_grid(params.page_size)
+        self._checkpoint_tree_page = params.page_size
         self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
@@ -225,7 +228,11 @@ class MambaComponent(TreeComponent):
         result: InsertResult,
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
-        assert params.mamba_value is not None
+        if params.mamba_value is None:
+            assert not is_new_leaf
+            assert node.component_data[self.component_type].value is not None
+            result.mamba_exist = True
+            return
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
@@ -558,6 +565,53 @@ class MambaComponent(TreeComponent):
             return None
         return previous_cache_len, pool.get_mamba_ping_pong_other_idx(keep_idx)
 
+    def _require_donatable_checkpoint_depth(
+        self, depth: int, req: Req, token_ids_len: int, *, min_depth: int = 0
+    ) -> int:
+        """Fail-closed validation of the host-known checkpoint depth.
+
+        Runs before any donate alloc/copy/commit, so a rejected depth never
+        mutates pool or tree state. A checkpoint must be a host integer within
+        the committed token span and land on a radix page boundary. Finished
+        checkpoints can be finer than the periodic Mamba tracking grid.
+        """
+        where = (
+            f"rid={getattr(req, 'rid', None)}, page={self._checkpoint_tree_page}, "
+            f"token_ids_len={token_ids_len}"
+        )
+        if isinstance(depth, torch.Tensor):
+            raise AssertionError(
+                f"Mamba donate refused: checkpoint depth is a device tensor "
+                f"(host-known int required), {where}"
+            )
+        if not isinstance(depth, int):
+            raise AssertionError(
+                f"Mamba donate refused: checkpoint depth is not a host int "
+                f"(got {type(depth).__name__}), {where}"
+            )
+        if not min_depth <= depth <= token_ids_len:
+            raise AssertionError(
+                f"Mamba donate refused: checkpoint depth {depth} outside "
+                f"[{min_depth}, {token_ids_len}], {where}"
+            )
+        if depth % self._checkpoint_tree_page != 0:
+            raise AssertionError(
+                f"Mamba donate refused: checkpoint depth {depth} not aligned to "
+                f"tree page, {where}"
+            )
+        return depth
+
+    def _checkpoint_depth_or_none(
+        self, depth: int, req: Req, token_ids_len: int, *, min_depth: int = 0
+    ) -> Optional[int]:
+        try:
+            return self._require_donatable_checkpoint_depth(
+                depth, req, token_ids_len, min_depth=min_depth
+            )
+        except AssertionError as error:
+            logger.error("%s; skipping cache insertion", error)
+            return None
+
     def prepare_for_caching_req(
         self,
         req: Req,
@@ -565,22 +619,60 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        min_depth = req.kv.cache_protected_len if is_finished else 0
         if self.cache.enable_mamba_extra_buffer:
             cache_len = req.kv.mamba_last_track_seqlen
+            if cache_len is None:
+                if is_finished and min_depth > 0:
+                    # The protected prefix includes checkpoints inserted during
+                    # this request, not just its admission cache hit.
+                    return (
+                        self._checkpoint_depth_or_none(
+                            min_depth, req, token_ids_len, min_depth=min_depth
+                        )
+                        or 0
+                    )
+            elif not (
+                is_finished and isinstance(cache_len, int) and cache_len > token_ids_len
+            ):
+                cache_len = self._checkpoint_depth_or_none(
+                    cache_len, req, token_ids_len, min_depth=min_depth
+                )
+                if cache_len is None:
+                    return 0
+            # An overshooting cache_len falls through: the finished path
+            # below can donate the previous ping-pong slot instead, which is
+            # sized for exactly that case.
         else:
+            if token_ids_len < req.kv.kv_committed_len:
+                logger.error(
+                    "Mamba donate refused: trimmed token span %d is shorter than "
+                    "committed state depth %d for rid=%s; skipping cache insertion",
+                    token_ids_len,
+                    req.kv.kv_committed_len,
+                    getattr(req, "rid", None),
+                )
+                return 0
             cache_len = token_ids_len
             # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by the
             # slot's unflushed ring depth (`write_pos`), so on request finish cap
             # the donate to the last flush boundary (where temporal is current)
             # and reset the cursor, keeping the donated checkpoint consistent with
             # its key length. page_size is asserted == 1, so no realign.
+            write_pos_buf = None
             if is_finished:
                 write_pos_buf = (
                     self.cache.req_to_token_pool.mamba_pool.replayssm_write_pos
                 )
                 if write_pos_buf is not None:
                     cache_len -= int(write_pos_buf[req.kv.mamba_pool_idx].item())
-                    write_pos_buf[req.kv.mamba_pool_idx] = 0
+            cache_len = self._checkpoint_depth_or_none(
+                cache_len, req, token_ids_len, min_depth=min_depth
+            )
+            if cache_len is None:
+                return 0
+            if write_pos_buf is not None:
+                write_pos_buf[req.kv.mamba_pool_idx] = 0
 
         if is_finished:
             if cache_len is None:
@@ -590,6 +682,11 @@ class MambaComponent(TreeComponent):
                 if checkpoint is None:
                     return 0
                 cache_len, keep_idx = checkpoint
+                cache_len = self._checkpoint_depth_or_none(
+                    cache_len, req, token_ids_len, min_depth=min_depth
+                )
+                if cache_len is None:
+                    return 0
                 insert_params.mamba_keep_idx = keep_idx
                 active_value = (
                     req.kv.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()

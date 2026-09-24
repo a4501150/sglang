@@ -1106,6 +1106,45 @@ fn cache_salt_is_a_distinct_child_namespace_dimension() -> Result<(), TreeCoreRu
 }
 
 #[test]
+fn storage_hashes_include_both_namespace_dimensions() -> Result<(), TreeCoreRuntimeError> {
+    let mut arena = arena();
+    let root = arena.root();
+    let shared = arena.alloc_child_in_namespace(root, vec![7, 8], 0, KeyNamespaceRef::default())?;
+    let first = arena.alloc_child_in_namespace(
+        root,
+        vec![7, 8],
+        0,
+        KeyNamespaceRef::new(Some("ab"), Some("c")),
+    )?;
+    let second = arena.alloc_child_in_namespace(
+        root,
+        vec![7, 8],
+        0,
+        KeyNamespaceRef::new(Some("a"), Some("bc")),
+    )?;
+
+    let legacy = get_hash_str::<Vec<i64>>(&[7, 8], None, 2);
+    let shared_hashes = arena.compute_node_hash_values(shared, 2);
+    let first_hashes = arena.compute_node_hash_values(first, 2);
+    let second_hashes = arena.compute_node_hash_values(second, 2);
+
+    // Golden value for the upstream namespace seed ("ab", "c"): the chain is
+    // seeded exactly with Python's storage_namespace_seed bytes (domain
+    // "sglang-cache-namespace-v1", little-endian UTF-8 byte lengths).
+    const EXPECTED_SEED: &str = "3d6b02ff0d7a0ce42a5ac4a58251ee0e63490c7de5eb46aa2eeaa3a0fdff5364";
+    assert_eq!(
+        first_hashes,
+        get_hash_str::<Vec<i64>>(&[7, 8], Some(EXPECTED_SEED), 2)
+    );
+
+    assert_eq!(shared_hashes, legacy);
+    assert_ne!(first_hashes, shared_hashes);
+    assert_ne!(second_hashes, shared_hashes);
+    assert_ne!(first_hashes, second_hashes);
+    Ok(())
+}
+
+#[test]
 fn namespace_hashing_uses_the_cached_digest_but_equality_checks_strings() {
     let long_extra_key = "x".repeat(64 * 1024);
     let long_cache_salt = "y".repeat(64 * 1024);
