@@ -3711,6 +3711,11 @@ class MHATokenToKVPoolDynamicFP8(MHATokenToKVPool):
                 ]
 
     def get_kv_scale_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        # The scales travel with the payload under layer-wise HiCache loads, so
+        # this getter carries its own transfer wait (like get_key_buffer)
+        # instead of relying on the caller having read the payload first.
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         idx = layer_id - self.start_layer
         return self.k_scale_buffer[idx], self.v_scale_buffer[idx]
 

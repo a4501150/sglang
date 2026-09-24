@@ -9389,6 +9389,139 @@ class TestResumableInsertWalk(_InsertWalkSuite):
                 cache.evict(EvictParams(num_tokens=8))
         self.assertEqual(allocator.available_size(), available + 4)
 
+    def test_write_through_storage_handoff_holds_host_locks(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.buffer_pipeline = None
+        calls = []
+        cache.tree_core = SimpleNamespace(
+            enable_storage=True,
+            finish_write_through=lambda nodes, ack: calls.append(
+                ("finish", tuple(nodes), ack)
+            ),
+        )
+        cache.ongoing_write_through = {
+            7: _OngoingWriteThrough(10, DecLockRefParams(), [5, 10])
+        }
+        cache.inc_host_lock_ref = lambda node: SimpleNamespace(
+            to_dec_params=lambda: f"host-{node}"
+        )
+        cache.dec_lock_ref = lambda node, params: calls.append(
+            ("dec_device", node, params)
+        )
+        cache.write_backup_storage = lambda node: calls.append(("write", node))
+        cache.dec_host_lock_ref = lambda node, params: calls.append(
+            ("dec_host", node, params)
+        )
+
+        cache._finish_write_through_ack(7)
+
+        self.assertEqual(
+            calls,
+            [
+                ("finish", (5, 10), 7),
+                ("dec_device", 10, DecLockRefParams()),
+                ("write", 5),
+                ("write", 10),
+                ("dec_host", 5, "host-5"),
+                ("dec_host", 10, "host-10"),
+            ],
+        )
+
+    def test_write_through_handoff_releases_partial_locks_on_failure(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.buffer_pipeline = None
+        calls = []
+        cache.tree_core = SimpleNamespace(
+            enable_storage=True,
+            finish_write_through=lambda nodes, ack: calls.append(("finish", ack)),
+        )
+        lock_params = DecLockRefParams()
+        cache.ongoing_write_through = {
+            7: _OngoingWriteThrough(10, lock_params, [5, 10])
+        }
+
+        def inc_host(node):
+            calls.append(("inc_host", node))
+            if node == 10:
+                raise RuntimeError("host lock failed")
+            return SimpleNamespace(to_dec_params=lambda: f"host-{node}")
+
+        cache.inc_host_lock_ref = inc_host
+        cache.dec_lock_ref = lambda node, params: calls.append(
+            ("dec_device", node, params)
+        )
+        cache.dec_host_lock_ref = lambda node, params: calls.append(
+            ("dec_host", node, params)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "host lock failed"):
+            cache._finish_write_through_ack(7)
+
+        self.assertEqual(
+            calls,
+            [
+                ("inc_host", 5),
+                ("inc_host", 10),
+                ("dec_device", 10, lock_params),
+                ("dec_host", 5, "host-5"),
+            ],
+        )
+
+    def test_device_direct_storage_locks_before_enqueue_and_releases_on_failure(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.hicache_storage_pass_prefix_keys = False
+        cache.ongoing_backup = {}
+        calls = []
+        spec = SimpleNamespace(
+            host_value="host-indices",
+            device_value="device-indices",
+            token_ids="tokens",
+            hash_value="hashes",
+            prefix_keys="prefixes",
+            comp_xfers={},
+        )
+        cache.tree_core = SimpleNamespace(
+            enable_storage=True,
+            build_storage_backup_spec=lambda node, pass_prefix: spec,
+        )
+        cache._build_sidecar_transfers = lambda phase, kv, comp: []
+        cache.inc_host_lock_ref = lambda node: SimpleNamespace(
+            to_dec_params=lambda: "host-lock"
+        )
+        cache.inc_lock_ref = lambda node: (
+            calls.append(("inc_device", node))
+            or SimpleNamespace(to_dec_params=lambda: "device-lock")
+        )
+        cache.dec_host_lock_ref = lambda node, params: calls.append(
+            ("dec_host", node, params)
+        )
+        cache.dec_lock_ref = lambda node, params: calls.append(
+            ("dec_device", node, params)
+        )
+
+        def write_storage(*args, **kwargs):
+            calls.append(("write_storage", kwargs["device_indices"]))
+            raise RuntimeError("enqueue failed")
+
+        cache.cache_controller = SimpleNamespace(
+            storage_device_direct=True,
+            write_storage=write_storage,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "enqueue failed"):
+            cache.write_backup_storage(5)
+
+        self.assertEqual(
+            calls,
+            [
+                ("inc_device", 5),
+                ("write_storage", "device-indices"),
+                ("dec_host", 5, "host-lock"),
+                ("dec_device", 5, "device-lock"),
+            ],
+        )
+        self.assertFalse(cache.ongoing_backup)
+
     def test_write_through_publish_list_is_ordered_ancestors_first(self):
         """One ack spanning several nodes publishes a parent before its children,
         whatever order the component transfers listed them in."""

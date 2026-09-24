@@ -1724,14 +1724,28 @@ class UnifiedRadixCache(BasePrefixCache):
         lock_node_id, lock_params, publish_node_ids = self.ongoing_write_through.pop(
             ack_id
         )
-        self.tree_core.finish_write_through(publish_node_ids, ack_id)
-        if lock_params is not None:
-            self.dec_lock_ref(lock_node_id, lock_params)
-        if self.enable_storage:
-            # Back up each fragment: after a split, lock_node only holds the
-            # suffix; the prefix fragment must be persisted as well.
-            for node_id in publish_node_ids:
-                self.write_backup_storage(node_id)
+        storage_handoff_locks = []
+        write_through_lock_released = False
+        try:
+            if self.enable_storage:
+                for node_id in publish_node_ids:
+                    storage_handoff_locks.append(
+                        (node_id, self.inc_host_lock_ref(node_id).to_dec_params())
+                    )
+            self.tree_core.finish_write_through(publish_node_ids, ack_id)
+            if lock_params is not None:
+                self.dec_lock_ref(lock_node_id, lock_params)
+                write_through_lock_released = True
+            if self.enable_storage:
+                # Back up each fragment: after a split, lock_node only holds the
+                # suffix; the prefix fragment must be persisted as well.
+                for node_id in publish_node_ids:
+                    self.write_backup_storage(node_id)
+        finally:
+            if lock_params is not None and not write_through_lock_released:
+                self.dec_lock_ref(lock_node_id, lock_params)
+            for node_id, host_lock_params in storage_handoff_locks:
+                self.dec_host_lock_ref(node_id, host_lock_params)
 
     def load_back(
         self,
@@ -1906,50 +1920,55 @@ class UnifiedRadixCache(BasePrefixCache):
     def write_backup_storage(self, node_id: NodeId) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
-        spec = self.tree_core.build_storage_backup_spec(
-            node_id, self.hicache_storage_pass_prefix_keys
-        )
-        if spec is None:
-            return
-
-        kv_xfer = PoolTransfer(
-            name=PoolName.KV,
-            host_indices=spec.host_value,
-            keys=spec.hash_value,
-        )
-        sidecar_xfers = self._build_sidecar_transfers(
-            CacheTransferPhase.BACKUP_STORAGE, kv_xfer, spec.comp_xfers
-        )
-        aux_xfers = [x for xfers in spec.comp_xfers.values() for x in xfers]
-        aux_xfers.extend(sidecar_xfers)
-
-        device_indices = (
-            spec.device_value
-            if getattr(self.cache_controller, "storage_device_direct", False)
-            else None
-        )
-        operation_id = self.cache_controller.write_storage(
-            spec.host_value,
-            spec.token_ids,
-            spec.hash_value,
-            spec.prefix_keys,
-            extra_pools=aux_xfers or None,
-            device_indices=device_indices,
-        )
         host_lock_params = self.inc_host_lock_ref(node_id).to_dec_params()
-        # A device-direct backup reads the payload from VRAM until the write
-        # acks, so pin the device value alongside the host value; the ack
-        # releases both.
-        device_lock_params = (
-            self.inc_lock_ref(node_id).to_dec_params()
-            if device_indices is not None
-            else None
-        )
-        self.ongoing_backup[operation_id] = (
-            node_id,
-            host_lock_params,
-            device_lock_params,
-        )
+        device_lock_params = None
+        backup_owns_locks = False
+        try:
+            spec = self.tree_core.build_storage_backup_spec(
+                node_id, self.hicache_storage_pass_prefix_keys
+            )
+            if spec is None:
+                return
+
+            kv_xfer = PoolTransfer(
+                name=PoolName.KV,
+                host_indices=spec.host_value,
+                keys=spec.hash_value,
+            )
+            sidecar_xfers = self._build_sidecar_transfers(
+                CacheTransferPhase.BACKUP_STORAGE, kv_xfer, spec.comp_xfers
+            )
+            aux_xfers = [x for xfers in spec.comp_xfers.values() for x in xfers]
+            aux_xfers.extend(sidecar_xfers)
+
+            device_indices = (
+                spec.device_value
+                if getattr(self.cache_controller, "storage_device_direct", False)
+                else None
+            )
+            # Device-direct storage can consume VRAM as soon as write_storage
+            # enqueues the operation, so acquire both pins before that handoff.
+            if device_indices is not None:
+                device_lock_params = self.inc_lock_ref(node_id).to_dec_params()
+            operation_id = self.cache_controller.write_storage(
+                spec.host_value,
+                spec.token_ids,
+                spec.hash_value,
+                spec.prefix_keys,
+                extra_pools=aux_xfers or None,
+                device_indices=device_indices,
+            )
+            self.ongoing_backup[operation_id] = (
+                node_id,
+                host_lock_params,
+                device_lock_params,
+            )
+            backup_owns_locks = True
+        finally:
+            if not backup_owns_locks:
+                self.dec_host_lock_ref(node_id, host_lock_params)
+                if device_lock_params is not None:
+                    self.dec_lock_ref(node_id, device_lock_params)
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)

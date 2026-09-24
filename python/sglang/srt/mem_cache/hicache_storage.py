@@ -753,6 +753,11 @@ class HiCacheFile(HiCacheStorage):
         fd = None
         try:
             if not self._evictor.reserve(suffixed, total, key=storage_key):
+                logger.warning(
+                    "HiCacheFile rejected storage write for key=%s bytes=%d",
+                    storage_key,
+                    total,
+                )
                 return False
             reserved = True
             fd = os.open(
@@ -1119,6 +1124,13 @@ class HiCacheFile(HiCacheStorage):
                         break
             if boundary:
                 hit_count[name] = boundary
+            elif kv_pages and transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                logger.warning(
+                    "HiCache storage found %d KV pages but no trailing %s sidecar; "
+                    "the prefix cannot be restored",
+                    kv_pages,
+                    name,
+                )
             final_pages = min(final_pages, boundary)
 
         return PoolTransferResult(final_pages, hit_count)
