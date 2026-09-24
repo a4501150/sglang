@@ -70,6 +70,10 @@ _current_stream_var: ContextVar[torch.Stream | None] = ContextVar(
 _forked_streams_var: ContextVar[set[torch.Stream] | None] = ContextVar(
     "forked_streams", default=None
 )
+# True while an eager_on_graph break body runs eagerly (between segment end and
+# the next _begin_new_segment). A nested eager_on_graph call in that window is
+# already running eagerly; a second break would end a segment that is not open.
+_in_eager_break_var: ContextVar[bool] = ContextVar("in_eager_break", default=False)
 
 
 def get_current_stream(device: torch.device | None = None) -> torch.Stream:
@@ -244,6 +248,11 @@ def eager_on_graph(
             capture = _current_capture_var.get()
             if capture is None:
                 return inner(*args, **kwargs)
+            if _in_eager_break_var.get():
+                # Nested break: an enclosing break is already running this
+                # region eagerly, so no segment is open to end. The outer
+                # break's replay_fn re-runs this body on every replay.
+                return inner(*args, **kwargs)
 
             # End the segment that captured up to this break point.
             capture._end_current_segment()
@@ -255,14 +264,18 @@ def eager_on_graph(
             if capture._barrier_fn is not None:
                 capture._barrier_fn()
 
-            # Run the break once so its outputs are allocated and their
-            # addresses recorded. A capture_stub replaces the body during
-            # capture (contents are never consumed; warmup and replay run
-            # the real inner), letting rank-coupled bodies skip the work.
-            if capture_stub is not None:
-                output = capture_stub(*args, **kwargs)
-            else:
-                output = inner(*args, **kwargs)
+            break_token = _in_eager_break_var.set(True)
+            try:
+                # Run the break once so its outputs are allocated and their
+                # addresses recorded. A capture_stub replaces the body during
+                # capture (contents are never consumed; warmup and replay run
+                # the real inner), letting rank-coupled bodies skip the work.
+                if capture_stub is not None:
+                    output = capture_stub(*args, **kwargs)
+                else:
+                    output = inner(*args, **kwargs)
+            finally:
+                _in_eager_break_var.reset(break_token)
 
             # Weak-ref captured inputs produced by graph segments. Their storage
             # is pinned by the segment CUDAGraphs' mempool use-count, so Python

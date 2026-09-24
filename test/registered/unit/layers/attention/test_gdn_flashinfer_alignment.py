@@ -7,6 +7,7 @@ from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     FlashInferGDNKernel,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -38,7 +39,7 @@ def _make_kernel_without_flashinfer() -> FlashInferGDNKernel:
     return kernel
 
 
-class TestFlashInferGDNAlignment(unittest.TestCase):
+class TestFlashInferGDNAlignment(CustomTestCase):
     def test_extend_writes_directly_to_preallocated_output(self):
         kernel = _make_kernel_without_flashinfer()
         kernel.use_state_pool = True
@@ -80,6 +81,48 @@ class TestFlashInferGDNAlignment(unittest.TestCase):
         self.assertEqual(result.data_ptr(), preallocated_output.data_ptr())
         torch.testing.assert_close(result, torch.full_like(result, 7.0))
         self.assertIsNone(checkpoints)
+        self.assertEqual(captured["use_cp"], "auto")
+
+    def test_extend_disables_cp_when_collecting_checkpoints(self):
+        kernel = _make_kernel_without_flashinfer()
+        kernel.use_state_pool = True
+        captured = {}
+
+        def fake_prefill(**kwargs):
+            captured.update(kwargs)
+            kwargs["output"].zero_()
+            kwargs["output_state"].copy_(kwargs["initial_state"])
+            return kwargs["output"], kwargs["output_state"]
+
+        kernel._prefill_fn = fake_prefill
+        q = torch.ones((1, 3, 1, 4), dtype=torch.bfloat16)
+        k = torch.ones_like(q)
+        v = torch.ones((1, 3, 2, 4), dtype=torch.bfloat16)
+        g = torch.zeros((1, 3, 2), dtype=torch.bfloat16)
+        beta = torch.ones_like(g)
+        ssm_states = torch.zeros((3, 2, 4, 4), dtype=torch.bfloat16)
+
+        with mock.patch(
+            "sglang.kernels.ops.attention.fla.l2norm.l2norm_fwd",
+            side_effect=lambda tensor, eps: tensor,
+        ):
+            _, _, checkpoints = kernel.extend(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states=ssm_states,
+                cache_indices=torch.tensor([1], dtype=torch.int32),
+                query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+                state_checkpoint_cu_starts=torch.tensor([0, 1]),
+                num_state_checkpoints=1,
+                state_checkpoint_every_n_tokens=64,
+                output=torch.empty_like(v),
+            )
+
+        self.assertFalse(captured["use_cp"])
+        self.assertEqual(checkpoints.shape, (1, 1, 2, 4, 4))
 
     def test_ratio8_bs1_split_view_reproduces_under_alignment(self):
         # In a BF16 [b_local(8)|a_local(8)] projection, a begins 16 bytes in;
@@ -447,9 +490,7 @@ class TestFlashInferGDNAlignment(unittest.TestCase):
         self.assertEqual(captured["A_log"].dtype, torch.float32)
         self.assertEqual(captured["A_log"].data_ptr() % 32, 0)
         self.assertEqual(captured["initial_state_indices"].data_ptr() % 32, 0)
-        torch.testing.assert_close(
-            captured["initial_state_indices"], cache_indices[:1]
-        )
+        torch.testing.assert_close(captured["initial_state_indices"], cache_indices[:1])
 
     def test_none_mode_requires_the_output_only_kernel(self):
         kernel = _make_kernel_without_flashinfer()
