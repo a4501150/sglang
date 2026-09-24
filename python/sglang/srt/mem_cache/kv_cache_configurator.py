@@ -66,6 +66,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     KVCache,
     MHATokenToKVPool,
+    MHATokenToKVPoolDynamicFP8,
     MHATokenToKVPoolMXFP8,
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
@@ -339,6 +340,17 @@ class KVCacheConfigurator:
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
+        if self.kv_cache_dtype_str == "fp8_e4m3_dynamic":
+            from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+
+            if (
+                not current_platform.is_cuda()
+                or parse_qsa_profile(self.model_config.hf_config) is None
+            ):
+                raise ValueError(
+                    "fp8_e4m3_dynamic KV cache is currently supported only by "
+                    "QSA models on CUDA."
+                )
         if current_platform.is_cpu() and self.kv_cache_dtype == torch.float8_e4m3fn:
             if self.use_mla_backend:
                 raise ValueError("CPU FP8 KV cache is only supported for MHA.")
@@ -1898,13 +1910,6 @@ class KVCacheConfigurator:
         quant_method = self._build_mha_quant_method(
             num_layers=len(full_attention_layer_ids)
         )
-        # MXFP8 KV cache needs the block-scaled pool (data + UE8M0 scale
-        # buffers) for the full-attention layers, same as the SWA branch.
-        full_pool_class = (
-            MHATokenToKVPoolMXFP8
-            if self.kv_cache_dtype_str == "mxfp8" and not self.use_mla_backend
-            else mha_pool_class
-        )
         from sglang.srt.layers.attention.qsa.config import (
             parse_qsa_profile,
         )
@@ -1913,6 +1918,17 @@ class KVCacheConfigurator:
         )
 
         qsa_profile = parse_qsa_profile(self.model_config.hf_config)
+        if self.kv_cache_dtype_str == "fp8_e4m3_dynamic":
+            if qsa_profile is None or self.use_mla_backend:
+                raise ValueError(
+                    "fp8_e4m3_dynamic KV cache is currently supported only by QSA."
+                )
+            full_pool_class = MHATokenToKVPoolDynamicFP8
+        elif self.kv_cache_dtype_str == "mxfp8" and not self.use_mla_backend:
+            # MXFP8 needs the block-scaled pool for full-attention layers.
+            full_pool_class = MHATokenToKVPoolMXFP8
+        else:
+            full_pool_class = mha_pool_class
         if qsa_profile is None:
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend

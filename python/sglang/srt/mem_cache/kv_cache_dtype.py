@@ -53,7 +53,11 @@ def configure_kv_cache_dtype(
             kv_cache_dtype = fp8_dtype
         else:
             kv_cache_dtype = torch.float8_e5m2
-    elif server_args_kv_cache_dtype == "fp8_e4m3":
+    elif server_args_kv_cache_dtype in ("fp8_e4m3", "fp8_e4m3_dynamic"):
+        if server_args_kv_cache_dtype == "fp8_e4m3_dynamic" and _is_hip:
+            raise ValueError(
+                "--kv-cache-dtype fp8_e4m3_dynamic is not supported on ROCm."
+            )
         if _is_hip:  # Using natively supported format
             kv_cache_dtype = fp8_dtype
         else:

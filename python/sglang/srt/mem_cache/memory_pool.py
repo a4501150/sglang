@@ -3677,6 +3677,163 @@ class PageMajorMHATokenToKVPool(MHATokenToKVPool):
         )
 
 
+class MHATokenToKVPoolDynamicFP8(MHATokenToKVPool):
+    """E4M3 KV cache with one FP32 descale per token and KV head."""
+
+    dynamic_fp8_kv_cache = True
+    FP8_MAX = 448.0
+
+    def _create_buffers_normal(self):
+        if self.use_hnd:
+            raise ValueError(
+                "Dynamic FP8 KV cache does not support SGLANG_USE_HND_KVCACHE."
+            )
+        if self.kv_cache_layout != "nhd":
+            raise ValueError(
+                "Dynamic FP8 KV cache requires the NHD cache layout, got "
+                f"{self.kv_cache_layout}."
+            )
+        super()._create_buffers_normal()
+        shape = (self.size + self.page_size, self.head_num)
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                self.k_scale_buffer = [
+                    torch.ones(shape, dtype=torch.float32, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+                self.v_scale_buffer = [
+                    torch.ones(shape, dtype=torch.float32, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+
+    def get_kv_scale_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        idx = layer_id - self.start_layer
+        return self.k_scale_buffer[idx], self.v_scale_buffer[idx]
+
+    @classmethod
+    def _quantize(cls, tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        values = tensor.float()
+        amax = values.abs().amax(dim=-1)
+        scale = torch.where(amax > 0, amax / cls.FP8_MAX, torch.ones_like(amax))
+        quantized = (values / scale.unsqueeze(-1)).clamp(-cls.FP8_MAX, cls.FP8_MAX)
+        return quantized.to(torch.float8_e4m3fn), scale
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc_info,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
+    ):
+        if dcp_kv_mask is not None:
+            raise NotImplementedError(
+                "Dynamic FP8 KV cache does not support DCP KV masks."
+            )
+        for name, scale in (("K", k_scale), ("V", v_scale)):
+            if scale is not None and not (
+                isinstance(scale, (int, float)) and scale == 1
+            ):
+                raise ValueError(
+                    f"Dynamic FP8 KV cache computes {name} scales at runtime; "
+                    "a static scale must not be supplied."
+                )
+
+        loc, _, _ = unwrap_write_loc(loc_info)
+        maybe_detect_oob(
+            loc, 0, self.size + self.page_size, "set_kv_buffer (MHA-dynamic-FP8)"
+        )
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
+        idx = layer_id - self.start_layer
+        quantized_k, dynamic_k_scale = self._quantize(cache_k)
+        quantized_v, dynamic_v_scale = self._quantize(cache_v)
+        if self.store_dtype != self.dtype:
+            quantized_k = quantized_k.view(self.store_dtype)
+            quantized_v = quantized_v.view(self.store_dtype)
+        self._store_kv_layer(idx, loc, quantized_k, quantized_v)
+        self.k_scale_buffer[idx][loc] = dynamic_k_scale
+        self.v_scale_buffer[idx][loc] = dynamic_v_scale
+
+    def set_kv_buffer_prefix_valid(self, *args, **kwargs):
+        raise NotImplementedError(
+            "prefix-valid commit is unsupported for dynamic FP8 KV cache "
+            "because it does not carry the per-token scale buffers."
+        )
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        assert not self.use_hnd
+        current_platform.synchronize()
+        kv_cache_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            kv_cache_cpu.append([])
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                kv_cache_cpu[-1].append(
+                    [
+                        self.k_buffer[layer_id][chunk_indices].to(
+                            "cpu", non_blocking=True
+                        ),
+                        self.v_buffer[layer_id][chunk_indices].to(
+                            "cpu", non_blocking=True
+                        ),
+                        self.k_scale_buffer[layer_id][chunk_indices].to(
+                            "cpu", non_blocking=True
+                        ),
+                        self.v_scale_buffer[layer_id][chunk_indices].to(
+                            "cpu", non_blocking=True
+                        ),
+                    ]
+                )
+        current_platform.synchronize()
+        return kv_cache_cpu
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        assert not self.use_hnd
+        current_platform.synchronize()
+        device = self.k_buffer[0].device
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                k_cpu, v_cpu, k_scale_cpu, v_scale_cpu = kv_cache_cpu[layer_id][
+                    i // chunk_size
+                ]
+                assert k_cpu.shape[0] == v_cpu.shape[0] == len(chunk_indices)
+                self.k_buffer[layer_id][chunk_indices] = k_cpu.to(
+                    device, non_blocking=True
+                )
+                self.v_buffer[layer_id][chunk_indices] = v_cpu.to(
+                    device, non_blocking=True
+                )
+                self.k_scale_buffer[layer_id][chunk_indices] = k_scale_cpu.to(
+                    device, non_blocking=True
+                )
+                self.v_scale_buffer[layer_id][chunk_indices] = v_scale_cpu.to(
+                    device, non_blocking=True
+                )
+        current_platform.synchronize()
+
+    def get_kv_scale_buf_infos(self):
+        tensors = self.k_scale_buffer + self.v_scale_buffer
+        return (
+            [tensor.data_ptr() for tensor in tensors],
+            [tensor.nbytes for tensor in tensors],
+            [tensor[0].nbytes * self.page_size for tensor in tensors],
+        )
+
+
 class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
     """MHA KV cache pool for MXFP8 block-scaled FP8.
 
@@ -4219,6 +4376,10 @@ class HybridLinearKVPool(KVCache):
         return getattr(self.full_kv_pool, "dsa_kv_cache_store_fp8", False)
 
     @property
+    def dynamic_fp8_kv_cache(self) -> bool:
+        return getattr(self.full_kv_pool, "dynamic_fp8_kv_cache", False)
+
+    @property
     def kv_cache_dim(self):
         return getattr(self.full_kv_pool, "kv_cache_dim", None)
 
@@ -4257,6 +4418,9 @@ class HybridLinearKVPool(KVCache):
 
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
+
+    def get_kv_scale_buf_infos(self):
+        return self.full_kv_pool.get_kv_scale_buf_infos()
 
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""

@@ -6,6 +6,56 @@ import torch
 import triton
 import triton.language as tl
 
+_FP8_DTYPES = (
+    torch.float8_e4m3fn,
+    torch.float8_e4m3fnuz,
+    torch.float8_e5m2,
+)
+
+
+def is_fp8_kv_dtype(dtype: torch.dtype) -> bool:
+    return dtype in _FP8_DTYPES
+
+
+def _validate_sparse_gqa_dtypes(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> bool:
+    """Return whether K/V are FP8 after validating the QSA compute contract."""
+
+    if k.dtype != v.dtype:
+        raise ValueError(f"QSA K/V dtypes must match, got {k.dtype} and {v.dtype}")
+    is_fp8 = is_fp8_kv_dtype(k.dtype)
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"QSA expects BF16/FP16 queries, got {q.dtype}")
+    if not is_fp8 and k.dtype != q.dtype:
+        raise ValueError(
+            f"QSA K/V must match query dtype {q.dtype} or use FP8, got {k.dtype}"
+        )
+    return is_fp8
+
+
+def _unit_scale(scale: Optional[float]) -> float:
+    return 1.0 if scale is None else float(scale)
+
+
+def _validate_dynamic_scale_buffers(k, v, k_scale_buffer, v_scale_buffer) -> bool:
+    if (k_scale_buffer is None) != (v_scale_buffer is None):
+        raise ValueError("dynamic K/V scale buffers must be supplied together")
+    if k_scale_buffer is None:
+        return False
+    expected_shape = k.shape[:2]
+    if (
+        tuple(k_scale_buffer.shape) != expected_shape
+        or tuple(v_scale_buffer.shape) != expected_shape
+    ):
+        raise ValueError("dynamic K/V scale buffers must be [tokens, kv_heads]")
+    if k_scale_buffer.device != k.device or v_scale_buffer.device != v.device:
+        raise ValueError("dynamic K/V scale buffers must be on the K/V device")
+    if k_scale_buffer.dtype != torch.float32 or v_scale_buffer.dtype != torch.float32:
+        raise ValueError("dynamic K/V scale buffers must use float32")
+    return True
+
+
 _H20_CONFIGS = [
     (32, (32, 8, 2)),
     (64, (64, 8, 2)),
@@ -35,6 +85,10 @@ def _sparse_gqa_prefill(
     indices,
     cu_seqlens,
     scale,
+    k_scale,
+    v_scale,
+    k_scale_buffer,
+    v_scale_buffer,
     topk,
     sq_m: tl.constexpr,
     sq_h: tl.constexpr,
@@ -45,6 +99,10 @@ def _sparse_gqa_prefill(
     sv_n: tl.constexpr,
     sv_h: tl.constexpr,
     sv_d: tl.constexpr,
+    sks_n: tl.constexpr,
+    sks_h: tl.constexpr,
+    svs_n: tl.constexpr,
+    svs_h: tl.constexpr,
     so_m: tl.constexpr,
     so_h: tl.constexpr,
     so_d: tl.constexpr,
@@ -56,6 +114,8 @@ def _sparse_gqa_prefill(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    KV_IS_FP8: tl.constexpr,
+    DYNAMIC_KV_SCALE: tl.constexpr,
 ):
     batch_group = tl.program_id(1)
     group = batch_group % NUM_KV_HEADS
@@ -97,18 +157,47 @@ def _sparse_gqa_prefill(
             mask=valid[None, :],
             other=0.0,
         )
+        if KV_IS_FP8:
+            # Triton does not support the BF16/FP16 x FP8 dot used by QSA.
+            # Widen cached K/V on load; bandwidth remains FP8 while MMA stays
+            # in the model dtype. Per-layer scales reconstruct calibrated KV.
+            keys = keys.to(q_values.dtype)
         values = tl.load(
             v_base + token[:, None] * sv_n + offs_d[None, :] * sv_d,
             mask=valid[:, None],
             other=0.0,
         )
-        scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
+        if KV_IS_FP8:
+            values = values.to(q_values.dtype)
+        if DYNAMIC_KV_SCALE:
+            dynamic_k_scale = tl.load(
+                k_scale_buffer + (seq_start + token) * sks_n + group * sks_h,
+                mask=valid,
+                other=1.0,
+            )
+            dynamic_v_scale = tl.load(
+                v_scale_buffer + (seq_start + token) * svs_n + group * svs_h,
+                mask=valid,
+                other=1.0,
+            )
+            keys *= dynamic_k_scale[None, :].to(keys.dtype)
+            values *= dynamic_v_scale[:, None].to(values.dtype)
+        scores = tl.dot(q_values, keys)
+        if KV_IS_FP8 and not DYNAMIC_KV_SCALE:
+            scores *= k_scale
+        scores = tl.where(valid[None, :], scores, -float("inf"))
         next_max = tl.maximum(max_value, tl.max(scores, 1))
         alpha = tl.math.exp2(max_value - next_max)
         probabilities = tl.math.exp2(scores - next_max[:, None])
-        accumulator = tl.dot(
-            probabilities.to(values.dtype), values, accumulator * alpha[:, None]
-        )
+        if KV_IS_FP8:
+            accumulator = (
+                accumulator * alpha[:, None]
+                + tl.dot(probabilities.to(values.dtype), values) * v_scale
+            )
+        else:
+            accumulator = tl.dot(
+                probabilities.to(values.dtype), values, accumulator * alpha[:, None]
+            )
         normalizer = normalizer * alpha + tl.sum(probabilities, 1)
         max_value = next_max
     output = accumulator / normalizer[:, None]
@@ -122,7 +211,27 @@ def _sparse_gqa_prefill(
     )
 
 
-def sparse_gqa_fwd_interface_triton(q, k, v, max_seqlen_k, indices, cu_seqlens, scale):
+def sparse_gqa_fwd_interface_triton(
+    q,
+    k,
+    v,
+    max_seqlen_k,
+    indices,
+    cu_seqlens,
+    scale,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    k_scale_buffer: Optional[torch.Tensor] = None,
+    v_scale_buffer: Optional[torch.Tensor] = None,
+):
+    kv_is_fp8 = _validate_sparse_gqa_dtypes(q, k, v)
+    dynamic_kv_scale = _validate_dynamic_scale_buffers(
+        k, v, k_scale_buffer, v_scale_buffer
+    )
+    if dynamic_kv_scale and (
+        _unit_scale(k_scale) != 1.0 or _unit_scale(v_scale) != 1.0
+    ):
+        raise ValueError("static and dynamic K/V scales cannot be combined")
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
@@ -137,6 +246,10 @@ def sparse_gqa_fwd_interface_triton(q, k, v, max_seqlen_k, indices, cu_seqlens, 
         indices,
         cu_seqlens,
         scale,
+        _unit_scale(k_scale),
+        _unit_scale(v_scale),
+        k_scale_buffer if dynamic_kv_scale else k,
+        v_scale_buffer if dynamic_kv_scale else v,
         indices.shape[-1],
         q.stride(0),
         q.stride(1),
@@ -147,6 +260,10 @@ def sparse_gqa_fwd_interface_triton(q, k, v, max_seqlen_k, indices, cu_seqlens, 
         v.stride(0),
         v.stride(1),
         v.stride(2),
+        k_scale_buffer.stride(0) if dynamic_kv_scale else 0,
+        k_scale_buffer.stride(1) if dynamic_kv_scale else 0,
+        v_scale_buffer.stride(0) if dynamic_kv_scale else 0,
+        v_scale_buffer.stride(1) if dynamic_kv_scale else 0,
         out.stride(0),
         out.stride(1),
         out.stride(2),
@@ -158,6 +275,8 @@ def sparse_gqa_fwd_interface_triton(q, k, v, max_seqlen_k, indices, cu_seqlens, 
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
+        KV_IS_FP8=kv_is_fp8,
+        DYNAMIC_KV_SCALE=dynamic_kv_scale,
         num_warps=warps,
         num_stages=stages,
     )
@@ -175,6 +294,10 @@ def _sparse_gqa_chunk_prefill(
     cu_k,
     kv_lens,
     scale,
+    k_scale,
+    v_scale,
+    k_scale_buffer,
+    v_scale_buffer,
     topk,
     sq_m: tl.constexpr,
     sq_h: tl.constexpr,
@@ -185,6 +308,10 @@ def _sparse_gqa_chunk_prefill(
     sv_n: tl.constexpr,
     sv_h: tl.constexpr,
     sv_d: tl.constexpr,
+    sks_n: tl.constexpr,
+    sks_h: tl.constexpr,
+    svs_n: tl.constexpr,
+    svs_h: tl.constexpr,
     so_m: tl.constexpr,
     so_h: tl.constexpr,
     so_d: tl.constexpr,
@@ -196,6 +323,8 @@ def _sparse_gqa_chunk_prefill(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    KV_IS_FP8: tl.constexpr,
+    DYNAMIC_KV_SCALE: tl.constexpr,
 ):
     query_relative = tl.program_id(0).to(tl.int64)
     batch_group = tl.program_id(1)
@@ -243,20 +372,38 @@ def _sparse_gqa_chunk_prefill(
             mask=valid[:, None],
             other=0.0,
         )
-        # The chunk-prefill K/V tensors are gathered from the KV pool and can
-        # therefore carry the FP8 storage dtype, which Triton's dot rejects
-        # (`Unsupported rhs dtype fp8e4nv`). Convert to Q's dtype; the QSA
-        # backend writes the pool without per-tensor k/v scales, so this is a
-        # plain cast (no-op for BF16 pools).
-        keys = keys.to(q_values.dtype)
-        values = values.to(q_values.dtype)
-        scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
+        if KV_IS_FP8:
+            keys = keys.to(q_values.dtype)
+            values = values.to(q_values.dtype)
+        if DYNAMIC_KV_SCALE:
+            dynamic_k_scale = tl.load(
+                k_scale_buffer + (k_start + token) * sks_n + group * sks_h,
+                mask=valid,
+                other=1.0,
+            )
+            dynamic_v_scale = tl.load(
+                v_scale_buffer + (k_start + token) * svs_n + group * svs_h,
+                mask=valid,
+                other=1.0,
+            )
+            keys *= dynamic_k_scale[None, :].to(keys.dtype)
+            values *= dynamic_v_scale[:, None].to(values.dtype)
+        scores = tl.dot(q_values, keys)
+        if KV_IS_FP8 and not DYNAMIC_KV_SCALE:
+            scores *= k_scale
+        scores = tl.where(valid[None, :], scores, -float("inf"))
         next_max = tl.maximum(max_value, tl.max(scores, 1))
         alpha = tl.math.exp2(max_value - next_max)
         probabilities = tl.math.exp2(scores - next_max[:, None])
-        accumulator = tl.dot(
-            probabilities.to(values.dtype), values, accumulator * alpha[:, None]
-        )
+        if KV_IS_FP8:
+            accumulator = (
+                accumulator * alpha[:, None]
+                + tl.dot(probabilities.to(values.dtype), values) * v_scale
+            )
+        else:
+            accumulator = tl.dot(
+                probabilities.to(values.dtype), values, accumulator * alpha[:, None]
+            )
         normalizer = normalizer * alpha + tl.sum(probabilities, 1)
         max_value = next_max
     output = accumulator / normalizer[:, None]
@@ -270,8 +417,32 @@ def _sparse_gqa_chunk_prefill(
     )
 
 
-def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
+def sparse_gqa_fwd_interface_triton_ck(
+    q,
+    k,
+    v,
+    indices,
+    cu_q,
+    cu_k,
+    kv_lens,
+    scale,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    k_scale_buffer: Optional[torch.Tensor] = None,
+    v_scale_buffer: Optional[torch.Tensor] = None,
+):
+    kv_is_fp8 = _validate_sparse_gqa_dtypes(q, k, v)
+    dynamic_kv_scale = _validate_dynamic_scale_buffers(
+        k, v, k_scale_buffer, v_scale_buffer
+    )
+    if dynamic_kv_scale and (
+        _unit_scale(k_scale) != 1.0 or _unit_scale(v_scale) != 1.0
+    ):
+        raise ValueError("static and dynamic K/V scales cannot be combined")
     k, v = k.contiguous(), v.contiguous()
+    if dynamic_kv_scale:
+        k_scale_buffer = k_scale_buffer.contiguous()
+        v_scale_buffer = v_scale_buffer.contiguous()
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
@@ -289,6 +460,10 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
         cu_k,
         kv_lens,
         scale,
+        _unit_scale(k_scale),
+        _unit_scale(v_scale),
+        k_scale_buffer if dynamic_kv_scale else k,
+        v_scale_buffer if dynamic_kv_scale else v,
         indices.shape[-1],
         q.stride(0),
         q.stride(1),
@@ -299,6 +474,10 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
         v.stride(0),
         v.stride(1),
         v.stride(2),
+        k_scale_buffer.stride(0) if dynamic_kv_scale else 0,
+        k_scale_buffer.stride(1) if dynamic_kv_scale else 0,
+        v_scale_buffer.stride(0) if dynamic_kv_scale else 0,
+        v_scale_buffer.stride(1) if dynamic_kv_scale else 0,
         out.stride(0),
         out.stride(1),
         out.stride(2),
@@ -310,6 +489,8 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
+        KV_IS_FP8=kv_is_fp8,
+        DYNAMIC_KV_SCALE=dynamic_kv_scale,
         num_warps=warps,
         num_stages=stages,
     )
@@ -435,15 +616,23 @@ def _compact_kv(
     cu_k,
     out_k,
     out_v,
+    k_scale,
+    v_scale,
+    k_scale_buffer,
+    v_scale_buffer,
     topk: tl.constexpr,
     heads: tl.constexpr,
     dim: tl.constexpr,
     req_stride: tl.constexpr,
     idx_stride: tl.constexpr,
+    k_scale_stride: tl.constexpr,
+    v_scale_stride: tl.constexpr,
     pad_cols,
     BLOCK_TOPK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     ZERO_FILL: tl.constexpr,
+    DEQUANTIZE_FP8: tl.constexpr,
+    DYNAMIC_KV_SCALE: tl.constexpr,
 ):
     batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
@@ -477,21 +666,24 @@ def _compact_kv(
         store_mask = (cols < pad_cols)[:, None] & (dims[None, :] < dim)
     else:
         store_mask = load_mask
-    # Dequantize while gathering: the scratch is allocated in the query dtype, so an
-    # FP8 pool is read as fp8 and stored as bf16. The QSA backend writes the pool
-    # without per-tensor k/v scales (see set_kv_buffer calls in
-    # qwen_sparse_attn_backend.py), so no scale is applied here either.
     out_dtype = out_k.dtype.element_ty
-    tl.store(
-        out_k + dst,
-        tl.load(k + src, mask=load_mask, other=0.0).to(out_dtype),
-        mask=store_mask,
-    )
-    tl.store(
-        out_v + dst,
-        tl.load(v + src, mask=load_mask, other=0.0).to(out_dtype),
-        mask=store_mask,
-    )
+    k_values = tl.load(k + src, mask=load_mask, other=0.0)
+    v_values = tl.load(v + src, mask=load_mask, other=0.0)
+    if DEQUANTIZE_FP8:
+        if DYNAMIC_KV_SCALE:
+            dynamic_k_scale = tl.load(
+                k_scale_buffer + slots * k_scale_stride + head, mask=valid, other=1.0
+            )
+            dynamic_v_scale = tl.load(
+                v_scale_buffer + slots * v_scale_stride + head, mask=valid, other=1.0
+            )
+            k_values = k_values.to(tl.float32) * dynamic_k_scale[:, None]
+            v_values = v_values.to(tl.float32) * dynamic_v_scale[:, None]
+        else:
+            k_values = k_values.to(tl.float32) * k_scale
+            v_values = v_values.to(tl.float32) * v_scale
+    tl.store(out_k + dst, k_values.to(out_dtype), mask=store_mask)
+    tl.store(out_v + dst, v_values.to(out_dtype), mask=store_mask)
 
 
 def qwen_sparse_valid_counts_triton(seq_lens, indices, counts, batch, topk):
@@ -520,6 +712,10 @@ def qwen_sparse_kv_extraction_compact_triton(
     batch,
     topk,
     zero_fill_cols: int = 0,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    k_scale_buffer: Optional[torch.Tensor] = None,
+    v_scale_buffer: Optional[torch.Tensor] = None,
 ):
     """Gather the selected K/V rows into ``out_k``/``out_v``.
 
@@ -531,12 +727,27 @@ def qwen_sparse_kv_extraction_compact_triton(
     the varlen fallback, whose rows are packed back-to-back.
 
     ``out_k``/``out_v`` may use a wider dtype than the pool (bf16 scratch for an FP8
-    pool); rows are converted while gathering.
+    pool); rows are converted and descaled while gathering.
 
     Both layouts assume the valid entries of each ``indices`` row are contiguous at
     the front (``expand_qsa_block_indices`` sorts them that way): ``valid_count`` is a
     count, not a mask, so a ``-1`` in the middle of a row would shift the packing.
     """
+    if k.dtype != v.dtype or out_k.dtype != out_v.dtype:
+        raise ValueError("QSA compact K/V input and output dtype pairs must match")
+    dequantize_fp8 = is_fp8_kv_dtype(k.dtype) and not is_fp8_kv_dtype(out_k.dtype)
+    dynamic_kv_scale = _validate_dynamic_scale_buffers(
+        k, v, k_scale_buffer, v_scale_buffer
+    )
+    if dynamic_kv_scale and (
+        _unit_scale(k_scale) != 1.0 or _unit_scale(v_scale) != 1.0
+    ):
+        raise ValueError("static and dynamic K/V scales cannot be combined")
+    if dynamic_kv_scale and not dequantize_fp8:
+        raise ValueError("dynamic FP8 scales require a non-FP8 compact output")
+    if dynamic_kv_scale:
+        k_scale_buffer = k_scale_buffer.contiguous()
+        v_scale_buffer = v_scale_buffer.contiguous()
     _, heads, dim = k.shape
     block_topk = 16
     zero_fill = zero_fill_cols > 0
@@ -551,20 +762,29 @@ def qwen_sparse_kv_extraction_compact_triton(
         cu_k,
         out_k,
         out_v,
+        _unit_scale(k_scale),
+        _unit_scale(v_scale),
+        k_scale_buffer if dynamic_kv_scale else k,
+        v_scale_buffer if dynamic_kv_scale else v,
         topk,
         heads,
         dim,
         req_to_token.stride(0),
         indices.stride(0),
+        k_scale_buffer.stride(0) if dynamic_kv_scale else 0,
+        v_scale_buffer.stride(0) if dynamic_kv_scale else 0,
         num_cols,
         BLOCK_TOPK=block_topk,
         BLOCK_D=triton.next_power_of_2(dim),
         ZERO_FILL=zero_fill,
+        DEQUANTIZE_FP8=dequantize_fp8,
+        DYNAMIC_KV_SCALE=dynamic_kv_scale,
         num_warps=8,
     )
 
 
 __all__ = [
+    "is_fp8_kv_dtype",
     "qwen_sparse_fa2_cu_seqlens_triton",
     "qwen_sparse_valid_counts_triton",
     "qwen_sparse_kv_extraction_compact_triton",

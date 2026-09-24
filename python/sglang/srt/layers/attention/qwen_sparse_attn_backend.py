@@ -30,6 +30,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     compressed_decode_view,
 )
 from sglang.srt.layers.attention.qsa.sparse_attn import (
+    is_fp8_kv_dtype,
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_valid_counts_triton,
@@ -220,6 +221,45 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+
+    @staticmethod
+    def _kv_descales(layer, kv_dtype: torch.dtype) -> Tuple[float, float]:
+        if not is_fp8_kv_dtype(kv_dtype):
+            return 1.0, 1.0
+        k_scale = getattr(layer, "k_scale_float", None)
+        v_scale = getattr(layer, "v_scale_float", None)
+        k_scale = 1.0 if k_scale is None else float(k_scale)
+        v_scale = 1.0 if v_scale is None else float(v_scale)
+        return (
+            k_scale if k_scale > 0.0 else 1.0,
+            v_scale if v_scale > 0.0 else 1.0,
+        )
+
+    def _kv_scale_inputs(self, layer, kv_dtype: torch.dtype):
+        pool = getattr(self, "token_to_kv_pool", None)
+        if getattr(pool, "dynamic_fp8_kv_cache", False):
+            k_scale_buffer, v_scale_buffer = pool.get_kv_scale_buffer(layer.layer_id)
+            return 1.0, 1.0, k_scale_buffer, v_scale_buffer
+        k_scale, v_scale = self._kv_descales(layer, kv_dtype)
+        return k_scale, v_scale, None, None
+
+    def _store_kv(self, layer, loc, k: torch.Tensor, v: torch.Tensor) -> None:
+        if getattr(self.token_to_kv_pool, "dynamic_fp8_kv_cache", False):
+            self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v)
+            return
+        cache_dtype = getattr(self.token_to_kv_pool, "dtype", k.dtype)
+        if not is_fp8_kv_dtype(cache_dtype):
+            self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v)
+            return
+        k_scale, v_scale = self._kv_descales(layer, cache_dtype)
+        if k_scale == 1.0 and v_scale == 1.0:
+            self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v)
+            return
+        # MHATokenToKVPool applies non-unit scales in-place before casting.
+        # Preserve the current K/V because prefill consumes them after the write.
+        self.token_to_kv_pool.set_kv_buffer(
+            layer, loc, k.clone(), v.clone(), k_scale, v_scale
+        )
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -1274,9 +1314,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            self._store_kv(layer, forward_batch.out_cache_loc, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
         num_valid_rows = topk_indices.shape[0]
@@ -1297,13 +1335,35 @@ class QwenSparseAttnBackend(AttentionBackend):
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
             pool = self.token_to_kv_pool
-            output = qsa_sparse_attention(
-                q,
-                pool.get_key_buffer(layer.layer_id),
-                pool.get_value_buffer(layer.layer_id),
-                slots,
-                layer.scaling,
+            k_buffer = pool.get_key_buffer(layer.layer_id)
+            v_buffer = pool.get_value_buffer(layer.layer_id)
+            k_scale, v_scale, k_scale_buffer, v_scale_buffer = self._kv_scale_inputs(
+                layer, k_buffer.dtype
             )
+            if k_scale_buffer is not None:
+                output = qsa_sparse_attention(
+                    q,
+                    k_buffer,
+                    v_buffer,
+                    slots,
+                    layer.scaling,
+                    k_scale_buffer=k_scale_buffer,
+                    v_scale_buffer=v_scale_buffer,
+                )
+            elif k_scale == 1.0 and v_scale == 1.0:
+                output = qsa_sparse_attention(
+                    q, k_buffer, v_buffer, slots, layer.scaling
+                )
+            else:
+                output = qsa_sparse_attention(
+                    q,
+                    k_buffer,
+                    v_buffer,
+                    slots,
+                    layer.scaling,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
             return self._pad_extend_output(output, num_output_rows)
 
         topk_indices = topk_indices.to(torch.int32).contiguous()
@@ -1333,20 +1393,27 @@ class QwenSparseAttnBackend(AttentionBackend):
         pool = self.token_to_kv_pool
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
+        k_scale, v_scale, k_scale_buffer, v_scale_buffer = self._kv_scale_inputs(
+            layer, k_buffer.dtype
+        )
         req_to_token = self.req_to_token_pool.req_to_token
         req_indices = forward_batch.req_pool_indices.tolist()
-        k_parts = [
-            k_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
+        slot_parts = [
+            req_to_token[req_indices[i], : sequence_lens[i]].long()
             for i in range(len(sequence_lens))
         ]
-        v_parts = [
-            v_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
+        k_parts = [k_buffer.index_select(0, slots) for slots in slot_parts]
+        v_parts = [v_buffer.index_select(0, slots) for slots in slot_parts]
+        k_scale_parts = (
+            [k_scale_buffer.index_select(0, slots) for slots in slot_parts]
+            if k_scale_buffer is not None
+            else None
+        )
+        v_scale_parts = (
+            [v_scale_buffer.index_select(0, slots) for slots in slot_parts]
+            if v_scale_buffer is not None
+            else None
+        )
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
@@ -1360,6 +1427,14 @@ class QwenSparseAttnBackend(AttentionBackend):
             cu_seqlens_k,
             sequence_lens_tensor,
             layer.scaling,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            k_scale_buffer=(
+                torch.cat(k_scale_parts) if k_scale_parts is not None else None
+            ),
+            v_scale_buffer=(
+                torch.cat(v_scale_parts) if v_scale_parts is not None else None
+            ),
         )
         return self._pad_extend_output(output, num_output_rows)
 
@@ -1452,6 +1527,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             q.dtype,
             k_buffer.device,
         )
+        k_scale, v_scale, k_scale_buffer, v_scale_buffer = self._kv_scale_inputs(
+            layer, k_buffer.dtype
+        )
         qwen_sparse_kv_extraction_compact_triton(
             k_buffer,
             v_buffer,
@@ -1469,6 +1547,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch,
             topk,
             zero_fill_cols=stride,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            k_scale_buffer=k_scale_buffer,
+            v_scale_buffer=v_scale_buffer,
         )
         num_kv_heads = k_buffer.shape[1]
         head_dim = k_buffer.shape[2]
@@ -1512,9 +1594,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            self._store_kv(layer, forward_batch.out_cache_loc, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
@@ -1531,7 +1611,33 @@ class QwenSparseAttnBackend(AttentionBackend):
         if not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
-            output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
+            k_scale, v_scale, k_scale_buffer, v_scale_buffer = self._kv_scale_inputs(
+                layer, k_buffer.dtype
+            )
+            if k_scale_buffer is not None:
+                output = qsa_sparse_attention(
+                    q,
+                    k_buffer,
+                    v_buffer,
+                    slots,
+                    layer.scaling,
+                    k_scale_buffer=k_scale_buffer,
+                    v_scale_buffer=v_scale_buffer,
+                )
+            elif k_scale == 1.0 and v_scale == 1.0:
+                output = qsa_sparse_attention(
+                    q, k_buffer, v_buffer, slots, layer.scaling
+                )
+            else:
+                output = qsa_sparse_attention(
+                    q,
+                    k_buffer,
+                    v_buffer,
+                    slots,
+                    layer.scaling,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
             return output.reshape(q.shape[0], -1)
 
         metadata = self._resolve_metadata(forward_batch)
@@ -1581,6 +1687,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             q.dtype,
             k_buffer.device,
         )
+        k_scale, v_scale, k_scale_buffer, v_scale_buffer = self._kv_scale_inputs(
+            layer, k_buffer.dtype
+        )
         qwen_sparse_kv_extraction_compact_triton(
             k_buffer,
             v_buffer,
@@ -1597,6 +1706,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             packed_v,
             batch,
             topk,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            k_scale_buffer=k_scale_buffer,
+            v_scale_buffer=v_scale_buffer,
         )
         if is_hip():
             relative_indices = torch.arange(

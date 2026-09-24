@@ -1354,6 +1354,7 @@ def setup_state_kv_args(
     from sglang.srt.mem_cache.memory_pool import (
         DSATokenToKVPool,
         HybridLinearKVPool,
+        MHATokenToKVPoolDynamicFP8,
         MHATokenToKVPoolMXFP8,
         MiniMaxSparseKVPool,
     )
@@ -1389,7 +1390,16 @@ def setup_state_kv_args(
                 tail_item_lens,
             )
 
-    if isinstance(token_to_kv_pool, MHATokenToKVPoolMXFP8):
+    has_separate_kv_scales = isinstance(
+        token_to_kv_pool, (MHATokenToKVPoolDynamicFP8, MHATokenToKVPoolMXFP8)
+    ) or (
+        isinstance(token_to_kv_pool, HybridLinearKVPool)
+        and isinstance(
+            token_to_kv_pool.full_kv_pool,
+            (MHATokenToKVPoolDynamicFP8, MHATokenToKVPoolMXFP8),
+        )
+    )
+    if has_separate_kv_scales:
         append_state_component(
             kv_args,
             StateType.BLOCK_SCALE,
