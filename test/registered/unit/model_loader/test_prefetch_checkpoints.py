@@ -359,6 +359,194 @@ class TestPrefetchCheckpoints(CustomTestCase):
         self.assertEqual(events, ["close", "drop:model.safetensors"])
 
 
+class TestPrefetchExclusion(CustomTestCase):
+    """Model-provided prefetch exclusions (Source.weight_loader_prefetch_-
+    exclude_files): a model that serves some checkpoint files itself at
+    gather time must be skipped by both prefetch paths while weight
+    iteration stays unchanged and every other file is still prefetched."""
+
+    def _create_files(self, tmpdir, num_shards=3):
+        paths = []
+        for i in range(num_shards):
+            tensors = {
+                f"layer{i}.weight": torch.randn(32, 32),
+                f"layer{i}.bias": torch.randn(32),
+            }
+            path = os.path.join(tmpdir, f"model-{i:05d}.safetensors")
+            safetensors.torch.save_file(tensors, path)
+            paths.append(path)
+        return paths
+
+    def _run(self, make_iterator, paths, exclude):
+        submitted = []
+
+        def capture(path, cancel_event=None):
+            submitted.append(path)
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch("threading.Thread", _InlineThread),
+            patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
+            patch("concurrent.futures.wait", side_effect=_wait_all),
+            patch(
+                "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
+                side_effect=capture,
+            ),
+            patch("sglang.srt.model_loader.weight_utils.logger.warning") as warning,
+        ):
+            loaded = dict(make_iterator(paths, exclude))
+        return loaded, submitted, warning
+
+    def _makers(self):
+        return {
+            "single": lambda paths, exclude: safetensors_weights_iterator(
+                paths, prefetch=True, prefetch_exclude_files=exclude
+            ),
+            "buffered": lambda paths, exclude: (
+                buffered_multi_thread_safetensors_weights_iterator(
+                    paths, max_workers=2, prefetch=True, prefetch_exclude_files=exclude
+                )
+            ),
+        }
+
+    def test_iterator_prefetch_skips_excluded_files_only(self):
+        for name, make in self._makers().items():
+            with (
+                self.subTest(iterator=name),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                paths = self._create_files(tmpdir)
+                loaded, submitted, warning = self._run(make, paths, [paths[1]])
+                # Only the matching file is skipped; all others prefetch.
+                self.assertEqual(sorted(submitted), sorted([paths[0], paths[2]]))
+                # Weight iteration is unchanged: every file's tensors load.
+                self.assertEqual(
+                    sorted(loaded),
+                    sorted(
+                        f"layer{i}.{part}"
+                        for i in range(3)
+                        for part in ("weight", "bias")
+                    ),
+                )
+                warning.assert_called_once()
+                self.assertEqual(
+                    warning.call_args.args[0],
+                    "Skipping checkpoint prefetch for %d file(s) served directly by "
+                    "the model at gather time: %s",
+                )
+                self.assertEqual(warning.call_args.args[1], 1)
+                self.assertIn(os.path.basename(paths[1]), warning.call_args.args[2])
+
+    def test_exclusion_matches_through_symlinked_paths(self):
+        for name, make in self._makers().items():
+            with (
+                self.subTest(iterator=name),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                paths = self._create_files(tmpdir)
+                link = os.path.join(tmpdir, "link")
+                os.symlink(tmpdir, link)
+                excluded_link = os.path.join(link, os.path.basename(paths[2]))
+                _, submitted, _ = self._run(make, paths, [excluded_link])
+                self.assertEqual(sorted(submitted), sorted([paths[0], paths[1]]))
+
+    def test_tensor_filter_runs_before_safetensors_materialization(self):
+        for name in self._makers():
+            with (
+                self.subTest(iterator=name),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                paths = self._create_files(tmpdir)
+                if name == "single":
+                    iterator = safetensors_weights_iterator(
+                        paths, skip_tensor=lambda key: key.endswith(".weight")
+                    )
+                else:
+                    iterator = buffered_multi_thread_safetensors_weights_iterator(
+                        paths,
+                        max_workers=2,
+                        skip_tensor=lambda key: key.endswith(".weight"),
+                    )
+                self.assertEqual(
+                    sorted(dict(iterator)),
+                    [f"layer{i}.bias" for i in range(3)],
+                )
+
+    def test_no_exclusions_prefetches_everything(self):
+        """Control: without exclusions both paths behave exactly as before."""
+        for name, make in self._makers().items():
+            for exclude in (None, []):
+                with (
+                    self.subTest(iterator=name, exclude=exclude),
+                    tempfile.TemporaryDirectory() as tmpdir,
+                ):
+                    paths = self._create_files(tmpdir)
+                    loaded, submitted, warning = self._run(make, paths, exclude)
+                    self.assertEqual(sorted(submitted), sorted(paths))
+                    self.assertEqual(len(loaded), 6)
+                    warning.assert_not_called()
+
+    def _start_startup_prefetch(self, exclude, extra_files=()):
+        source = DefaultModelLoader.Source(
+            model_or_path="/dummy",
+            revision=None,
+            fall_back_to_pt=False,
+            weight_loader_prefetch_exclude_files=exclude,
+        )
+        resolved = DefaultModelLoader.ResolvedSource(
+            source=source,
+            hf_folder="/dummy",
+            weight_files=tuple(
+                ["/dummy/model-00001.safetensors", "/dummy/ple.safetensors"]
+                + list(extra_files)
+            ),
+            use_safetensors=True,
+        )
+        with patch(
+            "sglang.srt.model_loader.loader._prefetch_all_checkpoints"
+        ) as prefetch:
+            DefaultModelLoader.start_checkpoint_prefetch((resolved,), num_threads=2)
+        return prefetch.call_args.args[0], prefetch
+
+    def test_startup_overlap_prefetch_skips_excluded_files_only(self):
+        files, prefetch = self._start_startup_prefetch(["/dummy/ple.safetensors"])
+        self.assertEqual(files, ["/dummy/model-00001.safetensors"])
+        prefetch.assert_called_once()
+        self.assertEqual(prefetch.call_args.kwargs["num_threads"], 2)
+
+    def test_startup_overlap_prefetch_unchanged_without_exclusions(self):
+        files, _ = self._start_startup_prefetch(None)
+        self.assertEqual(
+            files, ["/dummy/model-00001.safetensors", "/dummy/ple.safetensors"]
+        )
+
+    def test_source_init_new_populates_exclusions(self):
+        model_config = SimpleNamespace(model_path="/dummy", revision=None)
+
+        def skip_tensor(name):
+            return name.endswith(".ple")
+
+        model = SimpleNamespace(
+            weight_loader_prefetch_exclude_files=["/dummy/ple.safetensors"],
+            weight_loader_skip_tensor=skip_tensor,
+        )
+        source = DefaultModelLoader.Source.init_new(model_config, model)
+        self.assertEqual(
+            source.weight_loader_prefetch_exclude_files,
+            ["/dummy/ple.safetensors"],
+        )
+        self.assertIs(source.weight_loader_skip_tensor, skip_tensor)
+        # A model without the hook (or with an empty set: e.g. the built-in
+        # pinned/file PLE offloads) leaves the source exactly as before.
+        for plain in (
+            SimpleNamespace(),
+            SimpleNamespace(weight_loader_prefetch_exclude_files=[]),
+        ):
+            source = DefaultModelLoader.Source.init_new(model_config, plain)
+            self.assertIsNone(source.weight_loader_prefetch_exclude_files)
+            self.assertIsNone(source.weight_loader_skip_tensor)
+
+
 class TestPrefetchDispatch(CustomTestCase):
     """Verify _get_weights_iterator dispatches to the right safetensors
     iterator based on prefetch / multi-thread config.
@@ -376,13 +564,15 @@ class TestPrefetchDispatch(CustomTestCase):
         )
         return DefaultModelLoader(load_config)
 
-    def _make_source(self):
+    def _make_source(self, exclude=None, skip_tensor=None):
         # model_config=None skips maybe_add_mtp_safetensors. A real Source
         # (not a stand-in) so new fields with defaults are picked up.
         return DefaultModelLoader.Source(
             model_or_path="/dummy",
             revision=None,
             fall_back_to_pt=False,
+            weight_loader_prefetch_exclude_files=exclude,
+            weight_loader_skip_tensor=skip_tensor,
         )
 
     def _server_args(self, prefetch, disable_mmap=False, drop_cache=False):
@@ -496,6 +686,42 @@ class TestPrefetchDispatch(CustomTestCase):
         self.assertEqual(mock_buffered.call_args.kwargs["max_workers"], 64)
         mock_single.assert_not_called()
         self.assertEqual(self._override_notices(mock_log), [])
+
+    def test_model_exclusions_forwarded_to_safetensors_iterators(self):
+        """Source-level exclusions reach whichever prefetching iterator is
+        chosen; FASTSAFETENSORS (no prefetch path) gets nothing new."""
+        exclusions = ["/dummy/model-00007.safetensors"]
+
+        def skip_tensor(name):
+            return name.endswith(".ple")
+
+        for extra, forwarded in (
+            ({"enable_multithread_load": True}, "buffered"),
+            ({}, "single"),
+        ):
+            with self.subTest(iterator=forwarded):
+                loader = self._make_loader(dict(extra))
+                p_prep, p_model, p_buffered, p_single, p_log = self._patch_dispatch(
+                    prefetch=True
+                )
+                with (
+                    p_prep,
+                    p_model,
+                    p_buffered as mock_buffered,
+                    p_single as mock_single,
+                    p_log,
+                ):
+                    list(
+                        loader._get_weights_iterator(
+                            self._make_source(exclusions, skip_tensor)
+                        )
+                    )
+                mock_used = mock_buffered if forwarded == "buffered" else mock_single
+                mock_used.assert_called_once()
+                self.assertEqual(
+                    mock_used.call_args.kwargs["prefetch_exclude_files"], exclusions
+                )
+                self.assertIs(mock_used.call_args.kwargs["skip_tensor"], skip_tensor)
 
     def test_no_prefetch_uses_multithread(self):
         """Prefetch off -> multi-threaded iterator is used (default), no
