@@ -873,7 +873,16 @@ class MambaComponent(TreeComponent):
 
         if phase == CacheTransferPhase.BACKUP_STORAGE:
             cd = node.component_data[ct]
-            if cd.host_value is None or not node.hash_value:
+            if not node.hash_value:
+                return None
+            if cd.host_value is None:
+                if cd.value is not None:
+                    logger.warning(
+                        "Skipping Mamba storage checkpoint because its host state "
+                        "is unavailable: node_id=%s key=%s",
+                        node.id,
+                        node.hash_value[-1],
+                    )
                 return None
             return [
                 PoolTransfer(
