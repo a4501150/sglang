@@ -1021,6 +1021,18 @@ class UnifiedRadixCache(BasePrefixCache):
         for comp in self._components_tuple:
             effective_cache_len = comp.floor_cache_len(effective_cache_len)
 
+        if effective_cache_len <= 0:
+            self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
+            self.unpin(req)
+            for comp in self._components_tuple:
+                comp.cleanup_after_caching_req(
+                    req,
+                    is_finished=True,
+                    insert_result=None,
+                    insert_params=insert_params,
+                )
+            return
+
         # Truncate if needed; the tail free is deferred and batched with
         # the unaligned tail below so a shared boundary page is emitted once.
         kv_indices_full = kv_indices

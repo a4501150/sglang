@@ -19,6 +19,7 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+    PoolStats,
     SchedulerPoolStatsObserver,
 )
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
@@ -314,6 +315,106 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         )
         self.assertTrue(leak, msg)
         self.assertIn("align", msg.lower())
+
+
+class TestMambaSlotCensus(CustomTestCase):
+    """Mamba slot census: duplicate ownership and free-plus-referenced slots
+    can keep the slot-sum equation balanced, so they must be flagged even when
+    the arithmetic check passes."""
+
+    def _check_mamba_pool(
+        self, *, free_slots, cached, size, available, evictable, run_census=True
+    ):
+        tree_cache = MagicMock()
+        tree_cache.mamba_protected_size.return_value = 0
+        tree_cache.all_mamba_values_flatten.return_value = torch.tensor(
+            cached, dtype=torch.int64
+        )
+        # None: no page free list, so the leaked-pages dump exits early and the
+        # message is exactly the sum line plus the census suffix.
+        allocator = MagicMock()
+        allocator.get_all_free_pages.return_value = None
+        req_to_token_pool = SimpleNamespace(
+            mamba_pool=SimpleNamespace(size=size),
+            mamba_allocator=SimpleNamespace(
+                free_slots=torch.tensor(free_slots, dtype=torch.int64), size=size
+            ),
+        )
+        observer = MagicMock()
+        observer.session_held_mamba_slots.return_value = 0
+        checker = SchedulerInvariantChecker(
+            is_hybrid_swa=False,
+            is_hybrid_ssm=True,
+            disaggregation_mode=DisaggregationMode.NULL,
+            page_size=1,
+            full_tokens_per_layer=None,
+            swa_tokens_per_layer=None,
+            max_total_num_tokens=1024,
+            tree_cache=tree_cache,
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=req_to_token_pool,
+            pool_stats_observer=observer,
+            get_last_batch=lambda: None,
+            get_running_batch=lambda: None,
+            scheduler_stage_metrics=None,
+        )
+        ps = PoolStats(
+            full_num_used=0,
+            full_token_usage=0.0,
+            full_available_size=0,
+            full_evictable_size=0,
+            is_hybrid_ssm=True,
+            mamba_num_used=0,
+            mamba_usage=0.0,
+            mamba_available_size=available,
+            mamba_evictable_size=evictable,
+        )
+        result = checker._check_mamba_pool(ps, run_census=run_census)
+        return result, tree_cache
+
+    def test_clean_idle_check_does_not_synchronize_census(self):
+        (leak, _), tree_cache = self._check_mamba_pool(
+            free_slots=[1, 2, 3, 4, 5],
+            cached=[6],
+            size=6,
+            available=5,
+            evictable=1,
+            run_census=False,
+        )
+        self.assertFalse(leak)
+        tree_cache.all_mamba_values_flatten.assert_not_called()
+
+    def test_clean_census_passes(self):
+        (leak, msg), _ = self._check_mamba_pool(
+            free_slots=[1, 2, 3, 4, 5], cached=[6], size=6, available=5, evictable=1
+        )
+        self.assertFalse(leak)
+        self.assertNotIn("mamba_census", msg)
+
+    def test_free_and_referenced_slot_flagged_when_sums_balance(self):
+        # Slot 3 is both free and cached; slot 6 is owned by neither. The sums
+        # still balance (5 free + 1 cached == 6), so only the census can see it.
+        (leak, msg), _ = self._check_mamba_pool(
+            free_slots=[1, 2, 3, 4, 5], cached=[3], size=6, available=5, evictable=1
+        )
+        self.assertTrue(leak)
+        self.assertIn("free_and_referenced=[3]", msg)
+
+    def test_duplicate_ownership_flagged_when_sums_balance(self):
+        # Slot 3 is referenced by two cached states; slot 6 fell out of both
+        # ledgers. available(4) + evictable(2) == size(6) hides it from the sum.
+        (leak, msg), _ = self._check_mamba_pool(
+            free_slots=[1, 2, 4, 5], cached=[3, 3], size=6, available=4, evictable=2
+        )
+        self.assertTrue(leak)
+        self.assertIn("dup_owned_refs=1", msg)
+
+    def test_double_free_flagged(self):
+        (leak, msg), _ = self._check_mamba_pool(
+            free_slots=[1, 1, 2, 4, 5], cached=[3], size=6, available=5, evictable=1
+        )
+        self.assertTrue(leak)
+        self.assertIn("dup_free=1", msg)
 
 
 if __name__ == "__main__":

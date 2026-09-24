@@ -9,6 +9,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -65,6 +67,43 @@ def _controller(page_size=4, device_direct=True, backend=None, results=None):
     controller.page_get_func = lambda operation, hashes, host_indices, e: len(hashes)
     controller.prefetch_hits_sync_groups = []
     return controller
+
+
+class TestStorageFormatSpec(unittest.TestCase):
+    def test_runtime_fields_use_their_own_config_namespaces(self):
+        controller = _controller()
+        controller.mem_pool_host = SimpleNamespace()
+        memory = SimpleNamespace(hicache_mem_layout="page_first")
+        model = SimpleNamespace(
+            kv_cache_dtype="fp8_e4m3",
+            model_path="model-path",
+            revision="model-revision",
+        )
+        mamba = SimpleNamespace(
+            mamba_radix_cache_strategy="lru",
+            mamba_ssm_dtype="bfloat16",
+            mamba_track_interval=256,
+            enable_int8_mamba_checkpoint=True,
+            int8_mamba_ckpt_size=1024,
+            enable_linear_replayssm=True,
+            linear_replayssm_cache_len=64,
+        )
+        with (
+            patch("sglang.srt.runtime_context.get_memory", return_value=memory),
+            patch("sglang.srt.runtime_context.get_model", return_value=model),
+            patch(
+                "sglang.srt.runtime_context.get_exec",
+                return_value=SimpleNamespace(mamba=mamba),
+            ),
+        ):
+            runtime = controller._storage_format_spec("fallback", None)["runtime"]
+
+        self.assertEqual(runtime["hicache_mem_layout"], "page_first")
+        self.assertEqual(runtime["kv_cache_dtype"], "fp8_e4m3")
+        self.assertEqual(runtime["mamba_track_interval"], 256)
+        self.assertTrue(runtime["enable_int8_mamba_checkpoint"])
+        self.assertEqual(runtime["model_path"], "model-path")
+        self.assertEqual(runtime["model_revision"], "model-revision")
 
 
 class TestDeviceBackup(unittest.TestCase):

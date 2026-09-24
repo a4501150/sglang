@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
 
@@ -525,6 +525,7 @@ class HiCacheController:
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
+        host_pools: Optional[list] = None,
     ):
         """Attach (enable) storage backend at runtime.
 
@@ -550,7 +551,7 @@ class HiCacheController:
 
         self.get_hash_str = get_hash_str
         self.storage_config = self._generate_storage_config(
-            model_name, storage_backend_extra_config
+            model_name, storage_backend_extra_config, host_pools=host_pools
         )
         # for MLA models, only one rank needs to backup the KV cache
         self.backup_skip = (
@@ -704,13 +705,76 @@ class HiCacheController:
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
+    @staticmethod
+    def _pool_format_descriptor(name: Any, pool: Any) -> dict:
+        pool_name = getattr(name, "value", str(name))
+        device_pool = getattr(pool, "device_pool", None)
+        return {
+            "name": pool_name,
+            "class": f"{type(pool).__module__}.{type(pool).__qualname__}",
+            "layout": getattr(pool, "layout", None),
+            "page_size": getattr(pool, "page_size", None),
+            "dtype": str(getattr(pool, "dtype", None)),
+            "device_dtype": str(getattr(device_pool, "store_dtype", None)),
+            "size_per_token": getattr(pool, "size_per_token", None),
+            "start_layer": getattr(pool, "start_layer", None),
+            "end_layer": getattr(pool, "end_layer", None),
+            "dcp_size": getattr(pool, "dcp_size", 1),
+        }
+
+    def _storage_format_spec(
+        self, model_name: Optional[str], host_pools: Optional[list]
+    ) -> dict:
+        if host_pools:
+            pools = [
+                self._pool_format_descriptor(entry.name, entry.host_pool)
+                for entry in host_pools
+            ]
+        else:
+            pools = [self._pool_format_descriptor(PoolName.KV, self.mem_pool_host)]
+        pools.sort(key=lambda item: item["name"])
+
+        runtime = {}
+        try:
+            from sglang.srt.runtime_context import get_exec, get_memory, get_model
+
+            memory = get_memory()
+            model = get_model()
+            mamba = get_exec().mamba
+            runtime = {
+                "hicache_mem_layout": memory.hicache_mem_layout,
+                "kv_cache_dtype": model.kv_cache_dtype,
+                "mamba_radix_cache_strategy": mamba.mamba_radix_cache_strategy,
+                "mamba_ssm_dtype": mamba.mamba_ssm_dtype,
+                "mamba_track_interval": mamba.mamba_track_interval,
+                "enable_int8_mamba_checkpoint": mamba.enable_int8_mamba_checkpoint,
+                "int8_mamba_ckpt_size": mamba.int8_mamba_ckpt_size,
+                "enable_linear_replayssm": mamba.enable_linear_replayssm,
+                "linear_replayssm_cache_len": mamba.linear_replayssm_cache_len,
+                "model_path": model.model_path,
+                "model_revision": model.revision,
+            }
+        except (RuntimeError, ValueError):
+            logger.warning(
+                "Runtime configuration is unavailable while building the HiCache "
+                "format fingerprint; using model_name only"
+            )
+            runtime["model_path"] = model_name
+
+        return {
+            "model": model_name,
+            "tree_page_size": self.page_size,
+            "pools": pools,
+            "runtime": runtime,
+        }
+
     def _generate_storage_config(
         self,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
+        host_pools: Optional[list] = None,
     ):
-        if storage_backend_extra_config is None:
-            storage_backend_extra_config = {}
+        storage_backend_extra_config = dict(storage_backend_extra_config or {})
 
         if is_dp_attention_enabled():
             self.tp_rank = get_parallel().attn_tp_rank
@@ -766,6 +830,7 @@ class HiCacheController:
             should_split_heads=should_split_heads,
             dp_rank=self.dp_rank,
             extra_config=storage_backend_extra_config,
+            format_spec=self._storage_format_spec(model_name, host_pools),
         )
 
     def reset(self):
