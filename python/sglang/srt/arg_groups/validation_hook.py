@@ -535,9 +535,7 @@ def validate_gdn_mtp_cache_mode(server_args: Any):
     if cfg.gdn_mtp_cache_mode != "none":
         return
     if cfg.enable_linear_replayssm_spec or cfg.enable_linear_replayssm:
-        raise ValueError(
-            "--gdn-mtp-cache-mode none is incompatible with ReplaySSM."
-        )
+        raise ValueError("--gdn-mtp-cache-mode none is incompatible with ReplaySSM.")
     if cfg.speculative_eagle_topk not in (None, 1):
         raise ValueError(
             "--gdn-mtp-cache-mode none requires linear-chain speculative "
