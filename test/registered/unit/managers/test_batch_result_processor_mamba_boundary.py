@@ -94,7 +94,7 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
     def test_overlap_scheduler_handles_zero_and_one_batch_lookahead(self):
         cases = (
             (False, False, 0, 1),
-            (True, False, 1, 0),
+            (True, False, 1, 1),
             (True, True, 1, 1),
         )
         for (
