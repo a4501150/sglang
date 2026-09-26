@@ -1996,7 +1996,11 @@ class Scheduler(
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
-                    pop_and_process(wait_for_recovery=batch is None)
+                    # The fence cannot be skipped when a batch was just
+                    # launched: run_batch joins only the forward stream, and
+                    # donation/checkpoint kernels in process_batch_result read
+                    # slots that side-stream recovery writes.
+                    pop_and_process(wait_for_recovery=True)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
