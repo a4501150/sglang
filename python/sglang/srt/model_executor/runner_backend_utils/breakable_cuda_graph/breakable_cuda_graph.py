@@ -382,7 +382,11 @@ class BreakableCUDAGraphCapture:
 
     def __exit__(self, *args: object):
         try:
-            self._end_current_segment()
+            # A break body that raised ended its segment and never began the
+            # next one; end nothing so the missing-segment assert inside
+            # _end_current_segment cannot mask the in-flight exception.
+            if self._current_graph is not None:
+                self._end_current_segment()
         finally:
             _forked_streams_var.reset(self._forked_token)
             _current_stream_var.reset(self._stream_token)
