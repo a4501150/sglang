@@ -917,7 +917,9 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     # second decode.
     contract_error = generate_contract_error(await request.json())
     if contract_error is not None:
-        return ORJSONResponse(status_code=400, content={"error": contract_error})
+        return SGLangORJSONResponse(
+            status_code=400, content={"error": contract_error}
+        )
     return await serve_generate_request(obj, request)
 
 

@@ -22,7 +22,6 @@ from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
-
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -44,7 +43,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_memory, get_model, get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -625,18 +624,18 @@ class HiCacheController:
                     self.storage_backend_type == "dynamic"
                     and bool(self.storage_config.extra_config.get("interface_v1", 0))
                 )
-                or bool(
+                or (
                     # Backends that implement positional zero-copy page I/O
                     # (e.g. HiCacheFile with io_mode='direct') opt in through
                     # this capability flag instead of hardcoded name lists.
-                    getattr(self.storage_backend, "supports_zero_copy_page_io", False)
+                    self.storage_backend.supports_zero_copy_page_io
                 )
             ):
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
 
             self.storage_device_direct = bool(
-                getattr(self.storage_backend, "supports_device_target", False)
+                self.storage_backend.supports_device_target
             )
             if self.storage_device_direct:
                 self._register_device_pools()
@@ -749,8 +748,6 @@ class HiCacheController:
 
         runtime = {}
         try:
-            from sglang.srt.runtime_context import get_exec, get_memory, get_model
-
             memory = get_memory()
             model = get_model()
             mamba = get_exec().mamba
@@ -1305,6 +1302,11 @@ class HiCacheController:
         # Clamp to minimal number of hits.
         return min([kv_hits, *sidecar_hits.values()])
 
+    def _maybe_sweep_storage_orphans(self) -> None:
+        """Idle-path hook: periodically delete leftover storage tmp files."""
+        if self.storage_backend is not None:
+            self.storage_backend.maybe_sweep_orphans()
+
     def prefetch_io_aux_func(self):
         """
         Auxiliary function conducting IO operations for prefetching.
@@ -1313,11 +1315,19 @@ class HiCacheController:
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
             except Empty:
+                self._maybe_sweep_storage_orphans()
                 continue
             if operation is None:
                 continue
             try:
                 self._page_transfer(operation)
+            except Exception:
+                # The finally below still publishes the ack with whatever
+                # progress the operation made; keep the thread alive.
+                logger.exception(
+                    "HiCache prefetch IO failed for request %s",
+                    operation.request_id,
+                )
             finally:
                 self.prefetch_sync_queue.put(
                     PrefetchAck(
@@ -1407,6 +1417,9 @@ class HiCacheController:
                             operation
                         )
                 except Exception:
+                    # Never rethrow: a rank dying before the TP _all_reduce
+                    # below would hang every peer. Report zero hits instead;
+                    # the MIN reduction keeps all ranks consistent.
                     logger.exception(
                         "HiCache storage query failed for request %s",
                         operation.request_id,
@@ -1426,6 +1439,7 @@ class HiCacheController:
                 self.prefetch_hit_queue.put(operation)
 
             except Empty:
+                self._maybe_sweep_storage_orphans()
                 continue
 
     def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
@@ -1527,7 +1541,7 @@ class HiCacheController:
         path for this operation."""
         if not self.storage_device_direct:
             return False
-        registered = getattr(self.storage_backend, "registered_device_pools", {})
+        registered = self.storage_backend.registered_device_pools
         if PoolName.KV not in registered:
             return False
         for transfer in getattr(operation, "pool_transfers", None) or []:
@@ -1592,6 +1606,7 @@ class HiCacheController:
                 self.ack_backup_queue.put(operation)
 
             except Empty:
+                self._maybe_sweep_storage_orphans()
                 continue
 
     def prefetch_sync_thread_func(self):
@@ -1601,9 +1616,15 @@ class HiCacheController:
                 ack = self.prefetch_sync_queue.get(block=True, timeout=1)
                 if ack is None:
                     continue
-                self._reduce_prefetch_ack(ack)
+                try:
+                    self._reduce_prefetch_ack(ack)
+                except Exception:
+                    # Keep draining: a dead sync thread hangs every rank
+                    # waiting for its ack.
+                    logger.exception("HiCache prefetch ack reduction failed")
                 self.ack_prefetch_queue.put(ack)
             except Empty:
+                self._maybe_sweep_storage_orphans()
                 continue
 
     def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:

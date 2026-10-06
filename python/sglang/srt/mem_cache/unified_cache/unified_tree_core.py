@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
     ReplaceWriteThroughOnNodeSplit,
+    TouchStorageL3,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
     _NUM_COMPONENT_TYPES,
@@ -414,6 +415,9 @@ class _InsertWalkState(msgspec.Struct):
     target_node: Optional[UnifiedTreeNode] = None
     # Emitted actions awaiting the next barrier flush (or the final step).
     pending_actions: list[CacheAction | ComponentAction] = []
+    # Node ids whose L3 copies this walk re-referenced; flushed as one
+    # TouchStorageL3 in the tail step.
+    l3_touch_node_ids: list = []
 
 
 class UnifiedTreeCore(UnifiedTreeCoreInterface):
@@ -1353,8 +1357,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         # Nodes this request already inserted were counted back then.
         node_end = state.total_prefix_length + prefix_len
-        if node_end > state.params.inserted_len and self._inc_hit_count_and_check(node):
-            step_actions.append(self._build_backup_kv_action(node))
+        if node_end > state.params.inserted_len:
+            # A backuped node here means its L3 copy survived while the tree
+            # re-referenced it — including evicted nodes, whose L3 copy is the
+            # only one left (the hit-count path below early-returns for them).
+            if self.enable_hicache and node.backuped and node.hash_value:
+                state.l3_touch_node_ids.append(node.id)
+            if self._inc_hit_count_and_check(node):
+                step_actions.append(self._build_backup_kv_action(node))
         state.node = node
         state.total_prefix_length += prefix_len
         state.key = key[prefix_len:]
@@ -1448,6 +1458,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     state.target_node, write_back=self.is_write_back
                 )
             )
+
+        if state.l3_touch_node_ids:
+            state.pending_actions.append(TouchStorageL3(state.l3_touch_node_ids))
+            state.l3_touch_node_ids = []
 
     def _split_node(
         self, key: RadixKey, child: UnifiedTreeNode, split_len: int
@@ -2526,9 +2540,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def build_storage_backup_spec(
         self, node_id: NodeId, pass_prefix_keys: bool
     ) -> Optional[StorageBackupSpec]:
-        """Gather a node's device->storage backup spec; None if the node is not backuped."""
+        """Gather a node's device->storage backup spec.
+
+        None if the node is not backuped or carries no page hashes (storage
+        is content-addressed; mamba-style components skip such nodes too).
+        """
         node = self.node_by_id(node_id)
-        if not node.backuped:
+        if not node.backuped or not node.hash_value:
             return None
         prefix_keys = None
         if pass_prefix_keys:

@@ -7,10 +7,8 @@ from typing import Optional, Sequence
 
 import numpy as np
 import torch
-
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
-from sglang.srt.environ import envs
-from sglang.srt.mem_cache.hicache_storage import hicache_tensor_digest
+from sglang.srt.mem_cache.hicache_storage import DIRECT_IO_ALIGNMENT
 from sglang.srt.mem_cache.pool_host.base import (
     HostKVCache,
     host_memory_budget_bytes,
@@ -20,8 +18,10 @@ from sglang.srt.mem_cache.pool_host.base import (
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
+    log_hicache_transfer_digests,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils.common import ceil_align
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -58,7 +58,9 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
-_STORAGE_ALIGNMENT_BYTES = 4096
+# O_DIRECT segment rows (the same alignment HiCacheFile validates pools
+# against); host sibling buffers pad each slot's row up to this boundary.
+_STORAGE_ALIGNMENT_BYTES = DIRECT_IO_ALIGNMENT
 
 
 _NPU_HICACHE_MAMBA_IO_ENV = "SGLANG_NPU_HICACHE_MAMBA_IO"
@@ -161,18 +163,16 @@ class MambaPoolHost(HostKVCache):
         # Digest names ride the buffer info so the host pool stays decoupled
         # from the device pool; storage rows are padded to page alignment so
         # zero-copy direct storage can address each slot row as one segment.
-        self.slot_state_names = (
-            tuple(getattr(buffer_info, "extra_checkpoint_names", ()) or ())
-            or tuple(f"slot_state_{i}" for i in range(len(self.slot_state_device_tensors)))
+        self.slot_state_names = tuple(
+            getattr(buffer_info, "extra_checkpoint_names", ()) or ()
+        ) or tuple(
+            f"slot_state_{i}" for i in range(len(self.slot_state_device_tensors))
         )
         self.slot_state_elem_sizes = [
-            int(np.prod(state.shape[1:]))
-            for state in self.slot_state_device_tensors
+            int(np.prod(state.shape[1:])) for state in self.slot_state_device_tensors
         ]
         self.slot_state_storage_bytes = [
-            (elem_size * state.element_size() + _STORAGE_ALIGNMENT_BYTES - 1)
-            // _STORAGE_ALIGNMENT_BYTES
-            * _STORAGE_ALIGNMENT_BYTES
+            ceil_align(elem_size * state.element_size(), _STORAGE_ALIGNMENT_BYTES)
             for elem_size, state in zip(
                 self.slot_state_elem_sizes, self.slot_state_device_tensors
             )
@@ -429,31 +429,18 @@ class MambaPoolHost(HostKVCache):
         host_indices: torch.Tensor,
         device_indices: torch.Tensor,
     ) -> None:
-        if not envs.SGLANG_HICACHE_FILE_BACKEND_LOG_PAGE_DIGESTS.get():
-            return
-        if torch.cuda.is_available():
-            torch.cuda.current_stream().synchronize()
-        host_indices_list = host_indices.cpu().tolist()
-        device_indices_list = device_indices.cpu().tolist()
-        for host_index, device_index in zip(host_indices_list, device_indices_list):
-            host_components = dict(self.get_debug_page_tensors(host_index))
-            device_components = dict(self._iter_device_slot_tensors(device_index))
-            for component, host_tensor in host_components.items():
-                host_digest = hicache_tensor_digest(host_tensor)
-                device_digest = hicache_tensor_digest(device_components[component])
-                logger.warning(
-                    "HiCache transfer digest direction=%s component=%s "
-                    "host_page=%d device_slot=%d bytes=%d host_sha256=%s "
-                    "device_sha256=%s exact=%s",
-                    direction,
-                    component,
+        def _pairs():
+            host_indices_list = host_indices.cpu().tolist()
+            device_indices_list = device_indices.cpu().tolist()
+            for host_index, device_index in zip(host_indices_list, device_indices_list):
+                yield (
                     host_index,
                     device_index,
-                    host_tensor.numel() * host_tensor.element_size(),
-                    host_digest,
-                    device_digest,
-                    host_digest == device_digest,
+                    dict(self.get_debug_page_tensors(host_index)),
+                    dict(self._iter_device_slot_tensors(device_index)),
                 )
+
+        log_hicache_transfer_digests(direction, "slot", _pairs())
 
     @staticmethod
     def _flatten_tensor_bytes(tensor: torch.Tensor) -> torch.Tensor:

@@ -99,6 +99,8 @@ class _BackendBuilder:
         enable_metadata_cache=None,
         io_mode=None,
         format_spec=None,
+        orphan_grace_seconds=None,
+        orphan_sweep_interval_seconds=None,
     ) -> HiCacheFile:
         # Each backend gets its own subdir so MLA / non-MLA tests don't
         # contaminate each other's file_path.
@@ -121,6 +123,8 @@ class _BackendBuilder:
                 "metadata_ttl": metadata_ttl,
                 "enable_metadata_cache": enable_metadata_cache,
                 "io_mode": io_mode,
+                "orphan_grace_seconds": orphan_grace_seconds,
+                "orphan_sweep_interval_seconds": orphan_sweep_interval_seconds,
             },
         )
         return HiCacheFile(cfg, file_path=d)
@@ -157,6 +161,15 @@ class HiCacheFileLRUTestBase(CustomTestCase):
         ]
         for cm in self._env_overrides:
             cm.__enter__()
+
+    def _seed(self, b, name, size=8, age=3600):
+        """Create a file in the backend dir, backdated by `age` seconds."""
+        path = os.path.join(b.file_path, name)
+        with open(path, "wb") as f:
+            f.write(b"x" * size)
+        old = time.time() - age
+        os.utime(path, (old, old))
+        return path
 
     def tearDown(self):
         for cm in self._env_overrides:
@@ -739,6 +752,44 @@ class TestMetadataCache(CustomTestCase):
         cache.add("k1")
         time.sleep(0.3)
         self.assertTrue(cache.contains("k1"))
+
+    def test_metadata_cache_cap_evicts_oldest(self):
+        cache = MetadataCache(ttl_seconds=-1.0, max_entries=2)
+        cache.add("k1")
+        cache.add("k2")
+        cache.add("k3")
+        self.assertEqual(len(cache.cache), 2)
+        self.assertNotIn("k1", cache.cache)
+        self.assertIn("k2", cache.cache)
+        self.assertIn("k3", cache.cache)
+
+    def test_metadata_cache_hit_reorders_but_keeps_ttl(self):
+        cache = MetadataCache(ttl_seconds=0.5, max_entries=2)
+        cache.add("old")
+        cache.add("new")
+        self.assertTrue(cache.contains("old"))
+        # "old" was probed last, so the cap must evict "new".
+        cache.add("third")
+        self.assertIn("old", cache.cache)
+        self.assertNotIn("new", cache.cache)
+
+    def test_metadata_cache_purge_drops_expired_only(self):
+        cache = MetadataCache(ttl_seconds=0.1)
+        cache.add("stale")
+        time.sleep(0.2)
+        cache.add("fresh")
+        self.assertEqual(cache.purge(), 1)
+        self.assertNotIn("stale", cache.cache)
+        self.assertIn("fresh", cache.cache)
+        # Nothing expired -> nothing purged.
+        self.assertEqual(cache.purge(), 0)
+
+    def test_metadata_cache_purge_disabled_ttl(self):
+        cache = MetadataCache(ttl_seconds=-1.0)
+        cache.add("k1")
+        time.sleep(0.1)
+        self.assertEqual(cache.purge(), 0)
+        self.assertIn("k1", cache.cache)
 
 
 class TestHiCacheFileMetadataIntegration(HiCacheFileLRUTestBase):

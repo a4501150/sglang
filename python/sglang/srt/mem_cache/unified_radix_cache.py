@@ -65,6 +65,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
     ReplaceWriteThroughOnNodeSplit,
+    TouchStorageL3,
 )
 
 # UnifiedTreeNode / UnifiedLRUList live on the tree core; re-exported here
@@ -1318,8 +1319,27 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.linker.offload_nodes(action.node_ids)
             else:
                 self._execute_and_commit_kv_backup(action)
+        elif isinstance(action, TouchStorageL3):
+            self._touch_storage_l3(action.node_ids)
         else:
             raise AssertionError(f"unhandled CacheAction: {type(action).__name__}")
+
+    def _touch_storage_l3(self, node_ids: list) -> None:
+        """Refresh L3 recency for re-referenced nodes whose pages are stored.
+
+        One aggregated call per insert; backends without recency support are
+        a no-op.
+        """
+        if self.cache_controller is None:
+            return
+        backend = getattr(self.cache_controller, "storage_backend", None)
+        if backend is None:
+            return
+        keys: list[str] = []
+        for node_id in node_ids:
+            keys.extend(self.tree_core.node_by_id(node_id).hash_value or [])
+        if keys:
+            backend.touch_many(keys)
 
     def _drain_device_frees(
         self, device_frees: dict[ComponentType, list[torch.Tensor]]

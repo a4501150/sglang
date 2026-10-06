@@ -71,6 +71,14 @@ class BackupKV(msgspec.Struct, frozen=True):
     node_ids: list[NodeId]
 
 
+class TouchStorageL3(msgspec.Struct, frozen=True):
+    """L3 copies of these node_ids were re-referenced by an insert walk; bump
+    the file backend's recency so eviction keeps still-useful prefixes.
+    Aggregated into one action per insert."""
+
+    node_ids: list[NodeId]
+
+
 class MambaEvictExcessPathStates(ComponentAction, frozen=True):
     """Per-path Mamba state-cap eviction from the tail's root path; applied at
     the insert's commit barrier, after the walk-time backups whose
@@ -117,5 +125,9 @@ class SWARebuild(ComponentAction, frozen=True):
 
 # Cache-owned actions, applied by UnifiedRadixCache itself.
 CacheAction = (
-    ReplaceWriteThroughOnNodeSplit | FreeDeviceKV | FreeDeviceKVFullOnly | BackupKV
+    ReplaceWriteThroughOnNodeSplit
+    | FreeDeviceKV
+    | FreeDeviceKVFullOnly
+    | BackupKV
+    | TouchStorageL3
 )

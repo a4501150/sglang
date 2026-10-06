@@ -1,16 +1,18 @@
 """Staged L3 prefetch lifecycle through the buffer pipeline; no GPU kernels."""
 
 import tempfile
+import threading
 import unittest
 from array import array
 from collections import defaultdict, deque
 from datetime import timedelta
 from queue import Queue
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import torch
 
+from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.managers.schedule_batch import split_cached_prefix_by_tier
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -552,6 +554,97 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         retries = cache.storage_prefetch_retries
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [])
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [(req, None)])
+
+
+class TestStorageThreadHardening(unittest.TestCase):
+    """A failing storage op must still publish its ack, not kill the thread."""
+
+    @staticmethod
+    def _run_one_op(thread_func, stub, put_attr, item):
+        getattr(stub, put_attr).put(item)
+        stub.storage_stop_event.set()
+        thread_func(stub)
+
+    def test_backup_failure_still_acks(self):
+        stub = SimpleNamespace(
+            storage_stop_event=threading.Event(),
+            backup_queue=Queue(),
+            ack_backup_queue=Queue(),
+            backup_skip=False,
+            storage_backend=None,
+            _page_backup=Mock(side_effect=RuntimeError("boom")),
+        )
+        # The thread routes through the production wrapper, which must swallow
+        # the failure and let the ack through.
+        stub._page_backup_or_log = MethodType(
+            HiCacheController._page_backup_or_log, stub
+        )
+        op = SimpleNamespace(request_id="r1", completed_tokens=0)
+        self._run_one_op(HiCacheController.backup_thread_func, stub, "backup_queue", op)
+        self.assertEqual(stub._page_backup.call_count, 1)
+        self.assertIs(stub.ack_backup_queue.get_nowait(), op)
+
+    def test_hybrid_backup_failure_still_acks(self):
+        stub = SimpleNamespace(
+            storage_stop_event=threading.Event(),
+            backup_queue=Queue(),
+            ack_backup_queue=Queue(),
+            storage_backend=None,
+            _page_backup=Mock(side_effect=RuntimeError("boom")),
+        )
+        stub._page_backup_or_log = MethodType(
+            HybridCacheController._page_backup_or_log, stub
+        )
+        op = SimpleNamespace(request_id="r2", completed_tokens=0)
+        self._run_one_op(
+            HybridCacheController.backup_thread_func, stub, "backup_queue", op
+        )
+        self.assertEqual(stub._page_backup.call_count, 1)
+        self.assertIs(stub.ack_backup_queue.get_nowait(), op)
+
+    def test_prefetch_query_failure_still_publishes_hit(self):
+        stub = SimpleNamespace(
+            storage_stop_event=threading.Event(),
+            prefetch_queue=Queue(),
+            prefetch_hit_queue=Queue(),
+            storage_backend=None,
+            _storage_hit_query=Mock(side_effect=RuntimeError("boom")),
+            _all_reduce=Mock(),
+            prefetch_hits_sync_groups=None,
+            page_size=64,
+        )
+        # The MIN-reduce runs in-process through the production helper so the
+        # stub stays faithful to the thread's real call sequence.
+        stub._sync_prefetch_hit_query = MethodType(
+            HiCacheController._sync_prefetch_hit_query, stub
+        )
+        op = SimpleNamespace(request_id="r3", is_terminated=lambda: False)
+        self._run_one_op(
+            HiCacheController.prefetch_thread_func, stub, "prefetch_queue", op
+        )
+        self.assertIs(stub.prefetch_hit_queue.get_nowait(), op)
+        self.assertEqual(op.storage_hit_count, 0)
+        self.assertEqual(op.hash_value, [])
+
+    def test_prefetch_sync_reduction_failure_still_acks(self):
+        stub = SimpleNamespace(
+            storage_stop_event=threading.Event(),
+            prefetch_sync_queue=Queue(),
+            ack_prefetch_queue=Queue(),
+            storage_backend=None,
+        )
+
+        # This loop only checks the stop event (no queue-emptiness clause), so
+        # it must be set from inside the op: fail after flagging termination.
+        def reduce_and_stop(ack):
+            stub.storage_stop_event.set()
+            raise RuntimeError("boom")
+
+        stub._reduce_prefetch_ack = Mock(side_effect=reduce_and_stop)
+        ack = SimpleNamespace(rid="r4", completed_tokens=4)
+        stub.prefetch_sync_queue.put(ack)
+        HiCacheController.prefetch_sync_thread_func(stub)
+        self.assertIs(stub.ack_prefetch_queue.get_nowait(), ack)
 
 
 if __name__ == "__main__":

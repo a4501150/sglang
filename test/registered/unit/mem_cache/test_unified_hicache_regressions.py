@@ -1,16 +1,27 @@
 """Host reloads must preserve ID domains, allocation ownership, and stream order."""
 
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import _split_hicache_size
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.pool_host.group import PoolEntry
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.cache_action import TouchStorageL3
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components import FullComponent
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="extra-a", runner_config="1-gpu-small")
@@ -215,6 +226,92 @@ class TestTriPoolAssembly(unittest.TestCase):
                 else:
                     self.assertIs(entry.device_alloc_fn, swa_allocator.alloc)
                     self.assertIs(entry.device_free_fn, swa_allocator.free)
+
+
+class TestTouchStorageL3Emission(unittest.TestCase):
+    """An insert walk that re-references backuped nodes must emit one
+    aggregated TouchStorageL3, including evicted (device-gone) nodes."""
+
+    @staticmethod
+    def _core():
+        params = CacheInitParams(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            page_size=1,
+            disable=False,
+            tree_components=(ComponentType.FULL,),
+        )
+        cache = SimpleNamespace(enable_session_radix_cache=False)
+        core = UnifiedTreeCore(params, {ComponentType.FULL: FullComponent(cache, params)})
+        core.enable_hicache = True
+        return core
+
+    @staticmethod
+    def _pump(core, token_ids):
+        step = core.begin_insert(
+            InsertParams(
+                key=RadixKey(array("q", token_ids)),
+                value=torch.tensor(token_ids, dtype=torch.int64),
+            )
+        )
+        actions = list(step.actions)
+        while step.result is None:
+            step = core.resume_insert()
+            actions.extend(step.actions)
+        core.end_insert()
+        return actions, step.result
+
+    def test_backuped_nodes_are_touched_once_per_insert(self):
+        core = self._core()
+        actions, result = self._pump(core, [1, 2, 3])
+        node1 = core.node_by_id(result.last_device_node)
+        node1.component_data[ComponentType.FULL].host_value = torch.empty(
+            0, dtype=torch.int64
+        )
+        node1.hash_value = ["h1", "h2", "h3"]
+        # The extend-insert re-references the backuped node1: one aggregated
+        # touch, node2 itself is fresh (not backuped) so it is not included.
+        actions, result = self._pump(core, [1, 2, 3, 4, 5, 6])
+        touches = [a for a in actions if isinstance(a, TouchStorageL3)]
+        self.assertEqual(touches, [TouchStorageL3([node1.id])])
+        node2 = core.node_by_id(result.last_device_node)
+        node2.component_data[ComponentType.FULL].host_value = torch.empty(
+            0, dtype=torch.int64
+        )
+        node2.hash_value = ["h4", "h5", "h6"]
+        # A walk re-referencing both backuped nodes aggregates them into a
+        # single TouchStorageL3.
+        actions, _ = self._pump(core, [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        touches = [a for a in actions if isinstance(a, TouchStorageL3)]
+        self.assertEqual(len(touches), 1)
+        self.assertEqual(touches[0].node_ids, [node1.id, node2.id])
+
+    def test_evicted_backuped_nodes_still_touched(self):
+        core = self._core()
+        _, result = self._pump(core, [1, 2, 3])
+        node = core.node_by_id(result.last_device_node)
+        node.component_data[ComponentType.FULL].host_value = torch.empty(
+            0, dtype=torch.int64
+        )
+        node.hash_value = ["h1", "h2", "h3"]
+        node.component_data[ComponentType.FULL].value = None
+        with patch.object(core, "_unevict_node_on_insert"):
+            actions, _ = self._pump(core, [1, 2, 3, 4])
+        touches = [a for a in actions if isinstance(a, TouchStorageL3)]
+        # The hit-count path early-returns for evicted nodes, but their L3
+        # copy is the only one left — it must still be refreshed.
+        self.assertEqual(touches, [TouchStorageL3([node.id])])
+
+    def test_nodes_without_hashes_are_not_touched(self):
+        core = self._core()
+        _, result = self._pump(core, [1, 2, 3])
+        node = core.node_by_id(result.last_device_node)
+        node.component_data[ComponentType.FULL].host_value = torch.empty(
+            0, dtype=torch.int64
+        )
+        node.hash_value = []
+        actions, _ = self._pump(core, [1, 2, 3, 4])
+        self.assertFalse([a for a in actions if isinstance(a, TouchStorageL3)])
 
 
 if __name__ == "__main__":

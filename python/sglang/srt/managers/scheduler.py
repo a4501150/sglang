@@ -3280,7 +3280,7 @@ class Scheduler(
                         "anchor_exact=%s requested_pages=%d expected_suffix_exact=%s",
                         req.rid,
                         last_host_node,
-                        len(req.prefix_indices),
+                        req.prefix_len,
                         req.host_hit_length,
                         matched_len,
                         matched_len % self.page_size == 0,

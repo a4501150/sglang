@@ -238,6 +238,50 @@ class TestHiCacheStoragePageFirstDirectIO(HiCacheStorageBaseMixin, CustomTestCas
         return server_args, {}
 
 
+class TestHiCacheStorageGroupEviction(HiCacheStorageBaseMixin, CustomTestCase):
+    """Eviction at the file-backend cap must remove whole page groups.
+
+    A KV payload file and its sidecar-pool files (mamba state, scales, ...)
+    form one page group: evicting the payload while leaving a sidecar (or the
+    reverse) leaves an incomplete group that restore cannot use.
+    """
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        return {}, {
+            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
+            "SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE": "1G",
+            "SGLANG_HICACHE_FILE_BACKEND_EVICTION_RATIO": "0.9",
+        }
+
+    def test_eviction_keeps_page_groups_whole(self):
+        # Fill past the 1G cap: each ~6k-token prompt writes tens of MB.
+        for _ in range(20):
+            self.send_request(self.gen_prompt(6144), max_tokens=8)
+        self.flush_cache()
+
+        stems = [
+            fn[:-4] for fn in os.listdir(self.temp_dir) if fn.endswith(".bin")
+        ]
+        self.assertTrue(stems, "expected page files in the storage directory")
+        # All files share one model/rank/format suffix; strip the common tail.
+        suffix = os.path.commonprefix([s[::-1] for s in stems])[::-1]
+        kv_stems = set()
+        sidecar_bases = []
+        for stem in stems:
+            base = stem[: -len(suffix)] if suffix else stem
+            if "." in base:
+                sidecar_bases.append(base.rsplit(".", 1)[0])
+            else:
+                kv_stems.add(base)
+        orphans = [b for b in sidecar_bases if b not in kv_stems]
+        self.assertEqual(
+            orphans,
+            [],
+            f"sidecar files left without their KV payload: {orphans[:5]}",
+        )
+
+
 def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
     """Generic eval accuracy test with configurable accuracy threshold
 

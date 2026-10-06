@@ -1666,6 +1666,7 @@ class HybridCacheController(BaseHiCacheController):
                 self._page_backup_or_log(operation)
                 self.ack_backup_queue.put(operation)
             except Empty:
+                self._maybe_sweep_storage_orphans()
                 continue
 
     def _resolve_sidecar_kv_derived_pool_transfers(self, operation):

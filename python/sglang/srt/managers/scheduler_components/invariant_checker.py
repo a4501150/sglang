@@ -259,11 +259,6 @@ class SchedulerInvariantChecker:
                     expected_full_pages - free_full_pages - cached_full_pages
                 )
                 full_page_msg = f", leaked_full_pages={leaked_full_pages or None}"
-            if free_mamba_pages is None or cached_mamba_pages is None:
-                _, census_msg, free_mamba_pages, cached_mamba_pages = (
-                    self._mamba_slot_census(self.req_to_token_pool.mamba_allocator)
-                )
-                msg += census_msg
             expected_mamba_pages = set(
                 range(1, self.req_to_token_pool.mamba_allocator.size + 1)
             )

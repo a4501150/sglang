@@ -5,16 +5,17 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, List, Optional, Set
 
 import torch
-
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -80,6 +81,11 @@ class HiCacheStorageExtraInfo:
     # prefix_keys + keys is one contiguous chain for KV batches and sidecars.
     prefix_keys: Optional[List[str]] = None
     extra_info: Optional[dict] = None
+
+
+# Component key for a transfer that has no named sidecar pool: the KV
+# payload itself. Distinct from PoolName.KV, which names a pool.
+DEFAULT_COMPONENT_KEY = "__default__"
 
 
 class PoolName(str, Enum):
@@ -211,6 +217,11 @@ class HiCacheStorage(ABC):
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
 
+    # v2 registration registries; class-level empty defaults are read-only
+    # until the register methods lazily create the per-instance dicts.
+    registered_pools: dict = {}
+    registered_device_pools: dict = {}
+
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
@@ -249,6 +260,16 @@ class HiCacheStorage(ABC):
         copy-based paths.
         """
         return False
+
+    def touch_many(self, keys: List[str]) -> None:
+        """Refresh storage recency for a batch of page keys. Backends without
+        a recency index (or without persistent storage at all) ignore it."""
+        return
+
+    def maybe_sweep_orphans(self) -> None:
+        """Periodic leftover-file sweep hook driven from the storage threads'
+        idle paths. Backends without files ignore it."""
+        return
 
     def batch_exists_v2(
         self,
@@ -415,16 +436,49 @@ class HiCacheStorage(ABC):
 
 
 class MetadataCache:
-    def __init__(self, ttl_seconds: float):
+    def __init__(self, ttl_seconds: float, max_entries: Optional[int] = None):
         self.ttl_seconds = ttl_seconds
-        # key -> monotonic timestamp
-        self.cache: dict[str, float] = {}
+        # 0 / None disables the cap. Without it, a key cached once and never
+        # probed again lingers until process exit (entries are only dropped
+        # on their own next lookup); purge() is driven from the orphan sweep.
+        self.max_entries = max_entries or None
+        # key -> monotonic timestamp, oldest-added first
+        self.cache: OrderedDict[str, float] = OrderedDict()
+        self._last_expiry_scan: float = float("-inf")
         self.lock = threading.Lock()
 
     def add(self, key: str):
         with self.lock:
             if key not in self.cache:
                 self.cache[key] = time.monotonic()
+                if self.max_entries is not None and len(self.cache) > self.max_entries:
+                    self._evict_over_limit_locked()
+
+    def _evict_over_limit_locked(self):
+        # The expiry scan is O(entries); at the cap, running it on every add
+        # costs a full scan per write. Once per TTL window is enough — the
+        # periodic purge() from the orphan sweep reclaims stragglers, and the
+        # FIFO drop below still enforces the cap meanwhile.
+        now = time.monotonic()
+        if (
+            self.ttl_seconds != -1.0
+            and now - self._last_expiry_scan >= self.ttl_seconds
+        ):
+            self._last_expiry_scan = now
+            self._remove_expired_locked(now)
+        # Drop oldest-added beyond the cap; contains() reorders hits to the
+        # end, so insertion order approximates recency.
+        while len(self.cache) > self.max_entries:
+            self.cache.popitem(last=False)
+
+    def _remove_expired_locked(self, now: float) -> int:
+        """Delete every entry older than the TTL; returns how many went."""
+        if self.ttl_seconds == -1.0:
+            return 0
+        expired = [k for k, t in self.cache.items() if now - t > self.ttl_seconds]
+        for k in expired:
+            del self.cache[k]
+        return len(expired)
 
     def remove(self, key: str):
         with self.lock:
@@ -439,7 +493,16 @@ class MetadataCache:
             if time.monotonic() - self.cache[key] > self.ttl_seconds:
                 del self.cache[key]
                 return False
+            # Reorder to the end (recency) without extending the TTL.
+            self.cache.move_to_end(key)
             return True
+
+    def purge(self) -> int:
+        """Drop every expired entry; returns how many were removed."""
+        with self.lock:
+            removed = self._remove_expired_locked(time.monotonic())
+            self._last_expiry_scan = time.monotonic()
+            return removed
 
     def clear(self):
         with self.lock:
@@ -450,9 +513,10 @@ class HiCacheFile(HiCacheStorage):
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
+        extra_cfg = storage_config.extra_config or {}
         self.file_path = (
             envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get()
-            or (storage_config.extra_config or {}).get("file_storage_path")
+            or extra_cfg.get("file_storage_path")
             or file_path
         )
 
@@ -490,9 +554,7 @@ class HiCacheFile(HiCacheStorage):
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
         # Metadata cache positive lookup toggle & TTL
-        enable_cache_raw = None
-        if storage_config.extra_config:
-            enable_cache_raw = storage_config.extra_config.get("enable_metadata_cache")
+        enable_cache_raw = extra_cfg.get("enable_metadata_cache")
         if enable_cache_raw is None:
             enable_cache_raw = (
                 envs.SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE.get()
@@ -501,14 +563,19 @@ class HiCacheFile(HiCacheStorage):
         self.enable_metadata_cache = bool(enable_cache_raw)
 
         if self.enable_metadata_cache:
-            ttl_raw = None
-            if storage_config.extra_config:
-                ttl_raw = storage_config.extra_config.get("metadata_ttl")
+            ttl_raw = extra_cfg.get("metadata_ttl")
             if ttl_raw is None:
                 ttl_raw = envs.SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL.get()
 
             self.metadata_ttl = float(ttl_raw) if ttl_raw is not None else 5.0
-            self.metadata_cache = MetadataCache(self.metadata_ttl)
+            max_entries_raw = extra_cfg.get("metadata_cache_max_entries")
+            if max_entries_raw is None:
+                max_entries_raw = (
+                    envs.SGLANG_HICACHE_FILE_BACKEND_METADATA_CACHE_MAX_ENTRIES.get()
+                )
+            self.metadata_cache = MetadataCache(
+                self.metadata_ttl, max_entries=max_entries_raw
+            )
             self._scan_existing_files_to_metadata_cache()
         else:
             self.metadata_cache = None
@@ -528,12 +595,28 @@ class HiCacheFile(HiCacheStorage):
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None
             ),
+            sibling_keys=self._group_sibling_keys,
         )
+        grace_raw = extra_cfg.get("orphan_grace_seconds")
+        if grace_raw is None:
+            grace_raw = envs.SGLANG_HICACHE_FILE_BACKEND_ORPHAN_GRACE_SECONDS.get()
+        self._orphan_grace_seconds = 600.0 if grace_raw is None else float(grace_raw)
+        interval_raw = extra_cfg.get("orphan_sweep_interval_seconds")
+        if interval_raw is None:
+            interval_raw = (
+                envs.SGLANG_HICACHE_FILE_BACKEND_ORPHAN_SWEEP_INTERVAL_SECONDS.get()
+            )
+        self._orphan_sweep_interval_seconds = (
+            300.0 if interval_raw is None else float(interval_raw)
+        )
+        self._next_orphan_sweep = time.monotonic() + self._orphan_sweep_interval_seconds
+        if self._evictor.is_storage_owner:
+            # Untracked leftover bytes count toward the free-space watermark.
+            self._evictor.sweep_callback = self.sweep_orphans
+            self.sweep_orphans()
 
         # Page I/O mode; extra_config takes precedence over the env default.
-        io_mode_raw = None
-        if storage_config.extra_config:
-            io_mode_raw = storage_config.extra_config.get("io_mode")
+        io_mode_raw = extra_cfg.get("io_mode")
         if io_mode_raw is None:
             io_mode_raw = envs.SGLANG_HICACHE_FILE_BACKEND_IO_MODE.get()
         if io_mode_raw not in ("buffered", "direct"):
@@ -552,7 +635,10 @@ class HiCacheFile(HiCacheStorage):
         return key + self.config_suffix
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
-        if component_name is None or component_name in ("__default__", PoolName.KV):
+        if component_name is None or component_name in (
+            DEFAULT_COMPONENT_KEY,
+            PoolName.KV,
+        ):
             return self._get_suffixed_key(key)
         return self._get_suffixed_key(f"{key}.{component_name}")
 
@@ -562,6 +648,47 @@ class HiCacheFile(HiCacheStorage):
         return os.path.join(
             self.file_path, f"{self._get_component_key(key, component_name)}.bin"
         )
+
+    def touch_many(self, keys: List[str]) -> None:
+        """Bump L3 recency for whole page groups, KV payload and sidecars.
+
+        Called once per insert with the batch of re-referenced page hashes;
+        missing files are benign (the batched touch adopts nothing for them).
+        """
+        if not self._evictor.enabled:
+            return
+        pool_suffixes = [
+            f".{pool}{self.config_suffix}"
+            for pool in self.registered_pools
+            if pool not in (PoolName.KV, DEFAULT_COMPONENT_KEY)
+        ]
+        kv_suffix = self.config_suffix
+        pairs = []
+        for key in keys:
+            pairs.append(
+                (key + kv_suffix, os.path.join(self.file_path, f"{key}{kv_suffix}.bin"))
+            )
+            for pool_suffix in pool_suffixes:
+                stem = f"{key}{pool_suffix}"
+                pairs.append((stem, os.path.join(self.file_path, f"{stem}.bin")))
+        self._evictor.touch_many(pairs)
+
+    def _group_sibling_keys(self, suffixed_key: str) -> List[str]:
+        """Stems of every file storing part of the same page group.
+
+        Page keys are hashes without dots, so a sidecar stem is unambiguously
+        ``{key}.{pool}{suffix}`` while the KV payload stem is ``{key}{suffix}``.
+        """
+        if not suffixed_key.endswith(self.config_suffix):
+            return []
+        stem = suffixed_key[: -len(self.config_suffix)]
+        base = stem.rpartition(".")[0] or stem
+        siblings = [base + self.config_suffix]
+        for pool in self.registered_pools:
+            if pool in (PoolName.KV, DEFAULT_COMPONENT_KEY):
+                continue
+            siblings.append(f"{base}.{pool}{self.config_suffix}")
+        return siblings
 
     # ------------------------------------------------------------------
     # Direct (O_DIRECT) positional zero-copy page I/O
@@ -715,7 +842,7 @@ class HiCacheFile(HiCacheStorage):
     def _read_page_segments(self, storage_key: str, segments: List[tuple]) -> bool:
         """Read one page's segments from its file; True on an exact-length read."""
         suffixed = self._get_suffixed_key(storage_key)
-        tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
+        tensor_path = self._get_component_path(storage_key)
         expected = sum(size for _, size in segments)
         try:
             fd = os.open(tensor_path, os.O_RDONLY | self._o_direct)
@@ -753,7 +880,7 @@ class HiCacheFile(HiCacheStorage):
     def _write_page_segments(self, storage_key: str, segments: List[tuple]) -> bool:
         """Write one page's segments via a unique temp file + os.replace."""
         suffixed = self._get_suffixed_key(storage_key)
-        tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
+        tensor_path = self._get_component_path(storage_key)
         # Fast path: same key already on disk. Refresh recency and skip rewrite.
         if self.exists(storage_key):
             self._evictor.touch(suffixed, tensor_path)
@@ -901,17 +1028,98 @@ class HiCacheFile(HiCacheStorage):
             ):
                 self.metadata_cache.add(stem)
 
+    # Temp/probe leftovers from crashed writes: direct page write
+    # ({suffixed}.bin.tmp.{pid}.{tid}.{uuid}), buffered set (.{uuid}.tmp),
+    # and the O_DIRECT capability probe (.odirect_probe.{pid}.{tid}).
+    _ORPHAN_TEMP_PATTERNS = (
+        re.compile(r"\.bin\.tmp\.\d+\.\d+\.[0-9a-f]+$"),
+        re.compile(r"^\.[0-9a-f]+\.tmp$"),
+        re.compile(r"^\.odirect_probe\.\d+\.\d+$"),
+    )
+
+    def sweep_orphans(self) -> int:
+        """Delete leftover temp/probe files and stale-format pages.
+
+        Only files this instance could never read again are removed: aborted
+        temp writes and probes older than the grace window (a live writer or a
+        concurrently running older instance may still own them), and pages
+        carrying this instance's model/rank identity but an older format
+        fingerprint. Files of other ranks/models are never touched — the
+        suffix encodes their tp/pp/cp rank, so a shared directory would
+        otherwise cross-delete. Returns the bytes reclaimed. Caller may hold
+        the evictor lock (this sweep only touches untracked files).
+        """
+        if not self._evictor.is_storage_owner:
+            return 0
+        identity_prefix = self.config_suffix.rsplit("_fmt", 1)[0]
+        try:
+            names = os.listdir(self.file_path)
+        except FileNotFoundError:
+            return 0
+        now = time.time()
+        reclaimed = 0
+        removed = 0
+        for fn in names:
+            orphan = any(p.search(fn) for p in self._ORPHAN_TEMP_PATTERNS)
+            if not orphan and fn.endswith(".bin"):
+                # Page stems are "{key}{suffix}" with suffix ending in
+                # "_fmt{fingerprint}"; a same-identity stem carrying a
+                # different (older) fingerprint can never be read again.
+                stem_prefix, _, stem_fp = fn[:-4].rpartition("_fmt")
+                orphan = (
+                    stem_prefix.endswith(identity_prefix)
+                    and stem_fp
+                    and stem_fp != self.format_fingerprint
+                )
+            if not orphan:
+                continue
+            path = os.path.join(self.file_path, fn)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if now - st.st_mtime < self._orphan_grace_seconds:
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                continue
+            reclaimed += st.st_size
+            removed += 1
+        if removed:
+            logger.info(
+                "HiCacheFile orphan sweep: removed %d leftover files, "
+                "reclaimed %d bytes",
+                removed,
+                reclaimed,
+            )
+        if self.metadata_cache is not None:
+            purged = self.metadata_cache.purge()
+            if purged:
+                logger.info(
+                    "HiCacheFile metadata cache purged %d expired entries",
+                    purged,
+                )
+        return reclaimed
+
+    def maybe_sweep_orphans(self) -> None:
+        """Periodic orphan sweep hook for the storage threads' idle paths."""
+        now = time.monotonic()
+        if now < self._next_orphan_sweep:
+            return
+        self._next_orphan_sweep = now + self._orphan_sweep_interval_seconds
+        self.sweep_orphans()
+
     def _log_storage_tensor_digest(
         self, direction: str, key: str, tensor: torch.Tensor
     ) -> None:
         if not self.log_page_digests:
             return
-        flat_bytes = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
         logger.warning(
             "HiCache storage tensor digest direction=%s key=%s bytes=%d sha256=%s",
             direction,
             key,
-            flat_bytes.numel(),
+            tensor.numel() * tensor.element_size(),
             hicache_tensor_digest(tensor),
         )
 
@@ -1145,7 +1353,6 @@ class HiCacheFile(HiCacheStorage):
         )
         storage_key = self._log_key(pool_name, key)
         for component, tensor in components:
-            flat_bytes = tensor.detach().contiguous().view(torch.uint8)
             logger.warning(
                 "HiCache page digest direction=%s pool=%s component=%s key=%s "
                 "host_page=%d bytes=%d sha256=%s",
@@ -1154,7 +1361,7 @@ class HiCacheFile(HiCacheStorage):
                 component,
                 storage_key,
                 page_offset,
-                flat_bytes.numel(),
+                tensor.numel() * tensor.element_size(),
                 hicache_tensor_digest(tensor),
             )
 
