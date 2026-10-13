@@ -76,6 +76,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.draft_moe_gemv import DraftMoeGemvRunner
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
@@ -2366,6 +2367,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self.enable_flashinfer_trtllm_moe and not get_moe_a2a_backend().is_megamoe()
         )
         self._cache_permute_indices = {}
+        # Set by enable_draft_moe_gemv for draft-model layers (SGLANG_OPT_DRAFT_MOE_GEMV).
+        self.draft_moe_gemv: Optional[DraftMoeGemvRunner] = None
 
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:
@@ -3244,6 +3247,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
                 FlashInferCutlassMoeQuantInfo,
             )
+
+            if self.draft_moe_gemv is not None:
+                combine_input = self.draft_moe_gemv.maybe_apply(
+                    layer=layer, dispatch_output=dispatch_output
+                )
+                if combine_input is not None:
+                    return combine_input
 
             assert not self.moe_runner_config.apply_router_weight_on_input, (
                 "apply_router_weight_on_input is not supported for Flashinfer"

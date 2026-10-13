@@ -1343,6 +1343,10 @@ class Envs:
     # standard dispatcher, and the triton MoE runner; falls back silently
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
+    # Draft (MTP/NEXTN) MoE layers on the FlashInfer CUTLASS NVFP4 runner: run
+    # one-token calls as a W4A16 Triton GEMV (layers/moe/draft_moe_gemv.py).
+    # Changes draft numerics only (bf16 activations instead of FP4).
+    SGLANG_OPT_DRAFT_MOE_GEMV = EnvBool(False)
 
     # ===================================================================
     # DeepGEMM Mega MoE
@@ -1707,6 +1711,11 @@ class Envs:
     # Multi-layer chain-MTP boundary-KV fix: widen the draft-extend window to
     # rewrite rejected-draft KV rows before reuse (acc_len repair; on by default).
     SGLANG_ENABLE_MTP_BOUNDARY_KV_FIX = EnvBool(True)
+    # Opt-in (donor SGLANG_MTP_FC_GEMV, aiueo52/sglang-rtxpro6000 @5105985
+    # qwen4_exp_mtp.py:32): route the draft MTP entry fusion's BF16
+    # fc_embedding/fc_hidden GEMMs through the resident donor dense GEMV at
+    # decode widths (rows <= 16); everything else keeps the cuBLAS fallback.
+    SGLANG_MTP_FC_GEMV = EnvBool(False)
     SGLANG_OPT_USE_INKLING_MULTI_STREAM_OVERLAP = EnvBool(True)
     SGLANG_OPT_USE_INKLING_SHEARED_BIAS = EnvBool(True)
     # Use feature-stacked GEMMs for the no-LoRA BF16 shared sink. Eligible LoRA

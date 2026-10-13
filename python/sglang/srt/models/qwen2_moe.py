@@ -341,6 +341,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 config.model_type == "qwen3_5_moe_text" and uses_cutedsl_ar_fusion()
             ),
         )
+        if is_nextn and envs.SGLANG_OPT_DRAFT_MOE_GEMV.get():
+            from sglang.srt.layers.moe.draft_moe_gemv import enable_draft_moe_gemv
+
+            enable_draft_moe_gemv(self.experts)
 
         self.gate = ReplicatedLinear(
             config.hidden_size,

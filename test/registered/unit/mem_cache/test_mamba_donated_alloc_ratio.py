@@ -336,22 +336,55 @@ class TestPPMambaPoolSizing(unittest.TestCase):
 
 
 class TestExtraMambaCacheSizing(unittest.TestCase):
+    """Backend per-request extra state (e.g. sparse-indexer buffers) rides on the
+    mamba slot cost; the spec verify scratch is priced from the real buffer
+    shapes (pinned exhaustively in test_spec_mamba_buffer_accounting.py) with
+    the CUDA dedup layout fixed regardless of the host platform."""
+
+    # (conv 512*3 bf16 + ssm 4*8*8 fp32) * 4 layers, and the draft-2 scratch:
+    # conv dedup 512*(2+2)*2*4 + ssm snapshots 4*8*8*4*2*4.
+    PER_REQ = 16384
+    INTER = 24576
+
     @staticmethod
     def _size(extra_bytes, *, pp_size=1, dp_size=1, draft_tokens=None, **schedule):
+        from unittest.mock import patch
+
         from sglang.srt import runtime_context as rc
+        from sglang.srt.configs.mamba_utils import (
+            Mamba2CacheParams,
+            Mamba2StateDType,
+            Mamba2StateShape,
+        )
+        from sglang.srt.mem_cache import kv_cache_configurator as kcc
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
         from sglang.srt.runtime_context import get_schedule
 
+        shape = Mamba2StateShape(
+            conv=[(512, 3)],
+            temporal=(4, 8, 8),
+            intermediate_size=0,
+            conv_dim=0,
+            ssm_state_size=0,
+            num_heads=0,
+            head_dim=0,
+            state_size=0,
+            conv_kernel=4,
+            num_k_heads_per_tp=1,
+        )
+        params = Mamba2CacheParams(
+            shape=shape,
+            dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32),
+            layers=[0, 1, 2, 3],
+        )
         fake = SimpleNamespace(
-            mambaish_config=SimpleNamespace(
-                mamba2_cache_params=SimpleNamespace(
-                    layers=[0, 1, 2, 3], mamba_cache_per_req=4 << 20
-                )
-            ),
+            mambaish_config=SimpleNamespace(mamba2_cache_params=params),
             extra_mamba_cache_bytes_per_req=extra_bytes,
             spec_algorithm=SimpleNamespace(is_none=lambda: draft_tokens is None),
             attn_dp_size=dp_size,
             pp_size=pp_size,
+            hybrid_gdn_config=None,
+            hybrid_kda_config=None,
             model_config=SimpleNamespace(num_hidden_layers=4),
             _calculate_mamba_ratio=lambda: 2,
         )
@@ -365,12 +398,21 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
         )
         args.update(schedule)
         with rc.get_context().override_server_args(**args):
-            remaining = KVCacheConfigurator._handle_max_mamba_cache(fake, 120 / 1024)
+            with (
+                patch.object(kcc, "_is_cpu", False),
+                patch.object(kcc, "_is_npu", False),
+            ):
+                remaining = KVCacheConfigurator._handle_max_mamba_cache(
+                    fake, 120 / 1024
+                )
             return get_schedule().max_mamba_cache_size, remaining * (1 << 30)
 
     def test_auto_capacity_reserves_backend_state(self):
-        self.assertEqual(self._size(0), (9, 80 << 20))
-        self.assertEqual(self._size(4 << 20), (4, 80 << 20))
+        self.assertEqual(self._size(0), (2559, 80 << 20))
+        self.assertEqual(
+            self._size(4 << 20),
+            (8, (120 << 20) - 9 * (self.PER_REQ + (4 << 20))),
+        )
 
     def test_fixed_capacity_charges_padding_and_partitioned_state(self):
         for pp_size in (1, 2):
@@ -384,40 +426,59 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
                             8 << 20, pp_size=pp_size, dp_size=dp_size, **schedule
                         )
                         self.assertEqual(slots, 8 // dp_size)
+                        # 4 layers split evenly over <= 2 stages halve the
+                        # per-stage share of both the state and the extra bytes.
+                        per_slot_stage = (self.PER_REQ + (8 << 20)) // pp_size
                         self.assertEqual(
                             remaining,
-                            (120 << 20) - (slots + 1) * (12 << 20) // pp_size,
+                            (120 << 20) - (slots + 1) * per_slot_stage,
                         )
 
     def test_speculative_auto_capacity_keeps_scratch_separate(self):
-        self.assertEqual(self._size(0, draft_tokens=2), (3, 88 << 20))
-        self.assertEqual(self._size(4 << 20, draft_tokens=2), (2, 80 << 20))
+        # ratio 2: slots = (40 MiB - per_slot - INTER) // (per_slot + INTER/2)
+        self.assertEqual(
+            self._size(0, draft_tokens=2),
+            (1461, (120 << 20) - 1462 * self.PER_REQ - 257 * self.INTER),
+        )
+        # capped at 8 // ratio = 4 requests -> 5 scratch slots.
+        self.assertEqual(
+            self._size(4 << 20, draft_tokens=2),
+            (8, (120 << 20) - 9 * (self.PER_REQ + (4 << 20)) - 5 * self.INTER),
+        )
 
     def test_pd_prefill_does_not_reserve_speculative_scratch(self):
         """A PD prefill server's hybrid req pool never allocates the per-draft-token
-        verify snapshots, so none of the three capacity branches may charge them."""
+        verify scratch, so none of the three capacity branches may charge them."""
         prefill = dict(disaggregation_mode="prefill")
-        # Fixed capacity: 8 slots, ratio 2 -> 4 capped reqs; the (4 + 1) * 2 * 4 MiB
+        # Fixed capacity: 8 slots, ratio 2 -> 4 capped reqs; the (4 + 1) * INTER
         # scratch is only charged outside PD prefill.
         self.assertEqual(
-            self._size(0, draft_tokens=2, max_mamba_cache_size=8), (8, 44 << 20)
+            self._size(0, draft_tokens=2, max_mamba_cache_size=8),
+            (8, (120 << 20) - 9 * self.PER_REQ - 5 * self.INTER),
         )
         self.assertEqual(
             self._size(0, draft_tokens=2, max_mamba_cache_size=8, **prefill),
-            (8, 84 << 20),
+            (8, (120 << 20) - 9 * self.PER_REQ),
         )
         # Capacity from max_running_requests with the radix cache disabled.
         fixed = dict(disable_radix_cache=True, max_running_requests=8)
-        self.assertEqual(self._size(0, draft_tokens=2, **fixed), (8, 12 << 20))
         self.assertEqual(
-            self._size(0, draft_tokens=2, **fixed, **prefill), (8, 84 << 20)
+            self._size(0, draft_tokens=2, **fixed),
+            (8, (120 << 20) - 9 * self.PER_REQ - 9 * self.INTER),
+        )
+        self.assertEqual(
+            self._size(0, draft_tokens=2, **fixed, **prefill),
+            (8, (120 << 20) - 9 * self.PER_REQ),
         )
         # Auto capacity sizes like a non-speculative server.
         self.assertEqual(self._size(0, draft_tokens=2, **prefill), self._size(0))
-        # Prefill pools that still allocate the snapshots keep the reserve.
-        for allocates in (
-            dict(enable_pd_role_switch=True),
-            dict(enable_unified_memory=True),
+        # Prefill pools that still allocate the snapshots keep the reserve. The
+        # role-switch pool keeps the standalone dedup layout; the unified pool
+        # always holds the dense buffers (no dedup view, see memory_pool.py).
+        dense = 24576 + 8192  # dense conv window + ssm snapshots at draft 2
+        for allocates, inter in (
+            (dict(enable_pd_role_switch=True), self.INTER),
+            (dict(enable_unified_memory=True), dense),
         ):
             with self.subTest(**allocates):
                 self.assertEqual(
@@ -428,7 +489,7 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
                         **prefill,
                         **allocates,
                     ),
-                    (8, 44 << 20),
+                    (8, (120 << 20) - 9 * self.PER_REQ - 5 * inter),
                 )
 
 

@@ -287,6 +287,7 @@ from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
     allocate_distinct_stream,
+    compute_spec_context_reserve,
     is_health_check_generate_req,
     validate_input_length,
 )
@@ -457,6 +458,10 @@ class Scheduler(
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
+
+    # Context kept free past each request's length cap for speculative
+    # lookahead (see compute_spec_context_reserve); 0 when spec is off.
+    spec_context_reserve: int = 0
 
     def __init__(
         self,
@@ -1188,6 +1193,7 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        self.spec_context_reserve = compute_spec_context_reserve(self.enable_overlap)
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -2604,7 +2610,7 @@ class Scheduler(
             0,
             min(
                 max_new_tokens,
-                self.max_req_len - input_len - 1,
+                self.max_req_len - input_len - 1 - self.spec_context_reserve,
             ),
         )
         # PrefillAdder reserves one page per shard; the allocator reserves one.
