@@ -1138,6 +1138,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     for i in range(block_offset, block_offset + block_size)
                 ],
                 dtype=positions_dtype,
+                pin_memory=is_pin_memory_available(device),
             ).to(device, non_blocking=True)
         elif (
             ret.spec_info is not None

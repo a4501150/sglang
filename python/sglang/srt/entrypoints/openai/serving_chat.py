@@ -2744,7 +2744,9 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> ChoiceLogprobs:
         """Process logprobs for streaming response"""
         output_token_logprobs = content["meta_info"]["output_token_logprobs"]
-        output_top_logprobs = content["meta_info"].get("output_top_logprobs", [])
+        # An absent row set arrives as None when the request never asked for
+        # alternatives; treat it as empty so slicing keeps working.
+        output_top_logprobs = content["meta_info"].get("output_top_logprobs") or []
         if not get_serving().incremental_streaming_output:
             output_token_logprobs = output_token_logprobs[
                 n_prev_token:total_output_logprobs
