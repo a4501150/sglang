@@ -72,6 +72,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     KVCache,
     MHATokenToKVPool,
+    MHATokenToKVPoolDynamicFP8,
     MHATokenToKVPoolMXFP8,
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
@@ -2321,6 +2322,12 @@ class KVCacheConfigurator:
                 "swa_v_head_dim": self.model_config.swa_v_head_dim,
                 "v_head_dim": self.model_config.v_head_dim,
             }
+        if self.kv_cache_dtype_str == "fp8_e4m3_dynamic":
+            raise ValueError(
+                "--kv-cache-dtype fp8_e4m3_dynamic is currently supported only "
+                "by QSA models (the dynamic per-token scale buffers are "
+                "consumed by the QSA attention kernels)."
+            )
         swa_pool_class = (
             MHATokenToKVPoolMXFP8
             if self.kv_cache_dtype_str == "mxfp8"
@@ -2473,6 +2480,12 @@ class KVCacheConfigurator:
                 f"--qsa-indexer-dtype {qsa_indexer_dtype} needs a model with a "
                 "compressed QSA indexer (Qwen4-Exp); this model has none"
             )
+        if self.kv_cache_dtype_str == "fp8_e4m3_dynamic" and qsa_profile is None:
+            raise ValueError(
+                "--kv-cache-dtype fp8_e4m3_dynamic is currently supported only "
+                "by QSA models (the dynamic per-token scale buffers are "
+                "consumed by the QSA attention kernels)."
+            )
         if qsa_profile is None:
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend
@@ -2530,8 +2543,10 @@ class KVCacheConfigurator:
             return NPUMHATokenToKVPool
         if self.use_mla_backend:
             return mla_pool_class
-        # MXFP8 KV cache needs the block-scaled pool (data + UE8M0 scale
-        # buffers) for the full-attention layers, same as the SWA branch.
+        # Dynamic FP8 (per-token scales) and MXFP8 (block scales) both need
+        # their scale-carrying pool for the full-attention layers.
+        if self.kv_cache_dtype_str == "fp8_e4m3_dynamic":
+            return MHATokenToKVPoolDynamicFP8
         if self.kv_cache_dtype_str == "mxfp8":
             return MHATokenToKVPoolMXFP8
         return mha_pool_class
@@ -2539,6 +2554,12 @@ class KVCacheConfigurator:
     def _build_mha_kv_pool(
         self, *, max_total_num_tokens: int, mha_pool_class: type, quant_method=None
     ) -> KVCache:
+        if self.kv_cache_dtype_str == "fp8_e4m3_dynamic":
+            raise ValueError(
+                "--kv-cache-dtype fp8_e4m3_dynamic is currently supported only "
+                "by QSA models (the dynamic per-token scale buffers are "
+                "consumed by the QSA attention kernels)."
+            )
         if self.kv_cache_dtype_str == "mxfp8":
             pool_cls = MHATokenToKVPoolMXFP8
         else:
