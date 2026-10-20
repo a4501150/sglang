@@ -4,7 +4,7 @@ import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Iterable, Optional, Set, Tuple, Union
+from typing import Any, Iterable, List, Optional, Set, Tuple, Union
 
 import msgspec
 import sympy
@@ -26,7 +26,11 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.linear.utils import (
     select_verify_intermediate_state_indices,
 )
-from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStateList,
+    AuxHiddenStatePacker,
+)
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_shard_hidden_states,
@@ -1468,6 +1472,43 @@ def _shards_rows_over_cp(forward_batch: ForwardBatch) -> bool:
     )
 
 
+def _validate_dflash_completed_layer_ids(
+    layer_ids: List[int], *, num_hidden_layers: int
+) -> Tuple[int, ...]:
+    """Validate DFLASH capture ids: zero-based completed outputs, ascending.
+
+    Ascending order is a hard requirement, not a preference: captures pack in
+    loop order, and the draft's fc consumes them in its training order.
+    """
+    if not layer_ids:
+        raise ValueError("DFLASH requires explicit layer_ids for aux hidden capture.")
+    resolved = tuple(int(v) for v in layer_ids)
+    for idx, val in enumerate(resolved):
+        if val < 0 or val >= num_hidden_layers:
+            raise ValueError(
+                f"DFLASH target_layer_ids[{idx}]={val} falls outside the "
+                f"target's [0, {num_hidden_layers}) layers."
+            )
+    if len(set(resolved)) != len(resolved) or list(resolved) != sorted(resolved):
+        raise ValueError(
+            "DFLASH target_layer_ids must be strictly ascending (sorted, no "
+            f"duplicates); got {list(layer_ids)}."
+        )
+    return resolved
+
+
+def _dflash_completed_layer_output(
+    hidden_states: torch.Tensor, hc_count: int, hidden_size: int
+) -> torch.Tensor:
+    """Contract a completed layer's hc-widened output to the feature DFlash2
+    drafts trained on: the mean over the hyper-connection streams."""
+    assert hidden_states.shape[-1] == hc_count * hidden_size, (
+        f"DFLASH capture expected {hc_count} * {hidden_size} widened streams, "
+        f"got {tuple(hidden_states.shape)}."
+    )
+    return hidden_states.unflatten(-1, (hc_count, hidden_size)).mean(dim=-2)
+
+
 def _linear_attn_options():
     """Linear attention scans the sequence in token order, and its output owes
     the sum over the group its heads are partitioned over."""
@@ -2002,6 +2043,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         super().__init__(config, quant_config, prefix, is_nextn)
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
+        # Set by Qwen4ExpForConditionalGeneration.set_dflash_layers_to_capture.
+        self._dflash_completed_layer_ids: Tuple[int, ...] = ()
         self.has_ple = any(
             self.layers[layer_id].ple is not None
             for layer_id in range(self.start_layer, self.end_layer)
@@ -2076,7 +2119,26 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 ngram_size=self.ple_ngram_size,
                 ngram_eos_token_id=self.ple_ngram_eos_token_id,
             )
-        aux_hidden_states = AuxHiddenStateList()
+        dflash_completed_layer_ids = self._dflash_completed_layer_ids
+        if dflash_completed_layer_ids and shards_rows:
+            # Stream-averaged capture reads whole rows; under CP row sharding
+            # each rank would only hold its own slice.
+            raise RuntimeError(
+                "DFLASH aux capture on Qwen4-Exp requires attn_cp_size == 1."
+            )
+        # The packer writes captures into the decode graph runner's aux buffer
+        # when the batch carries one, so every graph size aliases one output
+        # tensor instead of pinning its own.
+        aux_hidden_states: AuxHiddenStateAccumulator = (
+            AuxHiddenStatePacker.for_batch(
+                forward_batch, len(dflash_completed_layer_ids)
+            )
+            if dflash_completed_layer_ids
+            else AuxHiddenStateList()
+        )
+        captured_last_layer_outputs = (
+            None if dflash_completed_layer_ids else aux_hidden_states
+        )
         normalized_input = None
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
@@ -2106,13 +2168,23 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     forward_batch=forward_batch,
                     ple_batch=ple_batch,
                     captured_last_layer_outputs=(
-                        aux_hidden_states
+                        captured_last_layer_outputs
                         if getattr(layer, "_is_layer_to_capture", False)
                         else None
                     ),
                 )
 
             normalized_input = norms.output
+
+            if i in dflash_completed_layer_ids:
+                # DFlash2 was trained on completed zero-based layer outputs,
+                # not on the next layer's hc-normed input.
+                aux_hidden_states.capture(
+                    _dflash_completed_layer_output(
+                        hidden_states, self.hc_count, self.hidden_size
+                    ),
+                    owned=True,
+                )
 
         if breakable_ple:
             _breakable_commit_ple_batch(batch=ple_batch)
@@ -2142,12 +2214,20 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 if capture is not None and capture.need_capture()
                 else None
             )
+        if dflash_completed_layer_ids:
+            # The parent class unpacks (hidden, packed aux) through
+            # capture_aux_hidden_states; the MTP hc-hidden return stays off.
+            return hidden_states, aux_hidden_states.finalize()
         if not forward_batch.forward_mode.is_idle():
             return hidden_states, hc_hidden_states
 
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
+
+    def get_aux_hidden_states_width(self) -> int:
+        # The decode graph runner preallocates this many aux columns per token.
+        return len(self._dflash_completed_layer_ids) * self.hidden_size
 
 
 class Qwen4ExpVLModel(Qwen4ExpModel):
@@ -2187,6 +2267,11 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
         if isinstance(model_output, PPProxyTensors):
             return model_output
         if isinstance(model_output, tuple):
+            if self._dflash_completed_layer_ids:
+                # The (hidden, packed aux) tuple passes through to the
+                # ForConditionalGeneration logits processor; the hc streams
+                # are not captured for DFlash.
+                return model_output
             hidden_states, self.last_hc_hidden_states = model_output
             return hidden_states
         return model_output
@@ -2227,6 +2312,33 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
         return embed, head
+
+    def get_aux_hidden_states_width(self) -> int:
+        return self.model.get_aux_hidden_states_width()
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        """Capture completed layer outputs for DFlash2 drafts.
+
+        The ids name zero-based completed outputs directly (no +1 shift):
+        DFlash2 was trained on completed outputs averaged over the hc
+        streams, unlike the layer-input capture the Qwen3-VL base performs.
+        """
+        if not self.pp_group.is_last_rank:
+            return
+        if self.pp_group.world_size != 1:
+            raise ValueError(
+                "DFLASH aux capture on Qwen4-Exp requires pipeline-parallel "
+                "world size 1: earlier stages would drop their captures."
+            )
+        resolved = _validate_dflash_completed_layer_ids(
+            layer_ids, num_hidden_layers=self.model.config.num_hidden_layers
+        )
+        self.capture_aux_hidden_states = True
+        self.model._dflash_completed_layer_ids = resolved
+        logger.info(
+            "Qwen4-Exp DFLASH capture: completed layers %s, hc stream-averaged.",
+            list(resolved),
+        )
 
     @torch.no_grad()
     def forward(
