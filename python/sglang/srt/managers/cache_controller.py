@@ -301,6 +301,11 @@ class PrefetchOperation(StorageOperation):
 
 
 class HiCacheController:
+    # Class-level defaults so partially-constructed controllers (tests)
+    # read the flags before attach; attach flips them per instance.
+    storage_device_direct = False
+    _device_staging_pools: dict = {}
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -345,7 +350,7 @@ class HiCacheController:
         # Buffer-mode device-target reads: L3 pages land in GPU staging
         # arenas and scatter into device pools, bypassing the host tier.
         self.storage_device_direct = False
-        self._device_staging_pools: dict = {}
+        self._device_staging_pools = {}
         self.enable_storage_metrics = enable_storage_metrics
         # Buffer mode: wired by the tree cache after attach; the load rate
         # limiter subtracts write staging from actual pool usage.
@@ -1066,13 +1071,19 @@ class HiCacheController:
                 self.load_fence_stream
             )
 
-        completion = self.l2_transfer_engine.submit_host_to_device(
-            self._l2_load_transfers(
+        if op.device_staged:
+            transfers = self._l2_load_transfers(
                 host_indices,
                 device_indices,
                 pool_transfers,
-                device_staged=op.device_staged,
-            ),
+                device_staged=True,
+            )
+        else:
+            transfers = self._l2_load_transfers(
+                host_indices, device_indices, pool_transfers
+            )
+        completion = self.l2_transfer_engine.submit_host_to_device(
+            transfers,
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
             transfer_layer_id_max=self.transfer_layer_id_max,

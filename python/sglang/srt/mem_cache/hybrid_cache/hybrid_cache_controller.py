@@ -930,9 +930,12 @@ class HybridCacheController(BaseHiCacheController):
         pool_transfers: Optional[list[PoolTransfer]] = None,
         device_staged: bool = False,
     ) -> list[L2Transfer]:
-        transfers = self._l2_transfers(
-            host_indices, device_indices, pool_transfers, device_staged=device_staged
-        )
+        if device_staged:
+            transfers = self._l2_transfers(
+                host_indices, device_indices, pool_transfers, device_staged=True
+            )
+        else:
+            transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
         transfers_by_entry = {
             (id(t.host_pool), id(t.device_pool)): t for t in transfers
         }

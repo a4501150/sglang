@@ -1916,11 +1916,14 @@ class BufferModePipeline:
             # Not staging, so these stay out of the aux_xfers the ack frees.
             load_xfers.extend(load_context.load_xfers)
         trim_tokens = plan.device_prefix_len - f.matched_len
+        load_kwargs = {}
+        if cache.cache_controller.storage_device_direct:
+            load_kwargs["device_staged"] = True
         device_indices = cache.cache_controller.load(
             host_indices=f.host_indices[trim_tokens:],
             node_id=load_back_id,
             extra_pools=load_xfers or None,
-            device_staged=cache.cache_controller.storage_device_direct,
+            **load_kwargs,
         )
         for load_context in load_contexts:
             load_context.finalize_allocation(success=device_indices is not None)
