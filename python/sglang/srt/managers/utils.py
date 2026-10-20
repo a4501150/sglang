@@ -17,6 +17,7 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -493,3 +494,20 @@ def compute_num_reserved_tokens() -> int:
         spec.speculative_eagle_topk * spec.speculative_num_steps,
         max_speculative_num_draft_tokens(),
     )
+
+
+def compute_spec_context_reserve() -> int:
+    """Context slots the scheduler keeps free past a request's length cap.
+
+    Every spec algorithm's decode prep over-allocates
+    ``get_alloc_reserve_per_decode()`` KV slots past each request's committed
+    length (DFLASH reserves ``2 * block_size`` itself; eagle/UNO share the same
+    double-buffer), so a request admitted up to its context cap would write
+    ``req_to_token`` rows -- and run verify positions -- past ``context_len``
+    (FA3 page table, RoPE cache). The reserve is not gated on overlap: the
+    allocators double-buffer unconditionally. 0 with spec decoding off; the
+    plain ``- 1`` in ``init_req_max_new_tokens`` covers that case.
+    """
+    if get_spec().speculative_algorithm is None:
+        return 0
+    return get_alloc_reserve_per_decode()

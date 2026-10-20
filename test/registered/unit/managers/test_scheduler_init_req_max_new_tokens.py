@@ -6,9 +6,11 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.utils import compute_spec_context_reserve
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -18,7 +20,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
     """Property tests for Scheduler.init_req_max_new_tokens.
 
     Rules enforced when clipping a request's max_new_tokens:
-      1. context: input_len + max_new_tokens < max_req_len
+      1. context: input_len + max_new_tokens + spec_context_reserve < max_req_len
       2. admission budget (PrefillAdder):
          ceil_page(input_len) + max_new_tokens + page_size * shard_widening
          < max_total_num_tokens * shard_widening
@@ -54,9 +56,11 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         max_total_num_tokens: int = 1024,
         page_size: int = 1,
         kv_shard_widening: int = 1,
+        spec_context_reserve: int = 0,
     ) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.max_req_len = max_req_len
+        scheduler.spec_context_reserve = spec_context_reserve
         scheduler.max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
         scheduler.kv_shard_widening = kv_shard_widening
@@ -97,7 +101,10 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         limit_active = limit is not None and limit > 0
 
         def satisfies_rules(candidate: int) -> bool:
-            context_ok = input_len + candidate < scheduler.max_req_len
+            context_ok = (
+                input_len + candidate + scheduler.spec_context_reserve
+                < scheduler.max_req_len
+            )
             budget_ok = (
                 paged_input_len + candidate + page_size * shard_widening
                 < scheduler.max_total_num_tokens * shard_widening
@@ -208,24 +215,107 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                             (32, 24),
                             (128, 24),
                         ):
-                            with self.subTest(
-                                page_size=page_size,
-                                input_len=input_len,
-                                requested=requested,
-                                limit=limit,
-                                max_req_len=max_req_len,
-                                max_total_num_tokens=max_total_num_tokens,
-                            ):
-                                with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(limit):
+                            for spec_context_reserve in (0, 8):
+                                with (
+                                    self.subTest(
+                                        page_size=page_size,
+                                        input_len=input_len,
+                                        requested=requested,
+                                        limit=limit,
+                                        max_req_len=max_req_len,
+                                        max_total_num_tokens=max_total_num_tokens,
+                                        spec_context_reserve=spec_context_reserve,
+                                    ),
+                                    envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(limit),
+                                ):
                                     scheduler = self._new_scheduler(
                                         max_req_len=max_req_len,
                                         max_total_num_tokens=max_total_num_tokens,
                                         page_size=page_size,
+                                        spec_context_reserve=spec_context_reserve,
                                     )
                                     req = self._new_req(
-                                        max_new_tokens=requested, input_len=input_len
+                                        max_new_tokens=requested,
+                                        input_len=input_len,
                                     )
                                     self._init_and_check(scheduler, req)
+
+    def test_spec_context_reserve_tracks_decode_over_allocation(self):
+        """The admission reserve is exactly the per-step decode
+        over-allocation (the double-buffer every spec algorithm's
+        prepare_for_decode writes past committed length), so admission and
+        allocation can never disagree."""
+        cases = (
+            ("EAGLE", 3, 1, 4),
+            ("EAGLE", 5, 2, 8),
+            ("DFLASH", 1, 1, 8),
+        )
+        for algo, steps, topk, draft in cases:
+            with (
+                self.subTest(algo=algo, steps=steps, topk=topk, draft=draft),
+                get_context().override_server_args(
+                    speculative_algorithm=algo,
+                    speculative_num_steps=steps,
+                    speculative_eagle_topk=topk,
+                    speculative_num_draft_tokens=draft,
+                    page_size=1,
+                ),
+                get_parallel().override(attn_dcp_size=1),
+            ):
+                self.assertEqual(
+                    compute_spec_context_reserve(),
+                    2 * get_alloc_len_per_decode(),
+                )
+
+    def test_spec_context_reserve_is_zero_without_spec(self):
+        with get_context().override_server_args(speculative_algorithm=None):
+            self.assertEqual(compute_spec_context_reserve(), 0)
+
+    def test_spec_in_flight_extent_stays_within_context(self):
+        """A request run to its length cap under DFLASH: the in-flight
+        extent -- the verify window plus the double-buffered next step that
+        prepare_for_decode maps into req_to_token -- must stay inside
+        context_len, or the page-table row and RoPE cache overrun."""
+        context_len, input_len = 4096, 25
+        max_req_len = context_len - 1  # TpModelWorker.get_worker_info
+        draft = 8  # DFLASH block size
+
+        def in_flight_extent(max_new_tokens):
+            return input_len + max_new_tokens + 2 * draft
+
+        with (
+            get_context().override_server_args(
+                speculative_algorithm="DFLASH",
+                speculative_num_steps=1,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=draft,
+                page_size=1,
+            ),
+            get_parallel().override(attn_dcp_size=1),
+        ):
+            reserve = compute_spec_context_reserve()
+        for requested in (None, 1 << 20, context_len - 4 - input_len):
+            with self.subTest(requested=requested):
+                scheduler = self._new_scheduler(
+                    max_req_len=max_req_len,
+                    max_total_num_tokens=1 << 20,
+                    spec_context_reserve=reserve,
+                )
+                req = self._new_req(max_new_tokens=requested, input_len=input_len)
+                max_new_tokens = self._init_and_check(scheduler, req)
+                self.assertLessEqual(
+                    in_flight_extent(max_new_tokens), context_len - 2
+                )
+
+        # Without the reserve the same admission overruns the context (the bug).
+        scheduler = self._new_scheduler(
+            max_req_len=max_req_len, max_total_num_tokens=1 << 20
+        )
+        req = self._new_req(max_new_tokens=None, input_len=input_len)
+        self.assertGreater(
+            in_flight_extent(self._init_and_check(scheduler, req)),
+            context_len - 2,
+        )
 
     def test_unified_budget_rounds_prompt_and_decode_together(self):
         bundle = init_unified_swa_pools(
