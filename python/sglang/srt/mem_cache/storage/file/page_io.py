@@ -285,10 +285,13 @@ class PosixPageIo:
         while copied < len(src):
             view = views[0]
             n = min(len(view), len(src) - copied)
-            view[:] = src[copied : copied + n]
+            # memoryview slice assignment needs exact lengths on both sides.
+            view[:n] = src[copied : copied + n]
             copied += n
             if len(view) == n:
                 views.pop(0)
+            else:
+                views[0] = view[n:]
 
     @staticmethod
     def _gather(dst: memoryview, views: List[memoryview]) -> None:
@@ -300,6 +303,8 @@ class PosixPageIo:
             copied += n
             if len(view) == n:
                 views.pop(0)
+            else:
+                views[0] = view[n:]
 
 
 class CuFilePageIo:
@@ -372,20 +377,24 @@ class CuFilePageIo:
         """
         if not requests:
             return []
-        ios = []
-        for path, file_offset, buf_ptr, size in requests:
-            ios.append(
-                self._binding.IoDesc(
-                    handle=self._read_handle(path),
-                    buf_ptr=buf_ptr,
-                    size=size,
-                    file_offset=file_offset,
-                )
+        ios = [
+            self._binding.IoDesc(
+                handle=self._read_handle(path),
+                buf_ptr=buf_ptr,
+                size=size,
+                file_offset=file_offset,
             )
+            for path, file_offset, buf_ptr, size in requests
+        ]
+        results: List[int] = []
         try:
             with self._batch_lock:
-                self._batch.submit(ios)
-                results = self._batch.wait(timeout_s=60.0)
+                # One submit/wait round per queue capacity; the binding
+                # chunks rounds itself for queue-depth-limited drivers.
+                for start in range(0, len(ios), self._batch.max_ios):
+                    chunk = ios[start : start + self._batch.max_ios]
+                    self._batch.submit(chunk)
+                    results.extend(self._batch.wait(timeout_s=60.0))
         except (self._binding.CuFileError, TimeoutError) as e:
             logger.error("HiCacheFile cufile batch read failed: %s", e)
             return [False] * len(requests)
