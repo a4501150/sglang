@@ -30,8 +30,12 @@ __all__ = ["CompressedTensorsW4A4Fp4"]
 
 
 class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
-    def __init__(self):
+    def __init__(self, weight_only: bool = False):
         self.group_size = 16
+        # Weight-only (nvfp4a16) checkpoints ship no calibrated activation
+        # scale; activations are quantized per block with the identity
+        # global scale (1.0) instead.
+        self.weight_only = weight_only
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -85,13 +89,25 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
 
         layer.register_parameter("weight_scale", weight_scale)
 
+        # Ones when weight_only: the checkpoint ships no activation scale, and
+        # 1.0 is the identity that leaves per-block scale factors to carry the
+        # dynamic range (dynamic activation quantization).
         input_global_scale = PerTensorScaleParameter(
-            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+            data=torch.ones(len(output_partition_sizes), dtype=torch.float32)
+            if self.weight_only
+            else torch.empty(len(output_partition_sizes), dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("input_global_scale", input_global_scale)
 
     def process_weights_after_loading(self, layer) -> None:
+        if self.weight_only:
+            logger.warning_once(
+                "NVFP4 weight-only linear: the checkpoint ships no input "
+                "global scale, so activations are quantized dynamically per "
+                "block (global scale 1.0). Run activation calibration for "
+                "optimal quality."
+            )
         global_input_scale = layer.input_global_scale.max().to(torch.float32)
         layer.input_global_scale = Parameter(global_input_scale, requires_grad=False)
 

@@ -113,14 +113,18 @@ def _get_scheme(kind, config_dict, capability):
 SELECTION_CASES = [
     # NVFP4 w4a4 keeps its native scheme on Blackwell and is served weight-only
     # before it. A downgraded w4a4 checkpoint still ships input_global_scale,
-    # which needs a registered destination.
+    # which needs a registered destination. Weight-only (nvfp4a16) also takes
+    # the native scheme on Blackwell -- with dynamic per-block activation
+    # quantization, since the checkpoint ships no activation scale -- and the
+    # Marlin scheme before it.
     ("linear", "nvfp4a16", SM90, CompressedTensorsW4A16Fp4, {"has_input_global_scale": False}),
     ("linear", "nvfp4", SM90, CompressedTensorsW4A16Fp4, {"has_input_global_scale": True}),
-    ("linear", "nvfp4a16", SM100, CompressedTensorsW4A16Fp4, {}),
-    ("linear", "nvfp4", SM100, CompressedTensorsW4A4Fp4, {}),
+    ("linear", "nvfp4a16", SM100, CompressedTensorsW4A4Fp4, {"weight_only": True}),
+    ("linear", "nvfp4", SM100, CompressedTensorsW4A4Fp4, {"weight_only": False}),
     ("moe", "nvfp4a16", SM90, CompressedTensorsW4A16Nvfp4MoE, {"has_input_global_scale": False, "group_size": 16}),
     ("moe", "nvfp4", SM90, CompressedTensorsW4A16Nvfp4MoE, {"has_input_global_scale": True}),
-    ("moe", "nvfp4", SM100, CompressedTensorsW4A4Nvfp4MoE, {}),
+    ("moe", "nvfp4a16", SM100, CompressedTensorsW4A4Nvfp4MoE, {"weight_only": True}),
+    ("moe", "nvfp4", SM100, CompressedTensorsW4A4Nvfp4MoE, {"weight_only": False}),
     # Neighbours of the fp4 predicates. The int4 type check keeps fp4 out of
     # WNA16; a weight-only MoE config has no input_activations, which the w8a8
     # predicates used to dereference.
@@ -180,6 +184,26 @@ class TestFp4SchemeSelection(CustomTestCase):
         output = "\n".join(captured.output)
         self.assertIn("marlin is weight-only", output)
         self.assertIn("MoE layers follow --moe-runner-backend", output)
+
+    def test_marlin_backend_keeps_weight_only_nvfp4a16_on_marlin(self):
+        """An explicit marlin backend must keep the weight-only Marlin schemes
+        on Blackwell (escape hatch for A/B against the dynamic w4a4 path)."""
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.layers.quantization import fp4_utils
+        from sglang.srt.runtime_context import get_flags
+
+        with (
+            mock.patch.object(
+                fp4_utils, "FP4_GEMM_RUNNER_BACKEND", Fp4GemmRunnerBackend.MARLIN
+            ),
+            get_flags().moe.override(runner_backend=MoeRunnerBackend.MARLIN),
+        ):
+            linear = _get_scheme("linear", _make_config("nvfp4a16"), SM100)
+            moe = _get_scheme("moe", _make_config("nvfp4a16"), SM100)
+        self.assertIsInstance(linear, CompressedTensorsW4A16Fp4)
+        self.assertFalse(linear.has_input_global_scale)
+        self.assertIsInstance(moe, CompressedTensorsW4A16Nvfp4MoE)
+        self.assertFalse(moe.has_input_global_scale)
 
     def test_fp4_weights_with_non_nvfp4_activations_raise(self):
         """Mismatched activation quantization must not be served weight-only."""

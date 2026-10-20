@@ -23,6 +23,7 @@ from sglang.srt.layers.quantization import fp4_utils
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A16Fp4,
     CompressedTensorsW4A16Nvfp4MoE,
+    CompressedTensorsW4A4Nvfp4MoE,
 )
 from sglang.srt.utils.common import (
     is_sm80_supported,
@@ -253,6 +254,153 @@ def test_moe_matches_dequantized_experts(fmt, is_gated, activation):
     # The kernel keeps the intermediate activation in bf16, hence 0.03.
     rel = _rel_err(out, expected)
     assert rel < 0.03, f"relative error {rel:.4f} too large"
+
+
+def _quantize_dynamic_per_block(x: torch.Tensor) -> torch.Tensor:
+    """Dynamic NVFP4 activation quantization with the identity global scale:
+    per-block e4m3 scale factors, e2m1 values, no global normalization.
+
+    flashinfer's fp4_quantize no longer accepts global_scale=None (the CUDA
+    backend asserts a scale whenever sf_use_ue8m0 is false), so the dynamic
+    recipe is expressed as the identity global scale of 1.0 -- exactly what
+    the weight-only schemes feed the kernels. The reference quantizes with
+    flashinfer's own quantizer and dequantizes, leaving only the scheme
+    translation and the kernel forward as error sources.
+    """
+    from flashinfer import fp4_quantize
+    from sglang.test.quant_ref_utils import dequantize_nvfp4_to_dtype
+
+    gs = torch.ones(1, dtype=torch.float32, device=x.device)
+    t = (x if x.dim() == 2 else x.unsqueeze(0)).to(torch.bfloat16).contiguous()
+    xq, xsf = fp4_quantize(t, gs)
+    return dequantize_nvfp4_to_dtype(xq, xsf, 1.0, torch.float32).reshape(x.shape)
+
+
+def _moe_reference_w4a4(x, w13, w2, topk_weights, topk_ids, is_gated, activation):
+    """Reference for the dynamic-W4A4 path: activations are quantized per
+    block (gemm1 input and gemm2 input), weights come dequantized."""
+    xq = _quantize_dynamic_per_block(x)
+    out = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+    for t in range(x.shape[0]):
+        for j in range(topk_ids.shape[1]):
+            e = topk_ids[t, j].item()
+            h = xq[t] @ w13[e].float().T
+            if is_gated:
+                gate, up = h.chunk(2)
+                act = F.silu(gate) * up
+            elif activation == "relu2":
+                act = torch.square(F.relu(h))
+            else:
+                act = F.silu(h)
+            act = _quantize_dynamic_per_block(act)
+            out[t] += topk_weights[t, j].float() * (act @ w2[e].float().T)
+    return out
+
+
+def _build_weight_only_w4a4_moe(is_gated, activation, dtype):
+    """The weight-only (nvfp4a16) MoE served through the W4A4 scheme: no
+    activation scales in the checkpoint, dynamic per-block quantization.
+    The scheme's create_weights always allocates a gated [up; gate] w13."""
+    assert is_gated, "CompressedTensorsW4A4Nvfp4MoE only allocates gated experts"
+    config = MoeRunnerConfig(
+        num_experts=NUM_EXPERTS,
+        num_local_experts=NUM_EXPERTS,
+        hidden_size=HIDDEN,
+        intermediate_size_per_partition=INTERMEDIATE,
+        top_k=TOP_K,
+        params_dtype=dtype,
+        activation=activation,
+        is_gated=is_gated,
+    )
+    layer = torch.nn.Module()
+    layer.moe_runner_config = config
+    layer.num_local_experts = NUM_EXPERTS
+    # The runner config reads the MoE placement off its layer.
+    layer.moe_tp_size = layer.moe_ep_size = 1
+    layer.moe_tp_rank = layer.moe_ep_rank = 0
+    config.layer = layer
+    scheme = CompressedTensorsW4A4Nvfp4MoE(weight_only=True)
+    scheme.create_weights(
+        layer=layer,
+        num_experts=NUM_EXPERTS,
+        hidden_size=HIDDEN,
+        intermediate_size_per_partition=INTERMEDIATE,
+        params_dtype=dtype,
+        weight_loader=lambda *args, **kwargs: None,
+    )
+    layer.to("cuda")
+
+    w13_rows = (2 if is_gated else 1) * INTERMEDIATE
+    refs = {}
+    for name, rows, cols in (("w13", w13_rows, HIDDEN), ("w2", HIDDEN, INTERMEDIATE)):
+        refs[name] = torch.empty(NUM_EXPERTS, rows, cols, dtype=dtype, device="cuda")
+        for e in range(NUM_EXPERTS):
+            # One matrix for gate and up together: the W4A4 path requires
+            # gate and up to share one weight global scale.
+            fp4, scales, divisor, refs[name][e] = _make_weight("nvfp4", rows, cols, dtype)
+            if name == "w13" and is_gated:
+                # The cutlass kernel expects w13 as [up; gate]; the reference
+                # keeps the checkpoint's [gate; up] row order.
+                half = rows // 2
+                fp4 = torch.cat([fp4[half:], fp4[:half]])
+                scales = torch.cat([scales[half:], scales[:half]])
+            getattr(layer, f"{name}_weight_packed").data[e].copy_(fp4)
+            getattr(layer, f"{name}_weight_scale").data[e].copy_(scales)
+            if divisor is not None:
+                getattr(layer, f"{name}_weight_global_scale").data[e] = divisor
+
+    layer.dispatcher = SimpleNamespace(
+        local_expert_mapping=None, num_experts=NUM_EXPERTS
+    )
+    scheme.create_moe_runner(layer, config)
+    scheme.process_weights_after_loading(layer)
+    return scheme, layer, refs["w13"], refs["w2"]
+
+
+@pytest.mark.skipif(
+    not (is_sm100_supported() or is_sm120_supported()),
+    reason="Dynamic W4A4 NVFP4 MoE requires SM100/SM120",
+)
+def test_moe_weight_only_dynamic_act_quant_matches_reference():
+    """Weight-only NVFP4 MoE on the W4A4 path: activations are quantized
+    dynamically per block (identity global scale), so the reference models
+    both activation quantizations; a second, looser bound against the plain
+    bf16 reference separates translation bugs from quantization error."""
+    from sglang.test.layer_ut_utils import init_single_process_dist
+
+    # The cutlass runner allocates output through the TP group's symmetric
+    # memory helper, which needs the model-parallel groups even at tp=1.
+    init_single_process_dist(master_port=29641)
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    scheme, layer, w13, w2 = _build_weight_only_w4a4_moe(True, "silu", dtype)
+
+    # Unit variance: tiny inputs push per-block e4m3 scale factors into the
+    # subnormal range, which is not the regime the identity global scale
+    # targets and swamps the translation error under test.
+    x = torch.randn(NUM_TOKENS, HIDDEN, dtype=dtype, device="cuda")
+    logits = torch.randn(NUM_TOKENS, NUM_EXPERTS, dtype=torch.float32, device="cuda")
+    topk_weights, topk_ids = torch.topk(torch.softmax(logits, dim=-1), TOP_K, dim=-1)
+    topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+    topk_ids = topk_ids.to(torch.int32)
+    dispatch_output = StandardDispatchOutput(
+        x, None, StandardTopKOutput(topk_weights, topk_ids, logits)
+    )
+
+    out = scheme.apply_weights(layer, dispatch_output).hidden_states
+    torch.cuda.synchronize()
+    assert torch.isfinite(out).all()
+    rel_quant = _rel_err(
+        out, _moe_reference_w4a4(x, w13, w2, topk_weights, topk_ids, True, "silu")
+    )
+    rel_bf16 = _rel_err(
+        out, _moe_reference(x, w13, w2, topk_weights, topk_ids, True, "silu")
+    )
+    # 0.05 for the quantization-aware reference (kernel vs reference differ
+    # only in bf16 intermediates and sf rounding); the bf16 bound separates
+    # the activation-quantization error the dynamic path necessarily adds.
+    assert rel_quant < 0.05, f"relative error {rel_quant:.4f} too large"
+    assert rel_bf16 < 0.25, f"relative error vs bf16 {rel_bf16:.4f} too large"
 
 
 if __name__ == "__main__":
