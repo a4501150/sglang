@@ -305,6 +305,9 @@ class HiCacheController:
     # read the flags before attach; attach flips them per instance.
     storage_device_direct = False
     _device_staging_pools: dict = {}
+    # Host-page read set at attach; kept for spans that bounce through the
+    # host pool while the device-staging path is active.
+    _host_page_get_func = None
 
     def __init__(
         self,
@@ -658,13 +661,21 @@ class HiCacheController:
             )
             if self.storage_device_direct:
                 self._register_device_staging(PoolName.KV, self.storage_host_pool)
+                # Host-page reads still serve spans that bounce through the
+                # host pool (past the arena); _device_kv_batch_get picks per
+                # operation.
+                self._host_page_get_func = self.page_get_func
                 self.page_get_func = self._device_kv_batch_get
                 # Device-target prefetches stage in the arena, not the host
                 # pool; the load-fraction gate follows the arena size.
                 anchor_staging = self._device_staging_pools.get(str(PoolName.KV))
                 if anchor_staging is not None:
-                    self.prefetch_capacity_limit = int(
-                        HICACHE_LOAD_POOL_USAGE_FRACTION * anchor_staging.size
+                    # Spans past the arena bounce through the host pool, so
+                    # the limit must keep covering host-pool fill, not just
+                    # the arena; the arena's own allocator bounds its spans.
+                    self.prefetch_capacity_limit = max(
+                        int(HICACHE_LOAD_POOL_USAGE_FRACTION * anchor_staging.size),
+                        self.prefetch_capacity_limit,
                     )
                 logger.info(
                     "HiCache device-target staging enabled: L3 reads land in "
@@ -1275,11 +1286,11 @@ class HiCacheController:
                     host_indices=batch_host_indices,
                     keys=batch_hashes,
                     device_indices=(
-                        batch_host_indices if self.storage_device_direct else None
+                        batch_host_indices if operation.device_staged else None
                     ),
                     target=(
                         PoolTransferTarget.DEVICE
-                        if self.storage_device_direct
+                        if operation.device_staged
                         else PoolTransferTarget.HOST
                     ),
                 )
@@ -1444,7 +1455,12 @@ class HiCacheController:
     def _device_kv_batch_get(
         self, operation, hash_values, host_indices, extra_info=None
     ) -> int:
-        """Read one KV batch L3 -> GPU staging arena; leading hit pages."""
+        """Read one KV batch: L3 -> GPU staging arena, or L3 -> host pool
+        for spans that bounce through the host."""
+        if not operation.device_staged:
+            return self._host_page_get_func(
+                operation, hash_values, host_indices, extra_info
+            )
         results = self.storage_backend.batch_get_v2(
             [
                 PoolTransfer(

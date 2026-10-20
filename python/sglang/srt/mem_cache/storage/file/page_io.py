@@ -335,6 +335,8 @@ class CuFilePageIo:
             max_ios=envs.SGLANG_HICACHE_CUFILE_MAX_IOS.get()
         )
         self._batch_lock = threading.Lock()
+        # One-shot: proves live reads took the cuFile driver, not a fallback.
+        self._first_read_logged = False
         logger.info(
             "HiCacheFile cufile engine active: driver mode=%s", self._driver.mode()
         )
@@ -353,6 +355,15 @@ class CuFilePageIo:
     def read_header(self, path: str) -> Optional[bytes]:
         return self._posix.read_header(path)
 
+    def _log_first_read(self) -> None:
+        if not self._first_read_logged:
+            self._first_read_logged = True
+            logger.info(
+                "HiCacheFile cufile engine served its first page read "
+                "(driver mode=%s)",
+                self._driver.mode(),
+            )
+
     def read_payload(
         self, path: str, payload_len: int, padded_len: int, segments: List[Segment]
     ) -> None:
@@ -366,6 +377,7 @@ class CuFilePageIo:
                     f"cuFile short read ({got}/{size}) at {path}:{offset}"
                 )
             offset += size
+        self._log_first_read()
 
     def read_many(
         self, requests: List[tuple]
@@ -398,6 +410,7 @@ class CuFilePageIo:
         except (self._binding.CuFileError, TimeoutError) as e:
             logger.error("HiCacheFile cufile batch read failed: %s", e)
             return [False] * len(requests)
+        self._log_first_read()
         return [count == size for (_, _, _, size), count in zip(requests, results)]
 
     def write_page_file(

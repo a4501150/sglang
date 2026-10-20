@@ -21,8 +21,11 @@ import os
 import shutil
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import torch
+
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import (
@@ -438,6 +441,117 @@ class TestIndexerScatterParity(DeviceStagingParityBase):
         for engine in self._engines():
             with self.subTest(engine=engine):
                 self._round_trip(engine)
+
+
+class _FakeHostPool:
+    """Anchor-shaped pool for controller-gate tests: alloc/free bookkeeping
+    only, never a shared-layout HostKVCache."""
+
+    def __init__(self, size: int, page_size: int):
+        self.size = size
+        self.page_size = page_size
+        self._free = list(range(size))
+
+    def alloc(self, need_size: int):
+        if need_size > len(self._free):
+            return None
+        tokens = self._free[:need_size]
+        self._free = self._free[need_size:]
+        return torch.tensor(tokens, dtype=torch.int64)
+
+    def free(self, indices: torch.Tensor) -> int:
+        self._free.extend(indices.tolist())
+        return len(indices)
+
+    def available_size(self) -> int:
+        return len(self._free)
+
+
+class TestOversizePrefetchHostBounce(CustomTestCase):
+    """With device-target staging on, a storage hit larger than the GPU
+    arena must bounce through the host pool instead of being declined:
+    the oversize gate, the allocation and the frees all follow the span's
+    actual location, not the global device flag."""
+
+    def setUp(self):
+        super().setUp()
+        if not torch.cuda.is_available():
+            self.skipTest("needs CUDA")
+        self.device = torch.device("cuda")
+
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        self.arena_host, _ = _make_fp8_host(self.device)
+        self.arena = DeviceStagingPool(
+            self.arena_host, device=self.device, page_slots=2, name="kv"
+        )
+        self.host_pool = _FakeHostPool(16 * KV_PAGE, KV_PAGE)
+        cc = HybridCacheController.__new__(HybridCacheController)
+        cc.storage_device_direct = True
+        cc._device_staging_pools = {str(PoolName.KV): self.arena}
+        cc.mem_pool_host = SimpleNamespace(
+            size=self.host_pool.size,
+            alloc=self.host_pool.alloc,
+            free=self.host_pool.free,
+            available_size=self.host_pool.available_size,
+            anchor_entry=SimpleNamespace(host_pool=object()),
+            entry_map={},
+        )
+        cc.host_write_staged_tokens_fn = None
+        cc.prefetch_capacity_limit = self.host_pool.size
+        self.cc = cc
+
+    def _op(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            PrefetchOperation,
+        )
+
+        return PrefetchOperation(CacheRequestHandle("oversize", 0), [1] * 64)
+
+    def test_oversize_gate_admits_host_bounce(self):
+        """The span is 4x the arena: it fits the host pool, so the gate must
+        admit it (this is the decline that emptied L3 restores for spans
+        past STORAGE_BATCH_SIZE pages)."""
+        span = 4 * self.arena.size  # 2 arena pages vs 8 span pages
+        self.assertGreater(span, self.arena.size)
+        self.assertTrue(self.cc.can_fit_prefetch_host_buffers(self._op(), span))
+        # Truly oversized (past the host pool too) is still declined.
+        self.assertFalse(
+            self.cc.can_fit_prefetch_host_buffers(self._op(), self.host_pool.size + 1)
+        )
+
+    def test_alloc_marks_the_bounce_location_and_frees_go_back(self):
+        # Arena-sized span: device-staged.
+        op = self._op()
+        small = self.arena.size
+        got = self.cc.alloc_prefetch_host_buffers(op, small)
+        self.assertIsNotNone(got)
+        self.assertTrue(op.device_staged)
+        arena_free = self.arena.available_size()
+        self.cc.free_prefetch_host_buffers(op, got)
+        self.assertEqual(self.arena.available_size(), self.arena.size)
+
+        # Oversize span: host bounce, flagged host-side.
+        op = self._op()
+        span = 4 * self.arena.size
+        got = self.cc.alloc_prefetch_host_buffers(op, span)
+        self.assertIsNotNone(got)
+        self.assertFalse(op.device_staged)
+        self.assertEqual(len(got), span)
+        self.assertEqual(self.host_pool.available_size(), self.host_pool.size - span)
+        self.cc.free_prefetch_host_buffers(op, got)
+        self.assertEqual(self.host_pool.available_size(), self.host_pool.size)
+
+    def test_rate_limit_gates_host_bounced_spans(self):
+        self.cc.prefetch_capacity_limit = 2 * self.arena.size
+        # Arena usage below the limit but the host pool full: a host-bounced
+        # span must still be rate limited.
+        self.host_pool._free = []
+        self.assertTrue(self.cc.prefetch_rate_limited())
+        self.host_pool._free = list(range(self.host_pool.size))
+        self.assertFalse(self.cc.prefetch_rate_limited())
 
 
 if __name__ == "__main__":

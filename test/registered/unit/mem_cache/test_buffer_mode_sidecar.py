@@ -556,6 +556,7 @@ class TestBufferModeSidecar(unittest.TestCase):
             pool_transfers=sidecars,
             storage_start=0,
             buffer_host_occupied_units=len(host_indices),
+            device_staged=False,
         )
         req_id = CacheRequestHandle("sidecar-prefetch", 0)
 

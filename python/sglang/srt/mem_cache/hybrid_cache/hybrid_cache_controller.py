@@ -139,6 +139,10 @@ class StorageOperation(BaseStorageOperation):
         super().__init__(host_indices, token_ids, last_hash, hash_value, prefix_keys)
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
+        # Set at allocation: the bounce lives in the device staging arena
+        # (True) or the host pool (False), also when the device path is on
+        # but the span (or arena headroom) forces the host bounce.
+        self.device_staged = False
 
 
 class PrefetchOperation(StorageOperation):
@@ -737,9 +741,11 @@ class HybridCacheController(BaseHiCacheController):
         self, operation: StorageOperation, need_size: int, *, empty: bool = True
     ) -> bool:
         if self.storage_device_direct:
-            return need_size <= self._device_staging_pools[
-                str(PoolName.KV)
-            ].size
+            arena = self._device_staging_pools.get(str(PoolName.KV))
+            if arena is not None and need_size <= arena.size:
+                return True
+            # A span past the arena's whole capacity, or a busy arena, bounces
+            # through the host pool; fall through to its capacity checks.
         anchor = self.mem_pool_host.anchor_entry
         if not uses_shared_host_layout(anchor.host_pool):
             return super().can_fit_prefetch_host_buffers(operation, need_size)
@@ -753,7 +759,18 @@ class HybridCacheController(BaseHiCacheController):
 
     def prefetch_rate_limited(self) -> bool:
         if self.storage_device_direct:
-            return super().prefetch_rate_limited()
+            # Device-target prefetches stage in the anchor arena; a busy
+            # arena defers its own allocations, so the arena gate is a
+            # backstop and the real limit is the host bounce path below.
+            staging = self._device_staging_pools.get(str(PoolName.KV))
+            if staging is not None:
+                used = staging.size - staging.available_size()
+                if max(0, used) >= self.prefetch_capacity_limit:
+                    return True
+            used = self.mem_pool_host.size - self.mem_pool_host.available_size()
+            if self.host_write_staged_tokens_fn is not None:
+                used -= self.host_write_staged_tokens_fn()
+            return max(0, used) >= self.prefetch_capacity_limit
         if self.host_memory_mode == "buffer_only" and uses_shared_host_layout(
             self.mem_pool_host.anchor_entry.host_pool
         ):
@@ -766,7 +783,15 @@ class HybridCacheController(BaseHiCacheController):
     ) -> Optional[torch.Tensor]:
         """Atomically allocate every prefetch slice from a shared arena."""
         if self.storage_device_direct:
-            return self.device_staging_alloc(PoolName.KV, need_size)
+            arena = self._device_staging_pools.get(str(PoolName.KV))
+            if arena is not None and need_size <= arena.size:
+                indices = self.device_staging_alloc(PoolName.KV, need_size)
+                if indices is not None:
+                    operation.device_staged = True
+                    return indices
+            # Span past the arena, or the arena is busy with in-flight
+            # reads: bounce through the host pool like the pre-device path.
+            operation.device_staged = False
         anchor = self.mem_pool_host.anchor_entry
         if not uses_shared_host_layout(anchor.host_pool):
             return super().alloc_prefetch_host_buffers(operation, need_size)
@@ -831,7 +856,7 @@ class HybridCacheController(BaseHiCacheController):
     ) -> None:
         """Roll back an unsubmitted prefetch's anchor and independent pools."""
         pool_transfers = operation.pool_transfers or []
-        if self.storage_device_direct:
+        if operation.device_staged:
             self.device_staging_free(PoolName.KV, host_indices)
             for transfer in pool_transfers:
                 if (
