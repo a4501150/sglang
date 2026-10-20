@@ -676,6 +676,26 @@ class HiCacheFile(HiCacheStorage):
         super().register_mem_host_pool_v2(host_pool, host_pool_name)
         self._register_pool_fingerprint(host_pool, str(host_pool_name))
 
+    def register_mem_device_pool_v2(self, device_pool, device_pool_name):
+        super().register_mem_device_pool_v2(device_pool, device_pool_name)
+        if self.io_engine.name == "cufile":
+            # One registration per arena covers every row for the direct
+            # gds/p2pdma path; compat mode falls back to cuFile's internal
+            # bounce pool.
+            from sglang.srt.utils import cufile as binding
+
+            if binding.cufile_available():
+                try:
+                    binding.register_buffer(
+                        device_pool.arena, device_pool.arena.numel()
+                    )
+                except binding.CuFileError as e:
+                    logger.warning(
+                        "cuFile arena registration failed for %s: %s",
+                        device_pool_name,
+                        e,
+                    )
+
     def _pool_fingerprint(self, pool_name: str) -> str:
         """Fingerprint of a registered pool's page format.
 
@@ -1411,6 +1431,10 @@ class HiCacheFile(HiCacheStorage):
         copy stream; the scatter submission waits the recorded events.
         Per-page failures return False so the caller clamps at the first
         failed page exactly like the host path.
+
+        Under the cufile engine the bounce disappears: after per-page
+        header validation, one batched submission reads the whole page
+        batch straight into the arena rows.
         """
         keys = transfer.keys or []
         staging = self.registered_device_pools.get(str(transfer.name))
@@ -1430,6 +1454,10 @@ class HiCacheFile(HiCacheStorage):
             )
             return [False] * len(keys)
         pool_name = str(transfer.name)
+        if self.io_engine.name == "cufile":
+            return self._device_read_pages_cufile(
+                pool_name, keys, staging, device_indices, page_size
+            )
         bounce = self._device_bounce(pool_name, staging.page_bytes)
         segments = [(bounce.data_ptr(), staging.page_bytes)]
         fingerprint = self._pool_fingerprint(pool_name)
@@ -1464,6 +1492,72 @@ class HiCacheFile(HiCacheStorage):
                 )
                 ok = False
             per_page.append(ok)
+        return per_page
+
+    def _device_read_pages_cufile(
+        self, pool_name: str, keys, staging, device_indices, page_size: int
+    ) -> List[bool]:
+        """Batched L3 -> arena reads: headers first, then one submission."""
+        fingerprint = self._pool_fingerprint(pool_name)
+        expected = staging.page_bytes
+        padded = (expected + 4095) // 4096 * 4096
+        slots = []
+        requests = []
+        ok_before: List[bool] = []
+        for i, key in enumerate(keys):
+            slot = int(device_indices[i * page_size].item()) // page_size
+            storage_key = self._log_key(pool_name, key)
+            suffixed = self._get_suffixed_key(storage_key)
+            tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
+            header_raw = self.io_engine.read_header(tensor_path)
+            ok = False
+            if header_raw is not None:
+                try:
+                    header = decode_page_header(header_raw)
+                    if header.fingerprint != fingerprint:
+                        self._drop_page_file(
+                            suffixed, tensor_path, "format fingerprint mismatch"
+                        )
+                    elif header.payload_len != expected:
+                        self._drop_page_file(
+                            suffixed, tensor_path, "wrong payload length"
+                        )
+                    else:
+                        ok = True
+                except ValueError as e:
+                    self._drop_page_file(suffixed, tensor_path, str(e))
+            if ok:
+                ok = header.payload_padded_len == padded
+                if not ok:
+                    self._drop_page_file(suffixed, tensor_path, "padded length")
+            ok_before.append(ok)
+            if ok:
+                slots.append(slot)
+                requests.append(
+                    (tensor_path, 4096, staging.arena[slot].data_ptr(), padded)
+                )
+        results = self.io_engine.read_many(requests)
+        read_iter = iter(results)
+        per_page = [
+            (ok and next(read_iter)) if ok else False for ok in ok_before
+        ]
+        if self.log_page_digests:
+            torch.cuda.synchronize()
+            read_keys = [k for k, ok in zip(keys, ok_before) if ok]
+            for slot, key, ok in zip(slots, read_keys, per_page):
+                if not ok:
+                    continue
+                for component, tensor in staging.get_debug_page_tensors(slot):
+                    logger.warning(
+                        "HiCache page digest direction=read pool=%s "
+                        "component=%s key=%s host_page=%d bytes=%d sha256=%s",
+                        pool_name,
+                        component,
+                        self._log_key(pool_name, key),
+                        slot,
+                        tensor.numel() * tensor.element_size(),
+                        hicache_tensor_digest(tensor),
+                    )
         return per_page
 
     def batch_get_v2(

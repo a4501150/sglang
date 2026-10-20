@@ -807,6 +807,8 @@ class Envs:
     # Page payload verification on read: "full" (crc every page), "sampled"
     # (crc one page in every 64 reads), or "off".
     SGLANG_HICACHE_FILE_VERIFY = EnvStr("sampled")
+    # Queue depth of one HiCacheFile cufile batch submission (page reads).
+    SGLANG_HICACHE_CUFILE_MAX_IOS = EnvInt(128)
     # Emit per-component sha256 digest marker lines for every page written to
     # or read from file storage, and for every host<->device transfer; parsed
     # by the HiCache digest bench (scripts/hicache_digest_check.py).

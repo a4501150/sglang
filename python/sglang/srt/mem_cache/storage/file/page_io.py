@@ -23,6 +23,7 @@ import os
 import threading
 from typing import List, Optional, Sequence, Tuple
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_format import (
     HEADER_BYTES,
     IO_ALIGNMENT,
@@ -301,6 +302,110 @@ class PosixPageIo:
                 views.pop(0)
 
 
+class CuFilePageIo:
+    """Batched cuFile page IO.
+
+    Reads go through the cuFile driver — whole padded pages straight off
+    the file into host pool segments or GPU staging-arena rows, one
+    ``CuFileBatch`` submission per page batch. Writes keep the crash
+    model of the posix engines (tmp + fsync + rename) and are delegated
+    to the O_DIRECT posix writer; device-source writes are a later phase.
+    """
+
+    def __init__(self, file_path: str):
+        from sglang.srt.utils import cufile as binding
+
+        if not binding.cufile_available():
+            raise RuntimeError(
+                "HiCacheFile io_engine='cufile': no usable libcufile.so "
+                "found (set SGLANG_CUFILE_LIB or install the nvidia cufile "
+                "package)."
+            )
+        self._binding = binding
+        self._driver = binding.CuFileDriver.instance()
+        self._posix = PosixPageIo(file_path, o_direct=True)
+        self._handles: dict = {}
+        self._handles_lock = threading.Lock()
+        self._batch = binding.CuFileBatch(
+            max_ios=envs.SGLANG_HICACHE_CUFILE_MAX_IOS.get()
+        )
+        self._batch_lock = threading.Lock()
+        logger.info(
+            "HiCacheFile cufile engine active: driver mode=%s", self._driver.mode()
+        )
+
+    @property
+    def name(self) -> str:
+        return "cufile"
+
+    def _read_handle(self, path: str):
+        handle = self._handles.get(path)
+        if handle is None:
+            handle = self._binding.CuFileHandle(path, writable=False)
+            self._handles[path] = handle
+        return handle
+
+    def read_header(self, path: str) -> Optional[bytes]:
+        return self._posix.read_header(path)
+
+    def read_payload(
+        self, path: str, payload_len: int, padded_len: int, segments: List[Segment]
+    ) -> None:
+        """One page's segments, host or device memory, any alignment."""
+        handle = self._read_handle(path)
+        offset = HEADER_BYTES
+        for ptr, size in segments:
+            got = handle.read(ptr, size, offset)
+            if got != size:
+                raise IOError(
+                    f"cuFile short read ({got}/{size}) at {path}:{offset}"
+                )
+            offset += size
+
+    def read_many(
+        self, requests: List[tuple]
+    ) -> List[bool]:
+        """Batched whole-page reads: [(path, file_offset, buf_ptr, size)].
+
+        One ``CuFileBatch`` submission (chunked by the binding for queue
+        depth); per-request success requires the full byte count.
+        """
+        if not requests:
+            return []
+        ios = []
+        for path, file_offset, buf_ptr, size in requests:
+            ios.append(
+                self._binding.IoDesc(
+                    handle=self._read_handle(path),
+                    buf_ptr=buf_ptr,
+                    size=size,
+                    file_offset=file_offset,
+                )
+            )
+        try:
+            with self._batch_lock:
+                self._batch.submit(ios)
+                results = self._batch.wait(timeout_s=60.0)
+        except (self._binding.CuFileError, TimeoutError) as e:
+            logger.error("HiCacheFile cufile batch read failed: %s", e)
+            return [False] * len(requests)
+        return [count == size for (_, _, _, size), count in zip(requests, results)]
+
+    def write_page_file(
+        self, tmp_path: str, header_bytes: bytes, segments: List[Segment]
+    ) -> None:
+        # Writes keep tmp + fsync + rename; the posix O_DIRECT writer
+        # implements that contract and handles any host buffer.
+        self._posix.write_page_file(tmp_path, header_bytes, segments)
+
+    def close(self) -> None:
+        with self._handles_lock:
+            for handle in self._handles.values():
+                handle.close()
+            self._handles.clear()
+        self._batch.close()
+
+
 PAGE_IO_ENGINE_NAMES = ("posix_buffered", "posix_o_direct", "cufile")
 
 
@@ -310,10 +415,7 @@ def make_page_io(file_path: str, engine: str):
     if engine == "posix_o_direct":
         return PosixPageIo(file_path, o_direct=True)
     if engine == "cufile":
-        raise NotImplementedError(
-            "HiCacheFile io_engine='cufile' requires the cuFile binding "
-            "(python/sglang/srt/utils/cufile.py), which is not available yet."
-        )
+        return CuFilePageIo(file_path)
     raise ValueError(
         f"HiCacheFile io_engine must be one of {PAGE_IO_ENGINE_NAMES}, got {engine!r}"
     )

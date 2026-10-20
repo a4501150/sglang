@@ -457,9 +457,16 @@ class TestEngines(CustomTestCase):
         with self.assertRaises(ValueError):
             _make_backend(self.base, io_engine="nio")
 
-    def test_cufile_engine_unavailable_until_binding_lands(self):
-        with self.assertRaises(NotImplementedError):
-            _make_backend(self.base, io_engine="cufile")
+    def test_cufile_engine_constructs_with_binding(self):
+        from sglang.srt.utils import cufile as binding
+
+        try:
+            b = _make_backend(self.base, io_engine="cufile")
+        except RuntimeError as e:
+            if not binding.cufile_available():
+                self.skipTest(f"no libcufile on this host: {e}")
+            raise
+        self.assertEqual(b.io_engine.name, "cufile")
 
     def test_corrupt_payload_crc_mismatch_is_miss(self):
         kv = FakePagePool(8192)

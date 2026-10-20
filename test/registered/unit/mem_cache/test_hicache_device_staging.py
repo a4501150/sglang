@@ -269,6 +269,13 @@ class DeviceStagingParityBase(CustomTestCase):
             engines.append("posix_o_direct")
         except (RuntimeError, OSError):
             pass
+        try:
+            from sglang.srt.utils import cufile as binding
+
+            if binding.cufile_available():
+                engines.append("cufile")
+        except Exception:
+            pass
         return engines
 
 
