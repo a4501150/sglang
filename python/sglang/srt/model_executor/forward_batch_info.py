@@ -1193,9 +1193,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             else:
                 # Without literal mask IDs among committed tokens, every mask
                 # ID in the block is still to be denoised.
-                ret.positions = torch.tensor(positions, dtype=positions_dtype).to(
-                    device, non_blocking=True
-                )
+                ret.positions = torch.tensor(
+                    positions,
+                    dtype=positions_dtype,
+                    pin_memory=is_pin_memory_available(device),
+                ).to(device, non_blocking=True)
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
