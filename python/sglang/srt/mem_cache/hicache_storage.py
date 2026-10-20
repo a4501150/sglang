@@ -99,6 +99,18 @@ class PoolName(str, Enum):
         return self.value
 
 
+class PoolTransferTarget(str, Enum):
+    """Destination of a host<->storage transfer.
+
+    HOST   : the registered host (L2) pool pages — the default.
+    DEVICE : a registered device staging arena; the transfer bypasses the
+             host pool entirely (buffer_only device-target reads).
+    """
+
+    HOST = "host"
+    DEVICE = "device"
+
+
 class PoolHitPolicy(str, Enum):
     """Hit policy for batch_exists_v2 per-pool prefix matching.
 
@@ -121,6 +133,7 @@ class PoolTransfer:
 
     device<->host path : host_indices + device_indices
     host<->storage path: host_indices + keys
+    device<->storage path: target=DEVICE + device_indices (staging slots)
     nodes_to_load      : evicted nodes this transfer covers
     """
 
@@ -128,6 +141,7 @@ class PoolTransfer:
     host_indices: Optional[torch.Tensor] = None
     device_indices: Optional[torch.Tensor] = None
     keys: Optional[List[str]] = None
+    target: PoolTransferTarget = PoolTransferTarget.HOST
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
@@ -197,6 +211,27 @@ class HiCacheStorage(ABC):
         if not hasattr(self, "registered_pools"):
             self.registered_pools = {}
         self.registered_pools[host_pool_name] = host_pool
+
+    def register_mem_device_pool_v2(self, device_pool, device_pool_name):
+        """Register a device-side pool for device-target transfers.
+
+        For the file backend this is a ``DeviceStagingPool`` mirroring the
+        named host pool's page geometry; ``PoolTransfer`` records with
+        ``target=PoolTransferTarget.DEVICE`` move whole pages between L3
+        files and that arena, bypassing the host (L2) pool entirely.
+        """
+        if not hasattr(self, "registered_device_pools"):
+            self.registered_device_pools = {}
+        self.registered_device_pools[device_pool_name] = device_pool
+
+    @property
+    def supports_device_target(self) -> bool:
+        """Capability: True when this backend can move complete cache pages
+        directly between registered device pools and L3 storage through
+        ``PoolTransfer`` records with ``target=PoolTransferTarget.DEVICE``.
+        Default False keeps callers on the host-mediated paths.
+        """
+        return False
 
     @property
     def supports_zero_copy_page_io(self) -> bool:
@@ -595,6 +630,11 @@ class HiCacheFile(HiCacheStorage):
         # carry the fingerprint in their header; a page written by another
         # geometry misses instead of loading corrupt.
         self._pool_fingerprints: dict[str, str] = {}
+        # Device staging arenas per pool name (register_mem_device_pool_v2).
+        self.registered_device_pools: dict = {}
+        # Reusable aligned pinned bounce per staged pool, keyed by pool name.
+        self._device_bounces: dict = {}
+        self._device_bounce_lock = threading.Lock()
 
         grace_raw = extra_cfg.get("orphan_grace_seconds")
         if grace_raw is None:
@@ -917,6 +957,13 @@ class HiCacheFile(HiCacheStorage):
         # Segment IO needs an engine that can address host pool pages in
         # place; the buffered engine would bounce every page anyway.
         return self.io_engine.name != "posix_buffered"
+
+    @property
+    def supports_device_target(self) -> bool:
+        # Device-target reads work through a pinned bounce + async copy onto
+        # the staging arena under every engine; the cuFile engine will read
+        # straight into the arena rows.
+        return True
 
     def _batch_io_v1(
         self, keys: List[str], host_indices: torch.Tensor, write: bool
@@ -1288,10 +1335,13 @@ class HiCacheFile(HiCacheStorage):
             return self._write_page_bytes(
                 storage_key, self._pool_fingerprint(pool_name), segments
             )
+        # The flat page must stay alive until the positional write reads it:
+        # segments are raw pointers, not owners.
+        data_page = host_pool.get_data_page(page_offset, flat=True)
         return self._write_page_bytes(
             storage_key,
             self._pool_fingerprint(pool_name),
-            self._tensor_segments(host_pool.get_data_page(page_offset, flat=True)),
+            self._tensor_segments(data_page),
         )
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], op_fn):
@@ -1340,12 +1390,96 @@ class HiCacheFile(HiCacheStorage):
             results[transfer.name] = per_page
         return results
 
+    def _device_bounce(self, pool_name: str, page_bytes: int) -> torch.Tensor:
+        """One aligned pinned whole-page bounce per staged pool."""
+        with self._device_bounce_lock:
+            bounce = self._device_bounces.get(pool_name)
+            if bounce is None or bounce.numel() < page_bytes:
+                raw = torch.empty(
+                    page_bytes + 4096, dtype=torch.uint8, pin_memory=True
+                )
+                offset = (-raw.data_ptr()) % 4096
+                bounce = raw.narrow(0, offset, page_bytes)
+                self._device_bounces[pool_name] = bounce
+            return bounce
+
+    def _device_read_pages(self, transfer: PoolTransfer) -> List[bool]:
+        """Read pages of one transfer into its device staging arena.
+
+        Each page is read positionally into an aligned pinned bounce, then
+        copied asynchronously onto its arena row on the staging pool's
+        copy stream; the scatter submission waits the recorded events.
+        Per-page failures return False so the caller clamps at the first
+        failed page exactly like the host path.
+        """
+        keys = transfer.keys or []
+        staging = self.registered_device_pools.get(str(transfer.name))
+        if staging is None:
+            logger.error(
+                "HiCacheFile device-target read for %s has no staging pool",
+                transfer.name,
+            )
+            return [False] * len(keys)
+        page_size = staging.page_size
+        device_indices = transfer.device_indices
+        if device_indices is None or device_indices.numel() != len(keys) * page_size:
+            logger.error(
+                "device-target indices length mismatch for %s: expected %s",
+                transfer.name,
+                len(keys) * page_size,
+            )
+            return [False] * len(keys)
+        pool_name = str(transfer.name)
+        bounce = self._device_bounce(pool_name, staging.page_bytes)
+        segments = [(bounce.data_ptr(), staging.page_bytes)]
+        fingerprint = self._pool_fingerprint(pool_name)
+        per_page: List[bool] = []
+        for i, key in enumerate(keys):
+            slot = int(device_indices[i * page_size].item()) // page_size
+            try:
+                ok = self._read_page_bytes(
+                    self._log_key(pool_name, key), fingerprint, segments
+                )
+                if ok:
+                    staging.copy_page_from_host(slot, bounce)
+                    if self.log_page_digests:
+                        for component, tensor in staging.get_debug_page_tensors(slot):
+                            logger.warning(
+                                "HiCache page digest direction=read pool=%s "
+                                "component=%s key=%s host_page=%d bytes=%d "
+                                "sha256=%s",
+                                pool_name,
+                                component,
+                                self._log_key(pool_name, key),
+                                slot,
+                                tensor.numel() * tensor.element_size(),
+                                hicache_tensor_digest(tensor),
+                            )
+            except Exception as e:
+                logger.error(
+                    "HiCacheFile device-target read failed for %s/%s: %s",
+                    pool_name,
+                    key,
+                    e,
+                )
+                ok = False
+            per_page.append(ok)
+        return per_page
+
     def batch_get_v2(
         self,
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
-        return self._batch_io_v2(transfers, self._read_page)
+        host_transfers = []
+        results: dict[str, List[bool]] = {}
+        for transfer in transfers:
+            if transfer.target == PoolTransferTarget.DEVICE:
+                results[transfer.name] = self._device_read_pages(transfer)
+            else:
+                host_transfers.append(transfer)
+        results.update(self._batch_io_v2(host_transfers, self._read_page))
+        return results
 
     def batch_set_v2(
         self,

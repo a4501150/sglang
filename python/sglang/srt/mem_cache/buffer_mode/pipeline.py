@@ -1214,6 +1214,20 @@ class BufferModePipeline:
         scheduler thread; buffer-mode acks/drops all run here, so frees
         land before the tick's next gate reads pool availability."""
         cc = self._cache.cache_controller
+        if cc.storage_device_direct:
+            # The span is arena slots; KV-derived mirrors ride the anchor's
+            # slots and are skipped by the same indices_from_pool filter.
+            if host_indices is not None and host_indices.numel() > 0:
+                cc.device_staging_free(PoolName.KV, host_indices)
+            for t in aux_xfers or ():
+                if (
+                    t.host_indices is None
+                    or t.host_indices.numel() == 0
+                    or t.indices_from_pool is not None
+                ):
+                    continue
+                cc.device_staging_free(t.name, t.host_indices)
+            return
         if host_indices is not None and host_indices.numel() > 0:
             cc.mem_pool_host.free(host_indices)
         for t in aux_xfers or ():
@@ -1906,6 +1920,7 @@ class BufferModePipeline:
             host_indices=f.host_indices[trim_tokens:],
             node_id=load_back_id,
             extra_pools=load_xfers or None,
+            device_staged=cache.cache_controller.storage_device_direct,
         )
         for load_context in load_contexts:
             load_context.finalize_allocation(success=device_indices is not None)

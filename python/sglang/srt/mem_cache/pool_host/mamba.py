@@ -899,9 +899,11 @@ class MambaPoolHost(HostKVCache):
         if self.temporal_state_elem_size > 0:
             yield "mamba_temporal", self.temporal_buffer[index]
         for conv_idx, conv_buf in enumerate(self.conv_buffer):
-            yield f"mamba_conv_{conv_idx}", conv_buf[:, index]
+            yield f"mamba_conv_{conv_idx}", conv_buf[index]
         for state_idx, state_buf in enumerate(self.slot_state_buffers):
-            yield f"mamba_slot_state_{state_idx}", state_buf[index]
+            yield f"mamba_slot_state_{state_idx}", state_buf[
+                index : index + self.page_size
+            ]
 
     def _iter_device_slot_tensors(self, index: int):
         temporal_layers = (

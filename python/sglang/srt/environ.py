@@ -800,6 +800,10 @@ class Envs:
     # their geometry allows, else through an aligned bounce), or "cufile"
     # (batched cuFile; requires the cuFile binding).
     SGLANG_HICACHE_FILE_BACKEND_IO_ENGINE = EnvStr("posix_buffered")
+    # GPU staging arena size for device-target L3 reads; 0 derives it from
+    # the prefetch threshold.
+    SGLANG_HICACHE_DEVICE_STAGING_PAGES = EnvInt(0)
+    SGLANG_HICACHE_DEVICE_STAGING_MAMBA_SLOTS = EnvInt(2)
     # Page payload verification on read: "full" (crc every page), "sampled"
     # (crc one page in every 64 reads), or "off".
     SGLANG_HICACHE_FILE_VERIFY = EnvStr("sampled")

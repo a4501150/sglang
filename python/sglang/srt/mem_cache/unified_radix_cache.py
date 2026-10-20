@@ -2890,7 +2890,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 num_tokens = min(len(transfer.keys or ()), hit_pages) * pool_page_size
                 if num_tokens == 0:
                     continue
-                host_indices = self.components[ct].alloc_prefetch_staging(num_tokens)
+                if cc.storage_device_direct and not transfer.indices_from_pool:
+                    # Device-target aux staging: arena slots, freed through
+                    # the same staging free path as the anchor span.
+                    host_indices = cc.device_staging_alloc(
+                        transfer.name, num_tokens
+                    )
+                else:
+                    host_indices = self.components[ct].alloc_prefetch_staging(
+                        num_tokens
+                    )
                 if host_indices is None:
                     if (
                         self.enable_storage_metrics
@@ -2899,6 +2908,12 @@ class UnifiedRadixCache(BasePrefixCache):
                         self.storage_metrics_collector.log_prefetch_aux_alloc_failed_tokens(
                             num_tokens
                         )
+                    if cc.storage_device_direct:
+                        for t in taken:
+                            if not t.indices_from_pool:
+                                cc.device_staging_free(t.name, t.host_indices)
+                            t.host_indices = None
+                        return False
                     cc.append_host_mem_release(extra_pools=taken)
                     for t in taken:
                         t.host_indices = None

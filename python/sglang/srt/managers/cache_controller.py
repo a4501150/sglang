@@ -23,12 +23,14 @@ from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
+    PoolTransferTarget,
     count_pool_hits,
 )
 
@@ -119,12 +121,16 @@ class CacheOperation:
         node_id: int,
         priority: Optional[int] = None,
         pool_transfers: Optional[List[PoolTransfer]] = None,
+        device_staged: bool = False,
     ):
         self.host_indices = host_indices
         self.device_indices = device_indices
         self.node_ids = [node_id]
         self.data = None
         self.pool_transfers = pool_transfers
+        # host_indices are device staging-arena slots: the load scatters
+        # arena -> device pool rows instead of copying host -> device.
+        self.device_staged = device_staged
 
         self.id = CacheOperation.counter
         CacheOperation.counter += 1
@@ -154,6 +160,7 @@ class CacheOperation:
                 host_indices=cat_or_none(t.host_indices for t in transfers),
                 device_indices=cat_or_none(t.device_indices for t in transfers),
                 keys=[key for t in transfers if t.keys for key in t.keys] or None,
+                target=transfers[0].target,
                 hit_policy=transfers[0].hit_policy,
                 indices_from_pool=transfers[0].indices_from_pool,
             )
@@ -177,6 +184,7 @@ class CacheOperation:
             -1,
             priority,
             pool_transfers=CacheOperation._merge_pool_transfers(ops),
+            device_staged=any(op.device_staged for op in ops),
         )
         merged_op.node_ids = node_ids
         return merged_op
@@ -334,6 +342,10 @@ class HiCacheController:
         self.enable_storage = False
         self.storage_backend = None
         self.storage_backend_type = None
+        # Buffer-mode device-target reads: L3 pages land in GPU staging
+        # arenas and scatter into device pools, bypassing the host tier.
+        self.storage_device_direct = False
+        self._device_staging_pools: dict = {}
         self.enable_storage_metrics = enable_storage_metrics
         # Buffer mode: wired by the tree cache after attach; the load rate
         # limiter subtracts write staging from actual pool usage.
@@ -632,6 +644,28 @@ class HiCacheController:
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
 
+            # Device-target reads engage only in buffer mode with a backend
+            # that can move whole pages between L3 and a GPU staging arena.
+            self.storage_device_direct = (
+                self.host_memory_mode == "buffer_only"
+                and self.storage_backend.supports_device_target
+                and self._device_staging_supported(self.storage_host_pool)
+            )
+            if self.storage_device_direct:
+                self._register_device_staging(PoolName.KV, self.storage_host_pool)
+                self.page_get_func = self._device_kv_batch_get
+                # Device-target prefetches stage in the arena, not the host
+                # pool; the load-fraction gate follows the arena size.
+                anchor_staging = self._device_staging_pools.get(str(PoolName.KV))
+                if anchor_staging is not None:
+                    self.prefetch_capacity_limit = int(
+                        HICACHE_LOAD_POOL_USAGE_FRACTION * anchor_staging.size
+                    )
+                logger.info(
+                    "HiCache device-target staging enabled: L3 reads land in "
+                    "GPU arenas and scatter into device pools."
+                )
+
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
             self._start_storage_threads()
@@ -657,6 +691,8 @@ class HiCacheController:
             self.storage_backend = None
             self.storage_backend_type = None
             self.enable_storage = False
+            self.storage_device_direct = False
+            self._device_staging_pools = {}
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
             raise
@@ -702,6 +738,8 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage = False
+        self.storage_device_direct = False
+        self._device_staging_pools = {}
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
         # Now it's safe to clear the stop event for future re-attach.
@@ -885,15 +923,27 @@ class HiCacheController:
         host_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
+        extra_pools: Optional[List[PoolTransfer]] = None,
+        device_staged: bool = False,
     ) -> Optional[torch.Tensor]:
         """
         Load KV caches from host memory to device memory.
+
+        With ``device_staged`` the host_indices are device staging-arena
+        slots and the copy scatters arena -> device pool rows.
         """
         device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
             return None
         self.load_queue.append(
-            CacheOperation(host_indices, device_indices, node_id, priority)
+            CacheOperation(
+                host_indices,
+                device_indices,
+                node_id,
+                priority,
+                pool_transfers=extra_pools,
+                device_staged=device_staged,
+            )
         )
         return device_indices
 
@@ -977,8 +1027,20 @@ class HiCacheController:
         host_indices: torch.Tensor,
         device_indices: torch.Tensor,
         pool_transfers: Optional[List[PoolTransfer]] = None,
+        device_staged: bool = False,
     ) -> list[L2Transfer]:
-        return self._l2_transfers(host_indices, device_indices, pool_transfers)
+        transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
+        if device_staged:
+            transfers = [
+                L2Transfer(
+                    host_pool=self._device_staging_pools[str(PoolName.KV)],
+                    device_pool=t.device_pool,
+                    host_indices=t.host_indices,
+                    device_indices=t.device_indices,
+                )
+                for t in transfers
+            ]
+        return transfers
 
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
@@ -986,6 +1048,11 @@ class HiCacheController:
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
+        if op.device_staged:
+            # Arena rows may still be filling on the staging copy streams.
+            self.wait_device_staging_copies(
+                self.l2_transfer_engine.host_to_device_stream
+            )
         host_indices, device_indices, pool_transfers = self._move_op_indices(op)
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
@@ -1000,7 +1067,12 @@ class HiCacheController:
             )
 
         completion = self.l2_transfer_engine.submit_host_to_device(
-            self._l2_load_transfers(host_indices, device_indices, pool_transfers),
+            self._l2_load_transfers(
+                host_indices,
+                device_indices,
+                pool_transfers,
+                device_staged=op.device_staged,
+            ),
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
             transfer_layer_id_max=self.transfer_layer_id_max,
@@ -1183,11 +1255,22 @@ class HiCacheController:
         # Read from KV-derived sidecar pools, if any.
         sidecar_hits: dict[str, int] = {}
         if len(kv_derived_transfers) > 0:
+            # KV-derived sidecars mirror the anchor's page numbering, so in
+            # device mode their arena rows are addressed by the same staging
+            # indices the KV batch used.
             current_kv_derived_transfers = [
                 PoolTransfer(
                     name=transfer.name,
                     host_indices=batch_host_indices,
                     keys=batch_hashes,
+                    device_indices=(
+                        batch_host_indices if self.storage_device_direct else None
+                    ),
+                    target=(
+                        PoolTransferTarget.DEVICE
+                        if self.storage_device_direct
+                        else PoolTransferTarget.HOST
+                    ),
                 )
                 for transfer in kv_derived_transfers
             ]
@@ -1238,6 +1321,13 @@ class HiCacheController:
         """
         Rate limit the prefetching operations to avoid overwhelming the storage backend.
         """
+        if self.storage_device_direct:
+            # Device-target prefetches stage in the anchor arena; host usage
+            # here is write staging only (reads bypass the host pool).
+            staging = self._device_staging_pools.get(str(PoolName.KV))
+            if staging is not None:
+                used = staging.size - staging.available_size()
+                return max(0, used) >= self.prefetch_capacity_limit
         if self.host_memory_mode == "buffer_only":
             # Gate on real pool usage: buffer mode allocates hit-sized, so
             # prefetch_tokens_occupied's requested spans overstate it. Pool
@@ -1265,6 +1355,107 @@ class HiCacheController:
     ) -> bool:
         """Whether a prefetch bounce can fit when its host pools are empty."""
         return need_size <= self.mem_pool_host.size
+
+    # ------------------------------------------------------------------
+    # Device-target staging (buffer_only L3 -> GPU arena -> device pools)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _device_staging_supported(host_pool) -> bool:
+        from sglang.srt.mem_cache.pool_host.device_staging import DeviceStagingPool
+
+        try:
+            DeviceStagingPool._check_geometry(host_pool)
+        except NotImplementedError:
+            return False
+        return True
+
+    def _device_staging_page_slots(self, host_pool) -> int:
+        if host_pool.page_size == 1:
+            # Slot pools (mamba): one trailing checkpoint per fetch plus one
+            # in flight; each row is tens of MB.
+            return max(
+                2, envs.SGLANG_HICACHE_DEVICE_STAGING_MAMBA_SLOTS.get()
+            )
+        override = envs.SGLANG_HICACHE_DEVICE_STAGING_PAGES.get()
+        if override:
+            return override
+        return max(
+            STORAGE_BATCH_SIZE,
+            (self.prefetch_threshold + self.page_size - 1) // self.page_size,
+        )
+
+    def _register_device_staging(self, name, host_pool) -> None:
+        """Build and register the device staging arena for one host pool."""
+        if not self.storage_device_direct or self.storage_backend is None:
+            return
+        from sglang.srt.mem_cache.pool_host.device_staging import DeviceStagingPool
+
+        pool_name = str(name)
+        if pool_name in self._device_staging_pools:
+            return
+        try:
+            staging = DeviceStagingPool(
+                host_pool,
+                device=self.device,
+                page_slots=self._device_staging_page_slots(host_pool),
+                name=pool_name,
+            )
+        except NotImplementedError as e:
+            logger.warning(
+                "HiCache device-target staging unavailable for %s: %s; "
+                "its pages stay on the host path.",
+                pool_name,
+                e,
+            )
+            return
+        self.storage_backend.register_mem_device_pool_v2(staging, pool_name)
+        self._device_staging_pools[pool_name] = staging
+
+    def device_staging_alloc(self, pool_name, need_size: int):
+        """Allocate staging-arena slots; None when the arena is full."""
+        staging = self._device_staging_pools.get(str(pool_name))
+        if staging is None:
+            return None
+        return staging.alloc(need_size)
+
+    def device_staging_free(self, pool_name, indices: torch.Tensor) -> None:
+        staging = self._device_staging_pools.get(str(pool_name))
+        if staging is not None:
+            staging.free(indices)
+
+    def wait_device_staging_copies(self, stream) -> None:
+        """Gate a scatter submission behind unread arena rows' copy events."""
+        for staging in self._device_staging_pools.values():
+            for event in staging.take_pending_copy_events():
+                stream.wait_event(event)
+
+    def _device_kv_batch_get(
+        self, operation, hash_values, host_indices, extra_info=None
+    ) -> int:
+        """Read one KV batch L3 -> GPU staging arena; leading hit pages."""
+        results = self.storage_backend.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.KV,
+                    keys=list(hash_values),
+                    device_indices=host_indices,
+                    target=PoolTransferTarget.DEVICE,
+                )
+            ],
+            extra_info=extra_info,
+        )
+        hits = results.get(PoolName.KV) or []
+        inc = 0
+        for i in range(len(hash_values)):
+            if not hits[i]:
+                logger.warning(
+                    f"Prefetch operation {operation.request_id} failed to "
+                    f"retrieve page {hash_values[i]} from device staging."
+                )
+                break
+            inc += 1
+        return inc
 
     def free_prefetch_host_buffers(
         self, operation: StorageOperation, host_indices: torch.Tensor

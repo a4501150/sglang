@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    PoolTransferTarget,
     count_pool_hits,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
@@ -347,6 +348,7 @@ class HybridCacheController(BaseHiCacheController):
 
         for entry in host_pools or []:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+            self._register_device_staging(entry.name, entry.host_pool)
         self.storage_backend.on_host_pools_registered()
 
     def detach_storage_backend(self):
@@ -366,6 +368,7 @@ class HybridCacheController(BaseHiCacheController):
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
         if self.enable_storage and self.storage_backend is not None:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+            self._register_device_staging(entry.name, entry.host_pool)
 
     @staticmethod
     def parse_storage_backend_extra_config(
@@ -733,6 +736,10 @@ class HybridCacheController(BaseHiCacheController):
     def can_fit_prefetch_host_buffers(
         self, operation: StorageOperation, need_size: int, *, empty: bool = True
     ) -> bool:
+        if self.storage_device_direct:
+            return need_size <= self._device_staging_pools[
+                str(PoolName.KV)
+            ].size
         anchor = self.mem_pool_host.anchor_entry
         if not uses_shared_host_layout(anchor.host_pool):
             return super().can_fit_prefetch_host_buffers(operation, need_size)
@@ -745,6 +752,8 @@ class HybridCacheController(BaseHiCacheController):
         return domain.can_fit_many_then(domain_requests, (), empty=empty)
 
     def prefetch_rate_limited(self) -> bool:
+        if self.storage_device_direct:
+            return super().prefetch_rate_limited()
         if self.host_memory_mode == "buffer_only" and uses_shared_host_layout(
             self.mem_pool_host.anchor_entry.host_pool
         ):
@@ -756,6 +765,8 @@ class HybridCacheController(BaseHiCacheController):
         self, operation: StorageOperation, need_size: int
     ) -> Optional[torch.Tensor]:
         """Atomically allocate every prefetch slice from a shared arena."""
+        if self.storage_device_direct:
+            return self.device_staging_alloc(PoolName.KV, need_size)
         anchor = self.mem_pool_host.anchor_entry
         if not uses_shared_host_layout(anchor.host_pool):
             return super().alloc_prefetch_host_buffers(operation, need_size)
@@ -820,6 +831,17 @@ class HybridCacheController(BaseHiCacheController):
     ) -> None:
         """Roll back an unsubmitted prefetch's anchor and independent pools."""
         pool_transfers = operation.pool_transfers or []
+        if self.storage_device_direct:
+            self.device_staging_free(PoolName.KV, host_indices)
+            for transfer in pool_transfers:
+                if (
+                    transfer.indices_from_pool is not None
+                    or transfer.host_indices is None
+                ):
+                    continue
+                self.device_staging_free(transfer.name, transfer.host_indices)
+                transfer.host_indices = None
+            return
         self.mem_pool_host.free(host_indices)
         for transfer in pool_transfers:
             if transfer.indices_from_pool is not None or transfer.host_indices is None:
@@ -847,18 +869,32 @@ class HybridCacheController(BaseHiCacheController):
 
         return self.move_hybrid_indices(op, write_back_jit=True)
 
+    def _device_staging_source(self, name, host_pool):
+        """Staging arena standing in for *host_pool* on device-staged loads."""
+        staging = self._device_staging_pools.get(str(name))
+        if staging is None:
+            raise ValueError(
+                f"device-staged load has no staging arena for pool {name}"
+            )
+        return staging
+
     def _l2_transfers(
         self,
         host_indices: torch.Tensor,
         device_indices: torch.Tensor,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        device_staged: bool = False,
     ) -> list[L2Transfer]:
         anchor = self.mem_pool_host.anchor_entry
         transfers = []
         if host_indices.numel() > 0:
             transfers.append(
                 L2Transfer(
-                    host_pool=anchor.host_pool,
+                    host_pool=(
+                        self._device_staging_source(anchor.name, anchor.host_pool)
+                        if device_staged
+                        else anchor.host_pool
+                    ),
                     device_pool=anchor.device_pool,
                     host_indices=host_indices,
                     device_indices=device_indices,
@@ -874,7 +910,11 @@ class HybridCacheController(BaseHiCacheController):
             entry = self.mem_pool_host.entry_map[pool_transfer.name]
             transfers.append(
                 L2Transfer(
-                    host_pool=entry.host_pool,
+                    host_pool=(
+                        self._device_staging_source(entry.name, entry.host_pool)
+                        if device_staged
+                        else entry.host_pool
+                    ),
                     device_pool=entry.device_pool,
                     host_indices=pool_transfer.host_indices,
                     device_indices=pool_transfer.device_indices,
@@ -888,8 +928,11 @@ class HybridCacheController(BaseHiCacheController):
         host_indices: torch.Tensor,
         device_indices: torch.Tensor,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        device_staged: bool = False,
     ) -> list[L2Transfer]:
-        transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
+        transfers = self._l2_transfers(
+            host_indices, device_indices, pool_transfers, device_staged=device_staged
+        )
         transfers_by_entry = {
             (id(t.host_pool), id(t.device_pool)): t for t in transfers
         }
@@ -975,11 +1018,13 @@ class HybridCacheController(BaseHiCacheController):
         *,
         device_indices: Optional[torch.Tensor] = None,
         anchor_indices: Optional[torch.Tensor] = None,
+        device_staged: bool = False,
     ) -> Optional[torch.Tensor]:
         """Queue an H2D of ``host_indices`` into freshly allocated FULL rows,
         or into caller-owned ``device_indices`` (kept on failure); side pools
         bind their device slots against ``anchor_indices`` (default: the KV
-        destination rows)."""
+        destination rows). With ``device_staged`` the host indices are device
+        staging-arena slots."""
         need_load_kv = host_indices.numel() > 0
         caller_owned = device_indices is not None
 
@@ -1016,6 +1061,7 @@ class HybridCacheController(BaseHiCacheController):
                 node_id,
                 priority,
                 pool_transfers=pool_transfers or None,
+                device_staged=device_staged,
             )
         )
         return device_indices
@@ -1519,6 +1565,22 @@ class HybridCacheController(BaseHiCacheController):
             )
             self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
+            if self.storage_device_direct:
+                # Device-target sidecar reads: the resolved host_indices are
+                # staging-arena slots; the backend reads pages straight into
+                # the arena rows.
+                transfers_nonkv = [
+                    (
+                        replace(
+                            transfer,
+                            device_indices=transfer.host_indices,
+                            target=PoolTransferTarget.DEVICE,
+                        )
+                        if transfer.host_indices is not None
+                        else transfer
+                    )
+                    for transfer in transfers_nonkv
+                ]
             try:
                 results = {}
                 for extra_info, transfers in _trailing_chain_groups(
