@@ -224,5 +224,38 @@ def test_run_eager_method_torch_compile():
     torch.testing.assert_close(compiled(x), layer(x))
 
 
+def _capture_exit_stub(current_graph):
+    """A BreakableCUDAGraphCapture-like object with the contextvar tokens
+    __exit__ must reset; __exit__ is called unbound so no capture starts."""
+    return SimpleNamespace(
+        _current_graph=current_graph,
+        _capture_token=bcg._current_capture_var.set(None),
+        _stream_token=bcg._current_stream_var.set(None),
+        _forked_token=bcg._forked_streams_var.set(None),
+        _stream_ctx=None,
+    )
+
+
+def test_capture_exit_ends_an_open_segment(monkeypatch):
+    monkeypatch.setattr(bcg, "_uninstall_wait_stream_hook", lambda: None)
+    events = []
+    capture = _capture_exit_stub(current_graph=object())
+    capture._end_current_segment = lambda: events.append("end")
+    assert bcg.BreakableCUDAGraphCapture.__exit__(capture, None, None, None) is False
+    assert events == ["end"]
+
+
+def test_capture_exit_preserves_error_after_failed_break(monkeypatch):
+    """A break body that raised already ended its segment and never began the
+    next one; __exit__ must not end a missing segment, whose assert inside
+    _end_current_segment would replace the in-flight exception."""
+    monkeypatch.setattr(bcg, "_uninstall_wait_stream_hook", lambda: None)
+    events = []
+    capture = _capture_exit_stub(current_graph=None)
+    capture._end_current_segment = lambda: events.append("end")
+    assert bcg.BreakableCUDAGraphCapture.__exit__(capture, None, None, None) is False
+    assert events == []
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
