@@ -604,6 +604,9 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
     backend = QwenSparseAttnBackend()
 
     class Pool:
+        dtype = torch.bfloat16
+        dynamic_fp8_kv_cache = False
+
         def set_kv_buffer(self, layer, loc, k, v):
             pass
 
@@ -645,6 +648,9 @@ def _make_paged_extend_backend():
     backend.forward_metadata = metadata
 
     class Pool:
+        dtype = torch.bfloat16
+        dynamic_fp8_kv_cache = False
+
         def set_kv_buffer(self, layer, loc, k, v):
             pass
 

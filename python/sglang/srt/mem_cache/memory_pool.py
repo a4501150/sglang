@@ -4251,6 +4251,20 @@ class MHATokenToKVPoolDynamicFP8(MHATokenToKVPool):
     dynamic_fp8_kv_cache = True
     FP8_MAX = 448.0
 
+    def _mha_scale_buffers(self):
+        from sglang.srt.mem_cache.device_pool_info import (
+            KVScaleBuffers,
+            KVScaleLayout,
+        )
+
+        # DYNAMIC_FP8_TOKEN, not TOKEN: host-pool dispatch must not confuse
+        # these descales with an FP4 pool's block-scale layout.
+        return KVScaleBuffers(
+            k=tuple(self.k_scale_buffer),
+            v=tuple(self.v_scale_buffer),
+            layout=KVScaleLayout.DYNAMIC_FP8_TOKEN,
+        )
+
     def _create_buffers(self):
         if self.post_capture_active:
             raise NotImplementedError(

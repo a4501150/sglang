@@ -158,12 +158,12 @@ class MHATokenToKVPoolHost(HostKVCache):
             )
         infos = (buffer_info, *draft_buffer_infos)
         for info in infos:
-            # TOKEN scales (dynamic FP8) and MXFP8_INTERLEAVED scales are moved
-            # only by the scale-aware host pools get_mha_host_pool_cls selects;
-            # the plain pool carries none.
+            # MXFP8_INTERLEAVED and DYNAMIC_FP8_TOKEN scales move only through
+            # the scale-aware host pools get_mha_host_pool_cls selects; the
+            # plain pool carries none. TOKEN (FP4 block scales) stays rejected.
             if info.scales is not None and info.scales.layout not in (
                 KVScaleLayout.MXFP8_INTERLEAVED,
-                KVScaleLayout.TOKEN,
+                KVScaleLayout.DYNAMIC_FP8_TOKEN,
             ):
                 raise ValueError(
                     f"{pool_label}: MHA host transfers do not support "
@@ -1697,7 +1697,7 @@ def get_mha_host_pool_cls(buffer_info: MHABufferInfo) -> type:
         return MHATokenToKVPoolMXFP8Host
     is_dynamic_fp8 = (
         buffer_info.scales is not None
-        and buffer_info.scales.layout == KVScaleLayout.TOKEN
+        and buffer_info.scales.layout == KVScaleLayout.DYNAMIC_FP8_TOKEN
     )
     if is_dynamic_fp8:
         if buffer_info.head_dim != buffer_info.v_head_dim:

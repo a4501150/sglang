@@ -77,11 +77,11 @@ class MHATokenToKVPoolDynamicFP8Host(MHATokenToKVPoolHost):
             )
         if (
             buffer_info.scales is None
-            or buffer_info.scales.layout != KVScaleLayout.TOKEN
+            or buffer_info.scales.layout != KVScaleLayout.DYNAMIC_FP8_TOKEN
         ):
             raise ValueError(
-                "Dynamic FP8 KV host pool requires per-token (TOKEN layout) "
-                "K/V scale buffers."
+                "Dynamic FP8 KV host pool requires per-token FP32 "
+                "(DYNAMIC_FP8_TOKEN layout) K/V scale buffers."
             )
         if buffer_info.head_dim != buffer_info.v_head_dim:
             raise NotImplementedError(
