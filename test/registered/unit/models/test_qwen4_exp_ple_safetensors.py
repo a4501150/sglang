@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import json
 import os
+import types
 import unittest
 
 import numpy as np
 import torch
 from safetensors.torch import save_file
+from torch import nn
 
 from sglang.srt.environ import envs
 from sglang.srt.models.qwen4_exp_ple_safetensors import (
@@ -488,6 +490,108 @@ def _read_rows(table, unique_ids):
             f.seek(int(off))
             blob += f.read(row_bytes)
     return blob
+
+
+class _FakeVocabEmbedding(nn.Module):
+    """Just enough of VocabParallelEmbedding for the wrapper: TP rank 0 of 1
+    owning the whole table, meta weight, the attributes the model reads."""
+
+    def __init__(self, num_rows: int, dim: int, dtype: torch.dtype):
+        super().__init__()
+        from sglang.srt.layers.quantization.unquant import (
+            UnquantizedEmbeddingMethod,
+        )
+
+        self.quant_method = UnquantizedEmbeddingMethod()
+        self.quant_config = None
+        self.enable_tp = True
+        self.use_attn_tp_group = False
+        self.tp_size = 1
+        self.num_embeddings = num_rows
+        self.org_vocab_size = num_rows
+        self.padding_size = 0
+        self.num_added_embeddings = 0
+        self.use_presharded_weights = False
+        self.org_vocab_size_padded = num_rows
+        self.num_embeddings_padded = num_rows
+        self.shard_indices = types.SimpleNamespace(
+            org_vocab_start_index=0, org_vocab_end_index=num_rows
+        )
+        self.embedding_dim = dim
+        self.num_embeddings_per_partition = num_rows
+        self.num_org_embeddings_per_partition = num_rows
+        self.num_added_embeddings_per_partition = 0
+        self.register_parameter(
+            "weight",
+            nn.Parameter(
+                torch.empty((num_rows, dim), dtype=dtype, device="meta"),
+                requires_grad=False,
+            ),
+        )
+        self.register_buffer("weight_scale", torch.ones(1, dtype=torch.bfloat16))
+
+
+class TestQwen4ExpSafetensorsEmbeddingGpu(unittest.TestCase):
+    """The wrapper the model installs, against the real checkpoint.
+
+    The full model needs the distributed runtime; the wrapper plus a
+    duck-typed VocabParallelEmbedding covers the wiring the model touches:
+    construction (descriptor build, dtype contract, meta weight), an
+    async gather + join_prefetch round trip, and the synchronous forward.
+    """
+
+    def _embedding(self, directory):
+        from sglang.srt.models.qwen4_exp_ple_safetensors import (
+            Qwen4ExpSafetensorsEmbedding,
+        )
+
+        emb = _FakeVocabEmbedding(320001536, 160, torch.bfloat16)
+        wrapper = Qwen4ExpSafetensorsEmbedding(emb, directory=directory)
+        self.addCleanup(wrapper.close)
+        return wrapper
+
+    def test_wrapper_roundtrip_real_checkpoint(self):
+        if not os.path.isdir(_REAL_CKPT):
+            raise unittest.SkipTest(f"Qwen3.8-Flash-Next not cached at {_REAL_CKPT}")
+        wrapper = self._embedding(_REAL_CKPT)
+        self.assertTrue(wrapper.weight.is_meta)
+        self.assertEqual(wrapper._table.num_rows, 320001536)
+        rng = np.random.default_rng(9)
+        ids = torch.tensor(
+            rng.integers(0, 320001536, size=96), dtype=torch.long, device="cuda"
+        )
+        out = wrapper.gather(ids)  # async: worker owns the IO
+        wrapper.join_prefetch()
+        torch.cuda.synchronize()
+        unique, inverse = np.unique(ids.cpu().numpy(), return_inverse=True)
+        expect = (
+            torch.frombuffer(
+                bytearray(_read_rows(wrapper._table, unique)), dtype=torch.uint8
+            )
+            .view(torch.bfloat16)
+            .reshape(-1, 160)
+        )[torch.from_numpy(inverse)]
+        self.assertTrue(torch.equal(out.cpu(), expect))
+        # The synchronous forward path gathers, joins and (TP=1) reduces.
+        out2 = wrapper(ids)
+        self.assertTrue(torch.equal(out2.cpu(), expect))
+        # Out-of-table ids zero-fill, matching the pinned backend.
+        bad = torch.tensor([320001536 + 5], dtype=torch.long, device="cuda")
+        self.assertTrue(
+            torch.equal(wrapper(bad).cpu(), torch.zeros(1, 160, dtype=torch.bfloat16))
+        )
+
+    def test_wrapper_rejects_dtype_mismatch(self):
+        if not os.path.isdir(_REAL_CKPT):
+            raise unittest.SkipTest(f"Qwen3.8-Flash-Next not cached at {_REAL_CKPT}")
+        from sglang.srt.models.qwen4_exp_ple_safetensors import (
+            Qwen4ExpSafetensorsEmbedding,
+        )
+
+        emb = _FakeVocabEmbedding(320001536, 160, torch.float8_e4m3fn)
+        with self.assertRaises(ValueError):
+            wrapper = Qwen4ExpSafetensorsEmbedding(emb, directory=_REAL_CKPT)
+            wrapper.close()
 
 
 if __name__ == "__main__":
