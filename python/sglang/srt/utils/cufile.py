@@ -90,6 +90,8 @@ _IO_PARAMS_NP = np.dtype(
 # cannot do while stuck inside submit). Measured with libcufile 1.19.1:
 # 65+ concurrent >4-KiB batch IOs hang; 128 concurrent 4-KiB IOs do not.
 _COMPAT_MAX_LARGE_IOS_PER_ROUND = 64
+# Partial-transfer resubmissions per wait() before a short count stands.
+_MAX_RESUME_ROUNDS = 16
 
 # cufile.h CUFILEOP_STATUS_ENTRIES: code -> (name, description).
 _CUFILE_ERRORS = {
@@ -855,6 +857,8 @@ class CuFileBatch:
         self._handle = _BatchHandle(self._driver._lib, self._chunk)
         self._pending: list = []  # _DescChunk / _VecChunk records, in order
         self._results: list[int] = []
+        # Every queued IO in order, so wait() can resume partial transfers.
+        self._log: list[tuple] = []
         self._total_capacity = max_ios
         self._queued = 0
 
@@ -875,6 +879,17 @@ class CuFileBatch:
             )
         for base in range(0, len(ios), self._chunk):
             self._pending.append(_DescChunk(list(ios[base : base + self._chunk])))
+        for io in ios:
+            self._log.append(
+                (
+                    io.handle,
+                    io.buf_ptr,
+                    io.is_write,
+                    np.array([io.file_offset], dtype=np.int64),
+                    np.array([io.size], dtype=np.int64),
+                    np.array([io.buf_offset], dtype=np.int64),
+                )
+            )
         self._queued += len(ios)
         if self._handle.outstanding == 0:
             self._pump_round()
@@ -912,6 +927,16 @@ class CuFileBatch:
                     is_write,
                 )
             )
+        self._log.append(
+            (
+                handle,
+                buf_ptr,
+                is_write,
+                np.asarray(file_offsets, dtype=np.int64),
+                np.asarray(sizes, dtype=np.int64),
+                np.asarray(buf_offsets, dtype=np.int64),
+            )
+        )
         self._queued += n
         if self._handle.outstanding == 0:
             self._pump_round()
@@ -919,10 +944,77 @@ class CuFileBatch:
     def wait(self, timeout_s: float) -> list[int]:
         """Drive all rounds to completion; returns per-IO byte counts in order.
 
+        Like ``pread``, cuFile may complete an IO partially (seen with
+        nvidia-fs loaded and a file on the compat fallback); the remainder is
+        resubmitted until the IO completes or stops progressing, so a count
+        below the requested size means end of file.
+
         Raises :class:`CuFileError` naming the failed IO, or ``TimeoutError``.
         After either, the batch is reusable (the error state is cleared).
         """
         deadline = time.monotonic() + timeout_s
+        log, self._log = self._log, []
+        results = np.asarray(self._drain(deadline, timeout_s), dtype=np.int64)
+        # positions[i] is the result index of row i of the current log, and
+        # round_done[i] the bytes that row moved in the latest round.
+        positions = np.arange(results.size)
+        round_done = results.copy()
+        for _ in range(_MAX_RESUME_ROUNDS):
+            resumed = self._queue_remainders(log, round_done)
+            if resumed is None:
+                break
+            log, mask = resumed
+            positions = positions[mask]
+            round_done = np.asarray(self._drain(deadline, timeout_s), dtype=np.int64)
+            results[positions] += round_done
+        return results.tolist()
+
+    def _queue_remainders(self, log, done):
+        """Queue the unfinished tail of every IO in ``log`` that progressed.
+
+        ``done`` holds the bytes each log row moved in the latest round. Returns the log of
+        the queued remainders and the mask of resumed rows, or ``None``.
+        """
+        if not log:
+            return None
+        sizes = np.concatenate([entry[4] for entry in log])
+        resumable = (done > 0) & (done < sizes)
+        if not resumable.any():
+            return None
+        resumed_log = []
+        base = 0
+        for handle, buf_ptr, is_write, offs, szs, bufs in log:
+            n = szs.size
+            got = done[base : base + n]
+            mask = resumable[base : base + n]
+            base += n
+            if not mask.any():
+                continue
+            entry = (
+                handle,
+                buf_ptr,
+                is_write,
+                offs[mask] + got[mask],
+                szs[mask] - got[mask],
+                bufs[mask] + got[mask],
+            )
+            resumed_log.append(entry)
+            for c in range(0, entry[4].size, self._chunk):
+                self._pending.append(
+                    _VecChunk(
+                        handle,
+                        buf_ptr,
+                        entry[3][c : c + self._chunk],
+                        entry[4][c : c + self._chunk],
+                        entry[5][c : c + self._chunk],
+                        is_write,
+                    )
+                )
+        self._queued = int(resumable.sum())
+        self._pump_round()
+        return resumed_log, resumable
+
+    def _drain(self, deadline: float, timeout_s: float) -> list[int]:
         try:
             while self._pending or self._handle.outstanding:
                 if self._handle.outstanding:
@@ -951,7 +1043,9 @@ class CuFileBatch:
         if not self._pending:
             return
         chunk = self._pending.pop(0)
-        compat = self._driver.mode() == "compat"
+        # Unaligned IO and files on the compat fallback bounce through the
+        # POSIX pool in every driver mode, not only when compat is global.
+        compat = True
         if isinstance(chunk, _DescChunk):
             ios = chunk.ios
             if compat and any(io.size > 4096 for io in ios):
@@ -988,6 +1082,7 @@ class CuFileBatch:
     def close(self) -> None:
         self._handle.close()
         self._pending.clear()
+        self._log = []
         self._queued = 0
         self._results = []
 

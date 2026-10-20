@@ -15,6 +15,8 @@ from __future__ import annotations
 import os
 import unittest
 
+import numpy as np
+
 import torch
 
 from sglang.srt.utils import cufile
@@ -219,6 +221,71 @@ class TestCuFileBinding(CustomTestCase):
             # The last page still reads in full.
             self.assertEqual(handle.read(buf, 4096, (8 << 20) - 4096), 4096)
 
+
+
+class _PartialBatchHandle:
+    """Native batch stand-in that moves at most ``step`` bytes per IO."""
+
+    def __init__(self, step: int) -> None:
+        self.step = step
+        self.outstanding = 0
+        self.results: list[int] = []
+        self.submitted: list[tuple] = []
+
+    def submit_vectors(self, handle, buf_ptr, offsets, sizes, buf_offsets, is_write):
+        self.submitted.append((offsets.copy(), sizes.copy(), buf_offsets.copy()))
+        self.results = [int(min(z, self.step)) for z in sizes]
+        self.outstanding = len(sizes)
+
+    def wait(self, timeout_s: float) -> None:
+        self.outstanding = 0
+
+    def cancel(self) -> None:
+        self.outstanding = 0
+
+    def close(self) -> None:
+        pass
+
+
+class TestCuFileBatchResume(unittest.TestCase):
+    """Partial transfers resume at the right offsets (no GPU needed)."""
+
+    def _batch(self, step: int) -> cufile.CuFileBatch:
+        batch = object.__new__(cufile.CuFileBatch)
+        batch._chunk = 8
+        batch._handle = _PartialBatchHandle(step)
+        batch._pending = []
+        batch._results = []
+        batch._log = []
+        batch._total_capacity = 8
+        batch._queued = 0
+        return batch
+
+    def test_short_transfers_resume_until_complete(self):
+        batch = self._batch(step=4096)
+        sizes = np.array([10000, 4096, 9000], dtype=np.int64)
+        offsets = np.array([0, 65536, 131072], dtype=np.int64)
+        bufs = np.array([0, 16384, 32768], dtype=np.int64)
+        batch.submit_spans(
+            None, buf_ptr=0, file_offsets=offsets, sizes=sizes, buf_offsets=bufs
+        )
+        self.assertEqual(batch.wait(timeout_s=5.0), sizes.tolist())
+        # The second round resumes only the unfinished IOs, 4 KiB further in.
+        offs, szs, buf = batch._handle.submitted[1]
+        self.assertEqual(offs.tolist(), [4096, 131072 + 4096])
+        self.assertEqual(szs.tolist(), [10000 - 4096, 9000 - 4096])
+        self.assertEqual(buf.tolist(), [4096, 32768 + 4096])
+
+    def test_no_progress_returns_the_short_count(self):
+        batch = self._batch(step=0)
+        batch.submit_spans(
+            None,
+            buf_ptr=0,
+            file_offsets=np.array([0], dtype=np.int64),
+            sizes=np.array([4096], dtype=np.int64),
+            buf_offsets=np.array([0], dtype=np.int64),
+        )
+        self.assertEqual(batch.wait(timeout_s=5.0), [0])
 
 if __name__ == "__main__":
     unittest.main()
