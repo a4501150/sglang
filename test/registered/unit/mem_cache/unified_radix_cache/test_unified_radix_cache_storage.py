@@ -50,6 +50,7 @@ from sglang.test.kits.unified_radix_cache.config import (
     requires,
     requires_full_swa_ps1,
     requires_hicache,
+    requires_mamba,
     requires_ps1_window4,
     requires_swa,
     requires_swa_only,
@@ -1067,6 +1068,55 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self._drain_buffer_writes(cache)
         hashes = [h for n in chain for h in cache.tree_core.get_hash_values(n)]
         self.assertEqual(self._storage_exists_count(cache, hashes), len(hashes))
+        cache.sanity_check()
+
+    @requires_hicache
+    @requires_mamba
+    def test_buffer_only_clamped_checkpoint_counts_reuse(self):
+        """A fully-cached re-read whose mamba donate boundary clamps the
+        checkpoint to zero must still count the matched nodes' reuse:
+        without the count, write_through_selective never reaches its
+        threshold and a hybrid-SSM server writes nothing to L3."""
+        if not self.cfg.enable_mamba_extra_buffer:
+            self.skipTest("the clamp needs the extra-buffer donate boundary")
+        storage_dir = self._make_storage_dir()
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(
+            cache,
+            write_policy="write_through_selective",
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+            host_memory_mode="buffer_only",
+            prefetch_policy="wait_complete",
+        )
+        # The production selective threshold; the fixture parks the trigger.
+        cache.write_through_threshold = 2
+
+        seq = self._make_seq(1, 8)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = match_prefix(cache, seq).last_device_node
+        chain = self._path_chain(cache, leaf)
+
+        # The re-read: the whole prompt matched, and it extends nothing past
+        # the mamba track grid, so no checkpoint is donated and the finished
+        # checkpoint clamps to zero.
+        req, _ = self._make_inflight_req(
+            cache, allocator, req_to_token_pool, seq, allocated=True
+        )
+        req.lock = cache.lock(leaf)
+        req.kv.cache_protected_len = len(seq)
+        req.kv.cache_inserted_len = 0
+        req.prefix_len = len(seq)
+        assert req.kv.mamba_last_track_seqlen is None
+        finish_req(cache, req, req.extend_end)
+
+        self._drain_buffer_writes(cache)
+        hashes = [h for n in chain for h in cache.tree_core.get_hash_values(n)]
+        self.assertEqual(self._storage_exists_count(cache, hashes), len(hashes))
+        # First re-read reached the threshold; the backup is in flight or
+        # done, and a second re-read must not re-fire it.
+        self.assertFalse(cache.buffer_backup_pending(leaf))
         cache.sanity_check()
 
     @requires_hicache

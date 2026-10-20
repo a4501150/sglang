@@ -1205,6 +1205,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
 
         if effective_cache_len <= 0:
+            self._count_reuse_hits(req, token_ids)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
                     req, is_finished=is_finished, insert_params=insert_params
@@ -1317,6 +1318,43 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.session_refs.register_session_ref(
                     req, leaf=result.last_device_node
                 )
+
+    def _count_reuse_hits(self, req: Req, token_ids) -> None:
+        """Count a fully-clamped checkpoint's reuse of already-keyed nodes.
+
+        A hybrid-SSM request that donates no mamba state clamps its
+        checkpoint to zero and skips the insert walk -- the only place node
+        hit counts grow -- so a re-read served entirely from the tree never
+        reaches the write_through_selective threshold and L3 stays empty.
+        The matched, still-locked span past what this request inserted is
+        pure reuse: count it like the insert walk would have.
+        """
+        protected = req.kv.cache_protected_len
+        inserted = req.kv.cache_inserted_len
+        if protected <= inserted or protected > len(token_ids):
+            return
+        key = (
+            RadixKey(
+                token_ids[:protected],
+                req.extra_key,
+                is_bigram=self.tree_core.is_eagle,
+                cache_salt=req.cache_salt,
+            )
+            .page_aligned(self.page_size)
+        )
+        if len(key) <= inserted:
+            return
+        actions = self.tree_core.count_reuse_hits(key, inserted)
+        self._touch_storage_l3(key, len(key))
+        if not actions:
+            return
+        if self.buffer_pipeline is not None:
+            self.buffer_pipeline.begin_insert_walk()
+        try:
+            self._apply_cache_actions(actions)
+        finally:
+            if self.buffer_pipeline is not None:
+                self.buffer_pipeline.end_insert_walk()
 
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:
@@ -2780,7 +2818,23 @@ class UnifiedRadixCache(BasePrefixCache):
             self.buffer_pipeline.pop_prefix_ctx(request)
             self.buffer_pipeline.release_anchor_lock(request)
         cc = self.cache_controller
-        cc.append_host_mem_release(host_indices=host_indices, extra_pools=extra_pools)
+        if info.operation.device_staged:
+            # Arena slots, not host rows: free through the staging pools.
+            if host_indices is not None and host_indices.numel() > 0:
+                cc.device_staging_free(PoolName.KV, host_indices)
+            for transfer in extra_pools or []:
+                if (
+                    transfer.host_indices is None
+                    or transfer.host_indices.numel() == 0
+                    or transfer.indices_from_pool is not None
+                ):
+                    continue
+                cc.device_staging_free(transfer.name, transfer.host_indices)
+                transfer.host_indices = None
+        else:
+            cc.append_host_mem_release(
+                host_indices=host_indices, extra_pools=extra_pools
+            )
         cc.prefetch_tokens_occupied = max(
             0,
             cc.prefetch_tokens_occupied
@@ -2890,7 +2944,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 num_tokens = min(len(transfer.keys or ()), hit_pages) * pool_page_size
                 if num_tokens == 0:
                     continue
-                if cc.storage_device_direct and not transfer.indices_from_pool:
+                if (
+                    cc.storage_device_direct
+                    and info.operation.device_staged
+                    and not transfer.indices_from_pool
+                ):
                     # Device-target aux staging: arena slots, freed through
                     # the same staging free path as the anchor span.
                     host_indices = cc.device_staging_alloc(
@@ -2908,7 +2966,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         self.storage_metrics_collector.log_prefetch_aux_alloc_failed_tokens(
                             num_tokens
                         )
-                    if cc.storage_device_direct:
+                    if info.operation.device_staged:
                         for t in taken:
                             if not t.indices_from_pool:
                                 cc.device_staging_free(t.name, t.host_indices)
