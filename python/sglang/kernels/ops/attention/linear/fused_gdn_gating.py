@@ -1,5 +1,3 @@
-from typing import Tuple
-
 import torch
 import triton
 import triton.language as tl
@@ -37,8 +35,10 @@ def fused_gdn_gating_kernel(
     )
     blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
     tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
+    # beta_output is an fp32 buffer consumed by the delta-rule state update
+    # every step; narrowing here loses bf16 epsilon on each round-trip.
     blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
-    tl.store(beta_output + off, blk_beta_output.to(b.dtype.element_ty), mask=mask)
+    tl.store(beta_output + off, blk_beta_output, mask=mask)
 
 
 def fused_gdn_gating(
@@ -48,7 +48,7 @@ def fused_gdn_gating(
     dt_bias: torch.Tensor,
     beta: float = 1.0,
     threshold: float = 20.0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     batch, num_heads = a.shape
     seq_len = 1
     stride_a = a.stride(0)
