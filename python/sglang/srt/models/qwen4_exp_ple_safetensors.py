@@ -367,6 +367,7 @@ def plan_io_spans(
     align_4k: bool,
     arena_bytes: int,
     max_spans: int = _MAX_SPANS_PER_ROUND,
+    file_sizes: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, list[Tuple[np.ndarray, list[Tuple[int, int, int, int]]]]]:
     """Group row addresses into merged IO spans, in arena-sized rounds.
 
@@ -383,7 +384,8 @@ def plan_io_spans(
     ``(row_indices, spans)`` per round, the spans as
     ``(file_index, file_offset, arena_offset, size)``. Row indices are into
     the input arrays; rounds are bounded by the arena size and
-    ``max_spans``.
+    ``max_spans``. ``file_sizes`` (bytes, indexed by file) caps aligned span
+    ends at end of file, where a page-rounded read would come back short.
     """
     n = byte_offsets.size
     if n == 0:
@@ -395,6 +397,8 @@ def plan_io_spans(
     ends = sorted_off + row_bytes
     if align_4k:
         ends = (ends + _PAGE_BYTES - 1) & ~(_PAGE_BYTES - 1)
+        if file_sizes is not None:
+            ends = np.minimum(ends, file_sizes[sorted_file])
     # Merge run: a span extends while the next row starts before or at the
     # accumulated end of its run. The accumulate must reset at file
     # boundaries -- a carried-over end would swallow every later row of the
@@ -595,6 +599,9 @@ class PleSafetensorsGatherer:
             self._mode = cufile.CuFileDriver.instance().mode()
             cufile.register_buffer(self._arena, arena_bytes)
             self._handles = [cufile.CuFileHandle(p) for p in table.files]
+            self._file_sizes = np.array(
+                [os.path.getsize(p) for p in table.files], dtype=np.int64
+            )
             self._batch = cufile.CuFileBatch(max_ios=_MAX_SPANS_PER_ROUND)
             self._pread_pool = None
             self._host_arena = None
@@ -604,6 +611,7 @@ class PleSafetensorsGatherer:
             # arena and one async H2D per round into the device arena.
             self._mode = "pread"
             self._handles = []
+            self._file_sizes = None
             self._batch = None
             self._pread_pool = ThreadPoolExecutor(max_workers=_PREAD_THREADS)
             self._host_arena = torch.empty(
@@ -724,6 +732,7 @@ class PleSafetensorsGatherer:
                 table.row_bytes,
                 align_4k=self._mode in ("gds", "p2pdma"),
                 arena_bytes=self._arena.numel(),
+                file_sizes=self._file_sizes,
             )
         else:
             arena_off, rounds = None, []

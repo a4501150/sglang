@@ -250,6 +250,23 @@ class TestPlanIoSpans(unittest.TestCase):
         for off, arena in zip(offsets, arena_off):
             self.assertEqual(arena, off)
 
+    def test_aligned_span_end_stops_at_end_of_file(self):
+        # The last row ends 200 B into a page that the file does not fill;
+        # a page-rounded read there would return short at end of file.
+        file_size = 8192 + 520
+        offsets = np.array([8192 + 200], dtype=np.int64)
+        _, rounds = plan_io_spans(
+            np.zeros(1, dtype=np.int64),
+            offsets,
+            self.ROW_BYTES,
+            align_4k=True,
+            arena_bytes=1 << 20,
+            file_sizes=np.array([file_size], dtype=np.int64),
+        )
+        _, off_arr, _, size_arr = rounds[0][1]
+        self.assertEqual(off_arr[0], 8192)
+        self.assertEqual(off_arr[0] + size_arr[0], file_size)
+
     def test_touching_rows_merge_in_compat_mode(self):
         offsets = np.array([1000, 1000 + self.ROW_BYTES], dtype=np.int64)
         _, rounds = plan_io_spans(
