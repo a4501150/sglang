@@ -795,14 +795,35 @@ class Envs:
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
+    # HiCacheFile page IO engine: "posix_buffered" (default; OS page cache),
+    # "posix_o_direct" (positional O_DIRECT straight on host pool pages when
+    # their geometry allows, else through an aligned bounce), or "cufile"
+    # (batched cuFile; requires the cuFile binding).
+    SGLANG_HICACHE_FILE_BACKEND_IO_ENGINE = EnvStr("posix_buffered")
+    # Page payload verification on read: "full" (crc every page), "sampled"
+    # (crc one page in every 64 reads), or "off".
+    SGLANG_HICACHE_FILE_VERIFY = EnvStr("sampled")
+    # Emit per-component sha256 digest marker lines for every page written to
+    # or read from file storage, and for every host<->device transfer; parsed
+    # by the HiCache digest bench (scripts/hicache_digest_check.py).
+    SGLANG_HICACHE_FILE_BACKEND_LOG_PAGE_DIGESTS = EnvBool(False)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
     SGLANG_HICACHE_FILE_BACKEND_EVICTION_RATIO = EnvFloat(0.9)
     SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE = EnvStr("0")
+    # Orphan janitor: leftover tmp/probe files and same-identity stale-format
+    # pages younger than the grace window are never touched (a live writer or
+    # a concurrently running older instance may still own them).
+    SGLANG_HICACHE_FILE_BACKEND_ORPHAN_GRACE_SECONDS = EnvFloat(600.0)
+    SGLANG_HICACHE_FILE_BACKEND_ORPHAN_SWEEP_INTERVAL_SECONDS = EnvFloat(300.0)
     # Enable client-side metadata caching to optimize filesystem checks (e.g. for Lustre/NFS/FUSE)
     SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)
     # Positive cache TTL for filesystem metadata lookups (-1 disables positive expiration)
     SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL = EnvFloat(5.0)
+    # Entry cap for the positive metadata cache (0 disables the cap). Entries
+    # are otherwise only dropped on their own next lookup, so long uptimes
+    # with write-through traffic grow the cache without bound.
+    SGLANG_HICACHE_FILE_BACKEND_METADATA_CACHE_MAX_ENTRIES = EnvInt(262144)
     # Buffer mode: staged prefetches pin their device anchor from IO commit
     # to consumption so eviction cannot waste the fetch. Cap = fraction of
     # the pool the pins may hold; 0 disables pinning.

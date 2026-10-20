@@ -28,7 +28,9 @@ from typing import Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.device_pool_info import KVScaleLayout, MHABufferInfo
+from sglang.srt.mem_cache.hicache_format import hicache_tensor_digest
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_unregister,
@@ -122,6 +124,72 @@ class MHATokenToKVPoolDynamicFP8Host(MHATokenToKVPoolHost):
     def get_size_per_token(self):
         payload = super().get_size_per_token()
         return payload + self._scale_token_bytes * self.layer_num
+
+    def storage_format_spec(self) -> dict:
+        spec = super().storage_format_spec()
+        # The base tag already marks the payload+scale page layout; the
+        # scale geometry pins the per-head fp32 component.
+        spec["kv_scale_dtype"] = "float32"
+        spec["kv_scale_head_num"] = self.head_num
+        return spec
+
+    def log_transfer_digests(
+        self,
+        direction: str,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+    ) -> None:
+        super().log_transfer_digests(direction, host_indices, device_indices)
+        if not envs.SGLANG_HICACHE_FILE_BACKEND_LOG_PAGE_DIGESTS.get():
+            return
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
+        host_values = self._validate_page_runs("host", host_indices)
+        device_values = self._validate_page_runs("device", device_indices)
+        for host_token, device_token in zip(
+            host_values[:: self.page_size], device_values[:: self.page_size]
+        ):
+            page = host_token // self.page_size
+            host_scales = {
+                "kv_scale_k": self.k_scale_host[page],
+                "kv_scale_v": self.v_scale_host[page],
+            }
+            device_scales = {
+                "kv_scale_k": torch.stack(
+                    [
+                        buffer[device_token : device_token + self.page_size]
+                        for buffer in self.scale_k_buffers
+                    ]
+                ),
+                "kv_scale_v": torch.stack(
+                    [
+                        buffer[device_token : device_token + self.page_size]
+                        for buffer in self.scale_v_buffers
+                    ]
+                ),
+            }
+            for component, host_tensor in host_scales.items():
+                host_digest = hicache_tensor_digest(host_tensor)
+                device_digest = hicache_tensor_digest(device_scales[component])
+                logger.warning(
+                    "HiCache KV transfer digest direction=%s component=%s "
+                    "host_page=%d device_index=%d bytes=%d host_sha256=%s "
+                    "device_sha256=%s exact=%s",
+                    direction,
+                    component,
+                    page,
+                    device_token,
+                    host_tensor.numel() * host_tensor.element_size(),
+                    host_digest,
+                    device_digest,
+                    host_digest == device_digest,
+                )
+
+    def get_debug_page_tensors(self, index: int):
+        yield from super().get_debug_page_tensors(index)
+        page = self._aligned_page_id(index)
+        yield "kv_scale_k", self.k_scale_host[page]
+        yield "kv_scale_v", self.v_scale_host[page]
 
     def _init_scale_buffer(self):
         alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]

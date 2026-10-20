@@ -623,9 +623,11 @@ class HiCacheController:
                     "tensorcast",
                     "seaweedfs",
                 ]
-            ) or (
-                self.storage_backend_type == "dynamic"
-                and bool(self.storage_config.extra_config.get("interface_v1", 0))
+                or self.storage_backend.supports_zero_copy_page_io
+                or (
+                    self.storage_backend_type == "dynamic"
+                    and bool(self.storage_config.extra_config.get("interface_v1", 0))
+                )
             ):
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
@@ -1197,6 +1199,11 @@ class HiCacheController:
         # Clamp to minimal number of hits.
         return min([kv_hits, *sidecar_hits.values()])
 
+    def _maybe_sweep_storage_orphans(self) -> None:
+        """Idle-path hook: periodically delete leftover storage tmp files."""
+        if self.storage_backend is not None:
+            self.storage_backend.maybe_sweep_orphans()
+
     def prefetch_io_aux_func(self):
         """
         Auxiliary function conducting IO operations for prefetching.
@@ -1205,11 +1212,19 @@ class HiCacheController:
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
             except Empty:
+                self._maybe_sweep_storage_orphans()
                 continue
             if operation is None:
                 continue
             try:
                 self._page_transfer(operation)
+            except Exception:
+                # The finally below still publishes the ack with whatever
+                # progress the operation made; keep the thread alive.
+                logger.exception(
+                    "HiCache prefetch IO failed for request %s",
+                    operation.request_id,
+                )
             finally:
                 self.prefetch_sync_queue.put(
                     PrefetchAck(
@@ -1318,6 +1333,7 @@ class HiCacheController:
                 self.prefetch_hit_queue.put(operation)
 
             except Empty:
+                self._maybe_sweep_storage_orphans()
                 continue
 
     def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
@@ -1410,6 +1426,7 @@ class HiCacheController:
                 self.ack_backup_queue.put(operation)
 
             except Empty:
+                self._maybe_sweep_storage_orphans()
                 continue
 
     def prefetch_sync_thread_func(self):
@@ -1419,9 +1436,15 @@ class HiCacheController:
                 ack = self.prefetch_sync_queue.get(block=True, timeout=1)
                 if ack is None:
                     continue
-                self._reduce_prefetch_ack(ack)
+                try:
+                    self._reduce_prefetch_ack(ack)
+                except Exception:
+                    # Keep draining: a dead sync thread hangs every rank
+                    # waiting for its ack.
+                    logger.exception("HiCache prefetch ack reduction failed")
                 self.ack_prefetch_queue.put(ack)
             except Empty:
+                self._maybe_sweep_storage_orphans()
                 continue
 
     def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:

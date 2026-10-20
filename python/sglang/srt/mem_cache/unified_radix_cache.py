@@ -67,6 +67,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     CacheAction,
@@ -653,6 +654,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 if step.result is not None:
                     # Walk actions flow through the steps; the result is action-free.
                     assert not step.result.cache_actions
+                    self._touch_storage_l3(params.key, step.result.prefix_len)
                     return step.result
                 step = self.tree_core.resume_insert()
         finally:
@@ -660,6 +662,26 @@ class UnifiedRadixCache(BasePrefixCache):
             self._apply_cache_actions(self.tree_core.end_insert())
             if self.buffer_pipeline is not None:
                 self.buffer_pipeline.end_insert_walk()
+
+    def _touch_storage_l3(self, key: RadixKey, prefix_len: int) -> None:
+        """Refresh L3 recency for the insert's re-referenced page hashes.
+
+        Without this, a prefix that stays hot in L1/L2 but is never
+        re-read from storage ages out of the L3 LRU even though the tree
+        keeps re-using it. One aggregated touch per insert.
+        """
+        if prefix_len <= 0 or self.cache_controller is None:
+            return
+        backend = self.cache_controller.storage_backend
+        if backend is None:
+            return
+        page_size = self.cache_controller.page_size
+        tokens = key.raw_token_ids()[:prefix_len]
+        keys = get_storage_hash_str(tokens, page_size=page_size)
+        if isinstance(keys, str):
+            keys = [keys]
+        if keys:
+            backend.touch_many(keys)
 
     @rank_consensus(same_params=True, same_results=True)
     def evict(self, params: EvictParams) -> EvictResult:

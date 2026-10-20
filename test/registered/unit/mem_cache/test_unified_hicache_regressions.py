@@ -157,6 +157,7 @@ class TestTransferStreamOrdering(unittest.TestCase):
             load_to_device_per_layer_physical=lambda pool, h, d, layer, backend, **kw: (
                 output.copy_(d)
             ),
+            log_transfer_digests=lambda *args, **kwargs: None,
         )
         transfer = L2Transfer(
             host,

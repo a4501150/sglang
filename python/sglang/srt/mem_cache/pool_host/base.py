@@ -167,6 +167,58 @@ class HostKVCache(abc.ABC):
     # Names this pool's page byte format in storage keys when it has one of its
     # own, so pages persisted in another format miss instead of loading.
     storage_format_tag: Optional[str] = None
+    # Class-level defaults so pools that bypass HostKVCache.__init__ (mamba,
+    # paged sidecars) still serialize a deterministic storage format spec.
+    pool_label: str = "kv"
+    layer_num: int = 0
+
+    def storage_format_spec(self) -> dict:
+        """Geometry that determines this pool's page byte format in storage.
+
+        The file backend fingerprints this dict into each page-file header,
+        so a page persisted under a different geometry misses instead of
+        loading corrupt. Subclasses with components the base fields cannot
+        express (mamba side states, per-token KV scales, paged sidecar item
+        bytes) override and extend it.
+        """
+        return {
+            "pool_label": self.pool_label,
+            "layout": self.layout,
+            "page_size": self.page_size,
+            "layer_num": self.layer_num,
+            "dtype": str(self.dtype).removeprefix("torch."),
+            "size_per_token": self.size_per_token,
+            "storage_format_tag": self.storage_format_tag,
+        }
+
+    def log_transfer_digests(
+        self,
+        direction: str,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+    ) -> None:
+        """Emit host<->device transfer digest markers when digest logging is
+        on. The base implementation is a no-op; pools that carry named page
+        components override it."""
+
+    def get_debug_page_tensors(self, index: int):
+        """Yield (component_name, tensor) pairs for one page's digest markers.
+
+        The default implementation names the whole flat page after the
+        pool label; pools with several components override it.
+        """
+        yield self.pool_label, self.get_data_page(index, flat=True)
+
+    def get_page_buffer_meta(self, indices):
+        """Zero-copy storage IO metadata: (pointers, sizes) for one page.
+
+        Pools whose pages are not one contiguous slice per page (mamba with
+        slot side states) keep this default and move whole flat pages.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose per-page buffer metadata; "
+            "storage backends use the whole-flat-page path for this pool."
+        )
 
     def __init__(
         self,

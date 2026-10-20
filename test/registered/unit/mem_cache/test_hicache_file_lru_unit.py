@@ -42,6 +42,13 @@ def _t(n_bytes: int, fill: int = 0) -> torch.Tensor:
     return torch.full((n_bytes,), fill, dtype=torch.uint8)
 
 
+def _file_bytes(payload_bytes: int) -> int:
+    """On-disk size of one page file: 4 KiB header + padded payload."""
+    header = 4096
+    alignment = 4096
+    return header + (payload_bytes + alignment - 1) // alignment * alignment
+
+
 def _make_config(
     *,
     tp_rank=0,
@@ -167,20 +174,22 @@ class TestEvictionDisabledByDefault(HiCacheFileLRUTestBase):
 
 class TestCapBasedEviction(HiCacheFileLRUTestBase):
     def test_basic_lru_evicts_oldest(self):
-        b = self.make_backend(max_size="300", eviction_ratio=1.0)
+        cap = 3 * _file_bytes(100)
+        b = self.make_backend(max_size=str(cap), eviction_ratio=1.0)
         self.assertTrue(b.set("a", _t(100)))
         self.assertTrue(b.set("b", _t(100)))
         self.assertTrue(b.set("c", _t(100)))
-        self.assertEqual(b._evictor._total_bytes, 300)
+        self.assertEqual(b._evictor._total_bytes, cap)
         # Adding "d" forces eviction of "a" (oldest).
         self.assertTrue(b.set("d", _t(100)))
-        self.assertLessEqual(b._evictor._total_bytes, 300)
+        self.assertLessEqual(b._evictor._total_bytes, cap)
         self.assertFalse(b.exists("a"))
         for k in ("b", "c", "d"):
             self.assertTrue(b.exists(k), f"{k} should still be present")
 
     def test_get_touches_recency(self):
-        b = self.make_backend(max_size="300", eviction_ratio=1.0)
+        cap = 3 * _file_bytes(100)
+        b = self.make_backend(max_size=str(cap), eviction_ratio=1.0)
         b.set("a", _t(100))
         b.set("b", _t(100))
         b.set("c", _t(100))
@@ -192,7 +201,7 @@ class TestCapBasedEviction(HiCacheFileLRUTestBase):
         self.assertFalse(b.exists("b"), "b should be the new LRU and got evicted")
 
     def test_value_larger_than_cap_rejected(self):
-        b = self.make_backend(max_size="100")
+        b = self.make_backend(max_size=str(_file_bytes(100) - 1))
         self.assertFalse(b.set("too_big", _t(200)))
         self.assertFalse(b.exists("too_big"))
         self.assertEqual(b._evictor._total_bytes, 0)
@@ -200,28 +209,29 @@ class TestCapBasedEviction(HiCacheFileLRUTestBase):
 
     def test_eviction_ratio_drops_to_watermark(self):
         # ratio=0.5 -> evict down to ~50% of the cap before adding.
-        b = self.make_backend(max_size="400", eviction_ratio=0.5)
+        file_b = _file_bytes(100)
+        b = self.make_backend(max_size=str(4 * file_b), eviction_ratio=0.5)
         for k in ("a", "b", "c", "d"):
             b.set(k, _t(100))
-        self.assertEqual(b._evictor._total_bytes, 400)
-        # target = 0.5*400 - 100 = 100, then +100 -> 200.
+        self.assertEqual(b._evictor._total_bytes, 4 * file_b)
+        # target = 0.5*cap - file_b, then +file_b after the write.
         b.set("e", _t(100))
-        self.assertLessEqual(b._evictor._total_bytes, 200)
+        self.assertLessEqual(b._evictor._total_bytes, 2 * file_b)
 
     def test_repeated_set_same_key_is_noop(self):
-        b = self.make_backend(max_size="300")
+        b = self.make_backend(max_size=str(4 * _file_bytes(100)))
         self.assertTrue(b.set("a", _t(100)))
-        self.assertEqual(b._evictor._total_bytes, 100)
+        self.assertEqual(b._evictor._total_bytes, _file_bytes(100))
         # Same key, different value -- fast path skips rewrite.
         self.assertTrue(b.set("a", _t(100)))
-        self.assertEqual(b._evictor._total_bytes, 100)
+        self.assertEqual(b._evictor._total_bytes, _file_bytes(100))
         self.assertEqual(len(b._evictor._lru), 1)
 
     def test_clear_resets_state(self):
-        b = self.make_backend(max_size="300")
+        b = self.make_backend(max_size=str(4 * _file_bytes(100)))
         b.set("a", _t(100))
         b.set("b", _t(100))
-        self.assertEqual(b._evictor._total_bytes, 200)
+        self.assertEqual(b._evictor._total_bytes, 2 * _file_bytes(100))
         self.assertTrue(b.clear())
         self.assertEqual(b._evictor._total_bytes, 0)
         self.assertEqual(len(b._evictor._lru), 0)
@@ -287,12 +297,14 @@ class TestMLAOwnerGating(HiCacheFileLRUTestBase):
         self.assertTrue(b._evictor.enabled)
 
     def test_mla_rank1_only_creates_its_mamba_files(self):
-        b = self.make_backend(max_size="200", is_mla=True, tp_rank=1, tp_size=2)
+        b = self.make_backend(
+            max_size=str(_file_bytes(50)), is_mla=True, tp_rank=1, tp_size=2
+        )
         # Replicated MLA files are created by rank 0 only.
         self.assertFalse(b.set("a", _t(50)))
         self.assertFalse(b.exists("a"))
         self.assertTrue(b.set("a.mamba", _t(50)))
-        self.assertEqual(b._evictor._total_bytes, 50)
+        self.assertEqual(b._evictor._total_bytes, _file_bytes(50))
 
     def test_mla_mamba_round_trip_keeps_each_tp_rank(self):
         """MLA shares KV files, but Mamba pages must not overwrite another rank's."""
@@ -324,30 +336,31 @@ class TestMLAOwnerGating(HiCacheFileLRUTestBase):
 class TestTrackOrTouch(HiCacheFileLRUTestBase):
     def test_set_fast_path_adopts_external_file(self):
         # A file written by another rank should be adopted on the next set().
-        b = self.make_backend(max_size="500")
+        b = self.make_backend(max_size="500Ki")
         # Manually drop a suffixed file with the right name on disk.
         suffixed = b._get_suffixed_key("xkey")
         path = os.path.join(b.file_path, f"{suffixed}.bin")
         with open(path, "wb") as f:
-            f.write(b"a" * 80)
+            f.write(b"a" * _file_bytes(80))
         self.assertEqual(b._evictor._total_bytes, 0)
         self.assertNotIn(suffixed, b._evictor._lru)
         # set() should hit the fast path and adopt the file.
         self.assertTrue(b.set("xkey", _t(80)))
         self.assertIn(suffixed, b._evictor._lru)
-        self.assertEqual(b._evictor._total_bytes, 80)
+        self.assertEqual(b._evictor._total_bytes, _file_bytes(80))
 
     def test_get_adopts_external_file(self):
-        b = self.make_backend(max_size="500")
+        b = self.make_backend(max_size="500Ki")
+        b.set("ykey", _t(64))
         suffixed = b._get_suffixed_key("ykey")
-        path = os.path.join(b.file_path, f"{suffixed}.bin")
-        with open(path, "wb") as f:
-            f.write(b"\x00" * 64)
+        # Simulate the file being untracked (written by another rank).
+        b._evictor._lru.clear()
+        b._evictor._total_bytes = 0
         # get() should return the data and also adopt the file.
         out = b.get("ykey", target_location=_t(64))
         self.assertIsNotNone(out)
         self.assertIn(suffixed, b._evictor._lru)
-        self.assertEqual(b._evictor._total_bytes, 64)
+        self.assertEqual(b._evictor._total_bytes, _file_bytes(64))
 
 
 class TestMinFreeSpaceWatermark(HiCacheFileLRUTestBase):
@@ -361,15 +374,13 @@ class TestMinFreeSpaceWatermark(HiCacheFileLRUTestBase):
 
     def test_evicts_to_satisfy_min_free(self):
         b = self.make_backend(max_size="0", min_free="100")
-        # Pre-seed LRU with one 80B entry that is on disk.
+        # Pre-seed LRU with one tracked page that is on disk.
+        b.set("victim", _t(80))
         suffixed = b._get_suffixed_key("victim")
-        path = os.path.join(b.file_path, f"{suffixed}.bin")
-        with open(path, "wb") as f:
-            f.write(b"v" * 80)
-        b._evictor._lru[suffixed] = 80
-        b._evictor._total_bytes = 80
-        # 130 free; +60 write needs evicting the 80B victim to clear the watermark.
-        free = [130]
+        self.assertIn(suffixed, b._evictor._lru)
+        # 500 free; an 8 KiB page write needs the victim's space to clear
+        # the 100B watermark.
+        free = [500]
 
         def fake_fs_stats():
             return (1024, free[0])
@@ -394,18 +405,23 @@ class TestMinFreeSpaceWatermark(HiCacheFileLRUTestBase):
 class TestPreReservationConcurrency(HiCacheFileLRUTestBase):
     def test_pre_reservation_visible_during_write(self):
         """An in-flight reservation must not be evicted by a concurrent set()."""
-        b = self.make_backend(max_size="100", eviction_ratio=1.0)
+        b = self.make_backend(
+            # One byte under two page files: admitting B must try to evict
+            # the pending A, fail, and refuse.
+            max_size=str(2 * _file_bytes(60) - 1),
+            eviction_ratio=1.0,
+        )
         pending = b._get_suffixed_key("A")
         with b._evictor._lock:
-            b._evictor._lru[pending] = 60
+            b._evictor._lru[pending] = _file_bytes(60)
             b._evictor._pending_writes.add(pending)
-            b._evictor._total_bytes = 60
+            b._evictor._total_bytes = _file_bytes(60)
 
         self.assertFalse(b.set("B", _t(60)))
         self.assertIn(pending, b._evictor._lru)
         self.assertIn(pending, b._evictor._pending_writes)
         self.assertEqual(b._evictor._total_bytes, sum(b._evictor._lru.values()))
-        self.assertLessEqual(b._evictor._total_bytes, 100)
+        self.assertLessEqual(b._evictor._total_bytes, 2 * _file_bytes(60))
 
 
 class TestMetadataCache(CustomTestCase):
@@ -480,9 +496,9 @@ class TestHiCacheFileMetadataIntegration(HiCacheFileLRUTestBase):
         self.assertTrue(b.metadata_cache.contains(f"k1{suffix}"))
 
     def test_eviction_removes_from_metadata_cache(self):
-        # max_size=200, so setting three 100B tensors will evict the oldest
+        # Cap fits two page files, so setting three evicts the oldest.
         b = self.make_backend(
-            max_size="200",
+            max_size=str(2 * _file_bytes(100)),
             eviction_ratio=1.0,
             metadata_ttl=-1.0,
             enable_metadata_cache=True,
