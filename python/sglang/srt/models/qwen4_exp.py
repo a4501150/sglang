@@ -1904,7 +1904,13 @@ class Qwen4ExpAttentionDecoderLayer(
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
+        # Only prefill graphs replay with a live batch in the piecewise
+        # context; target verify inside decode graphs indexes in-segment.
+        if (
+            is_in_breakable_cuda_graph()
+            and forward_batch.forward_mode.is_extend()
+            and get_tc_piecewise_forward_context() is not None
+        ):
             return _breakable_qsa_indexer(
                 layer=self, hidden_states=hidden_states, positions=positions
             )
