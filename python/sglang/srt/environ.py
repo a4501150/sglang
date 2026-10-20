@@ -778,6 +778,9 @@ class Envs:
     # ===================================================================
     # HiCache storage backends and mmap allocation
     # ===================================================================
+    # Override for the cuFile (GPUDirect Storage) ctypes binding's library
+    # search; unset means nvidia pip packages, then CUDA_HOME.
+    SGLANG_CUFILE_LIB = EnvStr(None)
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
     # HiCache host<->device transfers use the TMA staging kernel when the GPU
