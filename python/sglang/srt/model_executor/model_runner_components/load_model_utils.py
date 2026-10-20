@@ -285,6 +285,30 @@ def load_model_with_memory_saver(
             model_config.hf_text_config.ple_offload_backend = (
                 get_exec().offload.ple_offload_backend
             )
+            if get_exec().offload.ple_offload_backend == "safetensors":
+                # The table is served in place from the checkpoint files.
+                model_config.hf_text_config.ple_safetensors_dir = get_model().model_path
+                from sglang.srt.model_executor.cuda_graph_config import (
+                    Backend,
+                    Phase,
+                    check_cuda_graph_backend,
+                )
+
+                if (
+                    ple_offload_embedding
+                    and not check_cuda_graph_backend(
+                        Phase.DECODE, Backend.DISABLED
+                    )
+                    and not check_cuda_graph_backend(Phase.DECODE, Backend.BREAKABLE)
+                ):
+                    raise ValueError(
+                        "--ple-offload-backend safetensors issues host-side file "
+                        "IO per gather, which CUDA graphs cannot capture; run "
+                        "decode with the breakable graph backend "
+                        "(--cuda-graph-config 'decode:backend=breakable') or "
+                        "disable decode CUDA graphs "
+                        "(--cuda-graph-config 'decode:backend=disabled')"
+                    )
             if get_exec().offload.ple_offload_backend != "file":
                 model_config.hf_text_config.ple_offload_dir = (
                     get_exec().offload.ple_offload_dir

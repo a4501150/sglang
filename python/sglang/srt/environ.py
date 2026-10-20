@@ -305,6 +305,9 @@ class Envs:
     SGLANG_QWEN4_PLE_FILE_DIR = EnvStr(lambda: _default_cache_subdir("ple"))
     SGLANG_QWEN4_PLE_FILE_PREFETCH = EnvBool(True)
     SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
+    # safetensors PLE backend: device staging arena for one gather round
+    # (MiB). Gathers larger than the arena complete in multiple rounds.
+    SGLANG_QWEN4_PLE_SAFETENSORS_ARENA_MB = EnvInt(256)
     # Faulting rows in maps whole page-cache folios, so the mapping creeps
     # towards full residency (~45 KB/token) and eats the free memory that
     # sizes the KV pool. Cap its resident set; 0 disables the trim.

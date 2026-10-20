@@ -39,6 +39,7 @@ import time
 from typing import Optional, Sequence, Union
 
 import msgspec
+import numpy as np
 
 from sglang.srt.environ import envs
 
@@ -65,6 +66,24 @@ _FF_BATCH_IO = 1 << 1
 _FF_STREAMS = 1 << 2
 _FF_PARALLEL_IO = 1 << 3
 _FF_P2P = 1 << 4
+
+# numpy view of the CUfileIOParams_t array: filling a native chunk through
+# column assignments instead of per-IO ctypes writes keeps a 131k-IO
+# submission's Python cost from dominating its IO time.
+_IO_PARAMS_NP = np.dtype(
+    [
+        ("mode", "<i4"),
+        ("pad0", "<i4"),
+        ("devPtr_base", "<u8"),
+        ("file_offset", "<i8"),
+        ("devPtr_offset", "<i8"),
+        ("size", "<u8"),
+        ("fh", "<u8"),
+        ("opcode", "<i4"),
+        ("pad1", "<i4"),
+        ("cookie", "<u8"),
+    ]
+)
 # Compat-mode only: the POSIX bounce pool (cufile.json posix_pool_slab_count)
 # has 64 1-MiB and 128 4-KiB staging slabs, and a batch submit needing more
 # blocks forever (the slabs free only when GetStatus runs, which the caller
@@ -635,6 +654,7 @@ class _BatchHandle:
             "cuFileBatchIOSetUp",
         )
         self._params = (_CUfileIOParams * capacity)()
+        self._params_view = np.frombuffer(self._params, dtype=_IO_PARAMS_NP)
         self._events = (_CUfileIOEvents * capacity)()
         self.outstanding = 0
         self.results: list[int] = []
@@ -662,6 +682,42 @@ class _BatchHandle:
             self.cancel()
             raise
         self.outstanding = len(ios)
+        self.results = []
+
+    def submit_vectors(
+        self,
+        handle: CuFileHandle,
+        buf_ptr: int,
+        file_offsets: np.ndarray,
+        sizes: np.ndarray,
+        buf_offsets: np.ndarray,
+        is_write: bool = False,
+    ) -> None:
+        """Submit one file's IOs from numpy arrays; same contract as submit."""
+        n = len(file_offsets)
+        assert n <= self._capacity
+        if n == 0:
+            self.outstanding = 0
+            self.results = []
+            return
+        view = self._params_view[:n]
+        view["mode"] = _BATCH_MODE
+        view["devPtr_base"] = buf_ptr
+        view["file_offset"] = file_offsets
+        view["devPtr_offset"] = buf_offsets
+        view["size"] = sizes
+        view["fh"] = handle.native_handle
+        view["opcode"] = _OP_WRITE if is_write else _OP_READ
+        view["cookie"] = np.arange(1, n + 1, dtype=np.uint64)
+        try:
+            _check(
+                self._lib.cuFileBatchIOSubmit(self._native, n, self._params, 0),
+                "cuFileBatchIOSubmit",
+            )
+        except CuFileError:
+            self.cancel()
+            raise
+        self.outstanding = n
         self.results = []
 
     def wait(self, timeout_s: float) -> None:
@@ -736,6 +792,44 @@ class _BatchHandle:
             self._native = ctypes.c_void_p()
 
 
+class _DescChunk:
+    """Pending native-chunk-sized batch of IoDescs."""
+
+    __slots__ = ("ios",)
+
+    def __init__(self, ios: list) -> None:
+        self.ios = ios
+
+
+class _VecChunk:
+    """Pending native-chunk-sized batch of vectorized IOs."""
+
+    __slots__ = (
+        "handle",
+        "buf_ptr",
+        "file_offsets",
+        "sizes",
+        "buf_offsets",
+        "is_write",
+    )
+
+    def __init__(
+        self,
+        handle: CuFileHandle,
+        buf_ptr: int,
+        file_offsets: np.ndarray,
+        sizes: np.ndarray,
+        buf_offsets: np.ndarray,
+        is_write: bool,
+    ) -> None:
+        self.handle = handle
+        self.buf_ptr = buf_ptr
+        self.file_offsets = file_offsets
+        self.sizes = sizes
+        self.buf_offsets = buf_offsets
+        self.is_write = is_write
+
+
 class CuFileBatch:
     """Batched cuFile IO with up to ``max_ios`` requests queued per round.
 
@@ -759,7 +853,7 @@ class CuFileBatch:
             raise RuntimeError("cuFile batch IO unsupported in this mode")
         self._chunk = min(max_ios, self._driver.max_batch_io_size)
         self._handle = _BatchHandle(self._driver._lib, self._chunk)
-        self._pending: list[IoDesc] = []
+        self._pending: list = []  # _DescChunk / _VecChunk records, in order
         self._results: list[int] = []
         self._total_capacity = max_ios
         self._queued = 0
@@ -779,8 +873,46 @@ class CuFileBatch:
                 f"cufile batch full: {len(ios)} submitted with {self._queued} "
                 f"queued of {self._total_capacity} capacity; wait() first"
             )
-        self._pending.extend(ios)
+        for base in range(0, len(ios), self._chunk):
+            self._pending.append(_DescChunk(list(ios[base : base + self._chunk])))
         self._queued += len(ios)
+        if self._handle.outstanding == 0:
+            self._pump_round()
+
+    def submit_spans(
+        self,
+        handle: CuFileHandle,
+        *,
+        buf_ptr: int,
+        file_offsets: np.ndarray,
+        sizes: np.ndarray,
+        buf_offsets: np.ndarray,
+        is_write: bool = False,
+    ) -> None:
+        """Queue one file's IOs from numpy arrays -- the vectorized hot path
+        for span-shaped workloads (tens of thousands of IOs per submission,
+        where per-IO ``IoDesc`` construction dominates). Same capacity
+        contract and ordering as ``submit``.
+        """
+        n = len(file_offsets)
+        if n + self._queued > self._total_capacity:
+            raise ValueError(
+                f"cufile batch full: {n} submitted with {self._queued} "
+                f"queued of {self._total_capacity} capacity; wait() first"
+            )
+        for base in range(0, n, self._chunk):
+            take = min(self._chunk, n - base)
+            self._pending.append(
+                _VecChunk(
+                    handle,
+                    buf_ptr,
+                    file_offsets[base : base + take],
+                    sizes[base : base + take],
+                    buf_offsets[base : base + take],
+                    is_write,
+                )
+            )
+        self._queued += n
         if self._handle.outstanding == 0:
             self._pump_round()
 
@@ -816,13 +948,42 @@ class CuFileBatch:
         return results
 
     def _pump_round(self) -> None:
-        chunk = self._pending[: self._chunk]
-        if not chunk:
+        if not self._pending:
             return
-        if self._driver.mode() == "compat" and any(io.size > 4096 for io in chunk):
-            chunk = chunk[:_COMPAT_MAX_LARGE_IOS_PER_ROUND]
-        self._handle.submit(chunk)
-        del self._pending[: len(chunk)]
+        chunk = self._pending.pop(0)
+        compat = self._driver.mode() == "compat"
+        if isinstance(chunk, _DescChunk):
+            ios = chunk.ios
+            if compat and any(io.size > 4096 for io in ios):
+                head = ios[:_COMPAT_MAX_LARGE_IOS_PER_ROUND]
+                if len(ios) > len(head):
+                    self._pending.insert(0, _DescChunk(ios[len(head) :]))
+                ios = head
+            self._handle.submit(ios)
+            return
+        take = len(chunk.file_offsets)
+        if compat and bool((chunk.sizes > 4096).any()):
+            take = min(take, _COMPAT_MAX_LARGE_IOS_PER_ROUND)
+        if take < len(chunk.file_offsets):
+            self._pending.insert(
+                0,
+                _VecChunk(
+                    chunk.handle,
+                    chunk.buf_ptr,
+                    chunk.file_offsets[take:],
+                    chunk.sizes[take:],
+                    chunk.buf_offsets[take:],
+                    chunk.is_write,
+                ),
+            )
+        self._handle.submit_vectors(
+            chunk.handle,
+            chunk.buf_ptr,
+            chunk.file_offsets[:take],
+            chunk.sizes[:take],
+            chunk.buf_offsets[:take],
+            chunk.is_write,
+        )
 
     def close(self) -> None:
         self._handle.close()

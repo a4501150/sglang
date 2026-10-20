@@ -42,6 +42,11 @@ def handle_offload_compatibility(server_args: Any) -> None:
             "--ple-offload-backend file requires --ple-offload-embedding: "
             "the file-backed table is the offloaded table."
         )
+    if cfg.ple_offload_backend == "safetensors" and cfg.ple_offload_embedding is False:
+        raise ValueError(
+            "--ple-offload-backend safetensors requires --ple-offload-embedding: "
+            "the checkpoint-backed table is the offloaded table."
+        )
 
 
 def handle_gpu_memory_settings(server_args: Any):

@@ -96,6 +96,7 @@ from sglang.srt.models.qwen3_5 import (
     _qwen3_5_is_moe,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.qwen4_exp_ple_safetensors import Qwen4ExpSafetensorsEmbedding
 from sglang.srt.models.qwen4_exp_ple_table import (
     allocate_ple_host_table,
     make_ple_file_prefetcher,
@@ -194,12 +195,21 @@ class _BreakablePLEBatch:
         self.batch = batch
 
 
+def _live_forward_batch(captured: ForwardBatch) -> ForwardBatch:
+    # Prefill graphs replay with a live batch in the piecewise context; decode
+    # graphs refill the captured batch's static buffers in place.
+    context = get_tc_piecewise_forward_context()
+    return captured if context is None else context.forward_batch
+
+
 @eager_on_graph(True)
-def _breakable_prepare_ple_batch(input_ids, *, ngram_size, ngram_eos_token_id):
+def _breakable_prepare_ple_batch(
+    input_ids, forward_batch, *, ngram_size, ngram_eos_token_id
+):
     return _BreakablePLEBatch(
         batch=_prepare_ple_batch(
             input_ids=input_ids,
-            forward_batch=get_tc_piecewise_forward_context().forward_batch,
+            forward_batch=_live_forward_batch(forward_batch),
             ngram_size=ngram_size,
             ngram_eos_token_id=ngram_eos_token_id,
         )
@@ -207,16 +217,16 @@ def _breakable_prepare_ple_batch(input_ids, *, ngram_size, ngram_eos_token_id):
 
 
 @eager_on_graph(True)
-def _breakable_ple_prefetch(ple, batch):
+def _breakable_ple_prefetch(ple, batch, forward_batch):
     ple.start_prefetch(
         batch=batch.batch,
-        forward_batch=get_tc_piecewise_forward_context().forward_batch,
+        forward_batch=_live_forward_batch(forward_batch),
     )
 
 
 @eager_on_graph(True)
-def _breakable_ple_forward(ple, hidden_states, batch, output):
-    forward_batch = get_tc_piecewise_forward_context().forward_batch
+def _breakable_ple_forward(ple, hidden_states, batch, output, forward_batch):
+    forward_batch = _live_forward_batch(forward_batch)
     if batch.batch is None:
         # Idle batch replayed as a dummy extend: join the collective, add nothing.
         ple.forward_idle(forward_batch)
@@ -235,10 +245,10 @@ def _breakable_ple_forward(ple, hidden_states, batch, output):
 
 
 @eager_on_graph(True)
-def _breakable_commit_ple_batch(batch):
+def _breakable_commit_ple_batch(batch, forward_batch):
     _commit_ple_batch(
         batch=batch.batch,
-        forward_batch=get_tc_piecewise_forward_context().forward_batch,
+        forward_batch=_live_forward_batch(forward_batch),
     )
 
 
@@ -645,11 +655,18 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
         )
         if offload_embedding:
-            ngram_embedding = Qwen4ExpPinnedHostEmbedding(
-                ngram_embedding,
-                backend=getattr(config, "ple_offload_backend", "pinned"),
-                table_dir=getattr(config, "ple_offload_dir", None),
-            )
+            backend = config.ple_offload_backend
+            if backend == "safetensors":
+                ngram_embedding = Qwen4ExpSafetensorsEmbedding(
+                    ngram_embedding,
+                    directory=config.ple_safetensors_dir,
+                )
+            else:
+                ngram_embedding = Qwen4ExpPinnedHostEmbedding(
+                    ngram_embedding,
+                    backend=backend,
+                    table_dir=getattr(config, "ple_offload_dir", None),
+                )
         self.ngram_embedding = ngram_embedding
 
     @classmethod
@@ -1035,6 +1052,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             return tensor_model_parallel_all_reduce(output)
         return output
 
+    def join_prefetch(self) -> None:
+        # Host-side gather backends (safetensors) wait for their worker here.
+        pass
+
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.reduce(self.gather(input_ids))
 
@@ -1328,6 +1349,9 @@ class Qwen4ExpPLELayer(nn.Module):
         if self._prefetch_state is None:
             raise RuntimeError("PLE prefetch state is missing")
         embeddings, semantic_tokens, physical_tokens = self._prefetch_state
+        # The safetensors backend enqueues its scatter from a worker thread;
+        # wait for that enqueue before ordering the stream behind it.
+        self.ple_embedding.ngram_embedding.join_prefetch()
         torch.cuda.current_stream().wait_stream(self._prefetch_stream)
         embeddings = self.ple_embedding.ngram_embedding.reduce(embeddings)
         embeddings = embeddings * self.ple_embedding.ngram_embedding.weight_scale
@@ -1577,6 +1601,11 @@ class Qwen4ExpLayerExtensionMixin:
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
         self.ple = None
+        self.ple_prefetch_eager_breaks = (
+            _has_ple(layer_id, config)
+            and config.ple_offload_embedding
+            and config.ple_offload_backend == "safetensors"
+        )
         self._ple_forward_batch = None
         self._ple_batch = None
         self._hc_norms = None
@@ -1715,10 +1744,16 @@ class Qwen4ExpLayerExtensionMixin:
 
     def _add_ple_embedding(self, residual: torch.Tensor) -> torch.Tensor:
         forward_batch, ple_batch = self._ple_forward_batch, self._ple_batch
-        if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
+        if is_in_breakable_cuda_graph() and (
+            forward_batch.forward_mode.is_extend() or self.ple_prefetch_eager_breaks
+        ):
             output = torch.empty_like(residual)
             _breakable_ple_forward(
-                ple=self.ple, hidden_states=residual, batch=ple_batch, output=output
+                ple=self.ple,
+                hidden_states=residual,
+                batch=ple_batch,
+                output=output,
+                forward_batch=forward_batch,
             )
             return output
         if ple_batch is None:
@@ -2049,6 +2084,15 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             self.layers[layer_id].ple is not None
             for layer_id in range(self.start_layer, self.end_layer)
         )
+        # The safetensors PLE backend issues host-side file IO per gather;
+        # cuFile calls cannot be captured, so its prefetch and PLE forward
+        # must run in eager breaks whenever a breakable graph replays --
+        # extend and decode alike (the pinned backend captures its gather).
+        self.ple_prefetch_eager_breaks = (
+            self.has_ple
+            and config.ple_offload_embedding
+            and config.ple_offload_backend == "safetensors"
+        )
         self.ple_ngram_size = int(config.ngram_size) if self.has_ple else None
         self.ple_ngram_eos_token_id = (
             int(config.eos_token_id) if self.ple_ngram_size is not None else None
@@ -2103,12 +2147,16 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         breakable_ple = (
             self.has_ple
             and is_in_breakable_cuda_graph()
-            and forward_batch.forward_mode.is_extend()
+            and (
+                forward_batch.forward_mode.is_extend()
+                or self.ple_prefetch_eager_breaks
+            )
         )
         ple_batch = None
         if breakable_ple:
             ple_batch = _breakable_prepare_ple_batch(
                 input_ids=input_ids,
+                forward_batch=forward_batch,
                 ngram_size=self.ple_ngram_size,
                 ngram_eos_token_id=self.ple_ngram_eos_token_id,
             )
@@ -2146,7 +2194,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 next_ple = self.layers[i + 1].ple
                 if next_ple is not None:
                     if breakable_ple:
-                        _breakable_ple_prefetch(ple=next_ple, batch=ple_batch)
+                        _breakable_ple_prefetch(
+                            ple=next_ple, batch=ple_batch, forward_batch=forward_batch
+                        )
                     else:
                         next_ple.start_prefetch(
                             batch=ple_batch, forward_batch=forward_batch
@@ -2187,7 +2237,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 )
 
         if breakable_ple:
-            _breakable_commit_ple_batch(batch=ple_batch)
+            _breakable_commit_ple_batch(batch=ple_batch, forward_batch=forward_batch)
         else:
             _commit_ple_batch(batch=ple_batch, forward_batch=forward_batch)
 
@@ -2500,6 +2550,12 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if ple_mod is None:
                 return False
             emb = ple_mod.ngram_embedding
+            if isinstance(emb, Qwen4ExpSafetensorsEmbedding):
+                # The table is served straight from this very file: parsing
+                # validated it at init, and the mmap view is never touched
+                # (yielded zero-copy, so skipping costs no IO either).
+                loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
+                return True
             if (
                 loaded_weight.dtype == torch.float8_e4m3fn
                 and emb.weight.dtype != torch.float8_e4m3fn
