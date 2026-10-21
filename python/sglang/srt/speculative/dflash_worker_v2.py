@@ -678,8 +678,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         # (request slot, position) and never aliases the target's allocator,
         # so it gets its own over the ring space.
         if self._draft_ring is not None and memory_pool_config is not None:
-            num_req_slots = int(memory_pool_config.max_running_requests or 0)
-            if num_req_slots > 0 and self._draft_valid_start is None:
+            # Physical req-pool rows, not the logical request capacity: the
+            # pool pads one dummy row, and slot ids run over every row.
+            num_req_slots = (
+                int(req_to_token_pool.req_to_token.shape[0])
+                if req_to_token_pool is not None
+                else int(memory_pool_config.max_running_requests or 0) + 1
+            )
+            if self._draft_valid_start is None:
                 # int64: positions run to the model context length. The
                 # sentinel admits nothing (and stays finite, so the
                 # page-rounding in the clamp cannot overflow); every request

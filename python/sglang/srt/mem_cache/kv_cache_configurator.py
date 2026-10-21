@@ -594,7 +594,9 @@ class KVCacheConfigurator:
                 "to span the widened virtual location space the ring does "
                 "not index. Use the shared layout."
             )
-        num_req_slots = int(req_to_token_pool.size)
+        # Physical req-pool rows (the pool pads one dummy row), not the
+        # logical request capacity: ring slot bases run over every row.
+        num_req_slots = int(req_to_token_pool.req_to_token.shape[0])
         ring_tokens = ring.pool_tokens(num_req_slots)
         logger.info(
             "DFLASH draft KV ring pool: %d request slots x %d ring tokens "
@@ -3093,11 +3095,12 @@ class KVCacheConfigurator:
             )
         provisional = self.config_from_budget(available_bytes)
         provisional_reqs = self.resolve_max_num_reqs(provisional.max_total_num_tokens)
-        ring_bytes = ring.pool_tokens(provisional_reqs) * int(cell_size)
+        # The req pool pads one dummy row the ring must also cover.
+        ring_bytes = ring.pool_tokens(provisional_reqs + 1) * int(cell_size)
         logger.info(
             "DFLASH draft KV ring: %d request slots x %d ring tokens x %d B/token "
             "= %.2f GiB fixed bias (provisional solve).",
-            provisional_reqs,
+            provisional_reqs + 1,
             ring.ring_tokens,
             int(cell_size),
             ring_bytes / (1 << 30),
