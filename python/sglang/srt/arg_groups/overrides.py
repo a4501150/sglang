@@ -57,6 +57,7 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     use_mla_backend,
 )
 from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
+from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
 
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
@@ -1514,16 +1515,45 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
                 moe_runner_backend,
             )
             moe_runner_backend = mxfp8_default
+    # ModelOpt NVFP4 MoE must resolve `auto` here, once, before any layer is
+    # built. ModelOptNvFp4FusedMoEMethod snapshots the backend at construction
+    # (where `auto` reads as "not trtllm" and takes the CUTLASS weight
+    # layout), while its create_moe_runner independently resolves `auto` to
+    # FLASHINFER_TRTLLM; the trtllm forward then reads tensors (g1_scale_c)
+    # that only the trtllm weight prep builds. The operator does not have to
+    # name the quantization, so read it off the checkpoint like
+    # _deepseek_moe_quant_resolution does. Guard on the A2A backends whose
+    # dispatch expects standard-format tokens: megamoe resolves its own runner
+    # later in handle_a2a_moe, and the deepep family keys FP4 off cutedsl.
+    modelopt_fp4 = view.quantization in ("modelopt_fp4", "modelopt_mixed")
+    if not modelopt_fp4 and view.quantization in (None, "modelopt"):
+        hf_config = model_config_of(view).hf_config
+        quant_cfg = getattr(hf_config, "quantization_config", None) or {}
+        quant_method = get_quantization_config(hf_config)
+        # The parsed hf_config may already carry the canonical method name
+        # (modelopt_fp4) instead of the raw "modelopt" the checkpoint ships.
+        modelopt_fp4 = quant_method == "modelopt_fp4" or (
+            quant_method == "modelopt"
+            and canonicalize_modelopt_quant_algo(quant_cfg.get("quant_algo"))
+            == "modelopt_fp4"
+        )
     if (
         moe_runner_backend == "auto"
-        and view.quantization == "modelopt_fp4"
-        and (get_platform().is_sm120 or get_platform().is_sm110)
+        and modelopt_fp4
+        and view.moe_a2a_backend in ("none", "flashinfer")
     ):
-        moe_runner_backend = "flashinfer_cutlass"
-        logger.info(
-            "Use flashinfer_cutlass as MoE runner backend on SM110/SM120 for "
-            "modelopt_fp4 (trtllm-gen MoE kernels are SM100-only)"
-        )
+        if get_platform().is_sm120 or get_platform().is_sm110:
+            moe_runner_backend = "flashinfer_cutlass"
+            logger.info(
+                "Use flashinfer_cutlass as MoE runner backend on SM110/SM120 for "
+                "modelopt_fp4 (trtllm-gen MoE kernels are SM100-only)"
+            )
+        elif get_platform().is_blackwell:
+            moe_runner_backend = "flashinfer_trtllm"
+            logger.info(
+                "Use flashinfer_trtllm as MoE runner backend on Blackwell for "
+                "modelopt_fp4"
+            )
     if moe_runner_backend != view.moe_runner_backend:
         return {"moe_runner_backend": moe_runner_backend}
     return {}
