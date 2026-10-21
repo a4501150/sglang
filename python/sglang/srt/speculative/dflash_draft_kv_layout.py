@@ -153,7 +153,8 @@ def active_dflash_ring_layout(page_size: int) -> Optional[PrivateRingLayout]:
     from sglang.srt.runtime_context import get_spec
 
     spec = get_spec()
-    if spec.speculative_algorithm is None or not spec.speculative_algorithm.is_dflash():
+    algorithm = spec.speculative_algorithm
+    if algorithm is None or str(algorithm).upper() != "DFLASH":
         return None
     if spec.speculative_draft_kv_layout != "ring":
         return None
