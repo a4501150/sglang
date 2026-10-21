@@ -40,9 +40,11 @@ def is_post_capture_kv_active(
 ) -> bool:
     if is_draft_worker:
         # A dflash-family draft pool is indexed by the target's token ids, so it
-        # follows the target pool's post-capture backing.
+        # follows the target pool's post-capture backing. A ring-layout draft
+        # owns its pool (allocator None here) and never follows it.
         return (
             spec_algorithm.is_dflash_family()
+            and token_to_kv_pool_allocator is not None
             and token_to_kv_pool_allocator.get_kvcache().post_capture_active
         )
     return post_capture_kv_sizing_planned(server_args) and current_platform.is_cuda()
