@@ -563,6 +563,60 @@ class KVCacheConfigurator:
             unified_total_bytes=config.unified_total_bytes,
         )
 
+    def _apply_dflash_ring_draft_sizes(
+        self, *, sizes: _PoolSizes, req_to_token_pool
+    ) -> _PoolSizes:
+        """Size a ring-layout DFLASH draft pool from the request table.
+
+        The ring is indexed by (request slot, position), so its token count
+        is (req slots x ring tokens), not the target's token count. Runs
+        after the draft's req_to_token pool exists so the row count is the
+        pool's own, not the config's.
+        """
+        from sglang.srt.speculative.dflash_draft_kv_layout import (
+            active_dflash_ring_layout,
+        )
+
+        ring = active_dflash_ring_layout(self.page_size or 1)
+        if ring is None:
+            return sizes
+        if self.is_hybrid_swa:
+            raise ValueError(
+                "--speculative-draft-kv-layout ring does not support a hybrid "
+                "SWA draft: its sliding-window sub-pool maps ids the ring "
+                "does not. Use the shared layout."
+            )
+        if get_parallel().attn_dcp_size > 1:
+            raise ValueError(
+                "--speculative-draft-kv-layout ring does not support "
+                "context-parallel KV (attn_dcp_size="
+                f"{get_parallel().attn_dcp_size}): the draft pool would have "
+                "to span the widened virtual location space the ring does "
+                "not index. Use the shared layout."
+            )
+        num_req_slots = int(req_to_token_pool.size)
+        ring_tokens = ring.pool_tokens(num_req_slots)
+        logger.info(
+            "DFLASH draft KV ring pool: %d request slots x %d ring tokens "
+            "(window=%d, block=%d, page=%d) = %d tokens.",
+            num_req_slots,
+            ring.ring_tokens,
+            ring.window,
+            ring.block,
+            ring.page,
+            ring_tokens,
+        )
+        return msgspec.structs.replace(
+            sizes,
+            max_total_num_tokens=ring_tokens,
+            full_max_total_num_tokens=(
+                ring_tokens if sizes.full_max_total_num_tokens is not None else None
+            ),
+            swa_max_total_num_tokens=(
+                ring_tokens if sizes.swa_max_total_num_tokens is not None else None
+            ),
+        )
+
     def _init_pools(
         self,
         *,
@@ -750,6 +804,11 @@ class KVCacheConfigurator:
         # Initialize token_to_kv_pool
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
         is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
+
+        if self.is_draft_worker:
+            sizes = self._apply_dflash_ring_draft_sizes(
+                sizes=sizes, req_to_token_pool=req_to_token_pool
+            )
 
         self._validate_prefill_only_disable_kv_cache_pool_family(
             is_dsa_model, is_dsv4_model, current_platform
@@ -2996,6 +3055,9 @@ class KVCacheConfigurator:
         )
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
+        available_bytes = max(
+            available_bytes - self._dflash_ring_fixed_bytes(available_bytes), 0
+        )
         config = self.config_from_budget(available_bytes)
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
@@ -3004,6 +3066,43 @@ class KVCacheConfigurator:
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = get_schedule().mem_fraction_static
         return config
+
+    def _dflash_ring_fixed_bytes(self, available_bytes: int) -> int:
+        """Bytes to subtract from the KV budget for a ring-layout DFLASH draft.
+
+        The ring costs (request slots x ring tokens) of draft KV, a fixed
+        bias instead of a per-token cell charge. The request count is not
+        resolved yet, so derive it from a provisional budget solve: it can
+        only overshoot the final count by a fraction of one ring.
+        """
+        from sglang.srt.speculative.dflash_draft_kv_layout import (
+            active_dflash_ring_layout,
+        )
+
+        if self.is_draft_worker:
+            return 0
+        ring = active_dflash_ring_layout(self.page_size or 1)
+        if ring is None:
+            return 0
+        cell_size = self.spec_aux_config.dflash_draft_cell_size_per_token
+        if cell_size is None or int(cell_size) <= 0:
+            raise ValueError(
+                "DFLASH ring draft KV sizing needs the draft's bytes/token, but "
+                "dflash_draft_cell_size_per_token did not resolve from the draft "
+                "config. Use the shared layout or fix the draft checkpoint."
+            )
+        provisional = self.config_from_budget(available_bytes)
+        provisional_reqs = self.resolve_max_num_reqs(provisional.max_total_num_tokens)
+        ring_bytes = ring.pool_tokens(provisional_reqs) * int(cell_size)
+        logger.info(
+            "DFLASH draft KV ring: %d request slots x %d ring tokens x %d B/token "
+            "= %.2f GiB fixed bias (provisional solve).",
+            provisional_reqs,
+            ring.ring_tokens,
+            int(cell_size),
+            ring_bytes / (1 << 30),
+        )
+        return ring_bytes
 
     def config_from_budget(
         self, budget_bytes: int, *, cap_tokens: Optional[int] = None
