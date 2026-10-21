@@ -283,6 +283,7 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_dsa_topk_backend",
     "speculative_draft_kv_cache_dtype",
     "speculative_draft_window_size",
+    "speculative_draft_kv_layout",
     "speculative_moe_runner_backend",
     "speculative_moe_a2a_backend",
     "speculative_enable_w4a4_mxfp4_megamoe",

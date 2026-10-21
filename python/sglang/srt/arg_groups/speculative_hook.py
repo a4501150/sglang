@@ -217,6 +217,16 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 cfg.speculative_algorithm,
             )
 
+    if cfg.speculative_draft_kv_layout is not None and cfg.speculative_algorithm not in (
+        "DFLASH",
+        None,
+    ):
+        logger.warning(
+            "--speculative-draft-kv-layout has no effect with "
+            "speculative_algorithm=%s; only DFLASH reads it.",
+            cfg.speculative_algorithm,
+        )
+
     if cfg.speculative_draft_sink_size is not None:
         sink_size = int(cfg.speculative_draft_sink_size)
         if sink_size < 0:
@@ -422,6 +432,35 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 "--speculative-num-draft-tokens (block_size). "
                 f"window_size={cfg.speculative_draft_window_size}, block_size={draft_tokens}."
             )
+
+    # Default the draft KV layout from the window: a windowed draft keeps its
+    # KV in a per-request ring, so DFLASH costs (reqs x window) draft slots
+    # instead of one per target token. Windowless drafts must stay shared.
+    layout = cfg.speculative_draft_kv_layout or (
+        "ring" if cfg.speculative_draft_window_size is not None else "shared"
+    )
+    if layout == "ring":
+        if cfg.speculative_draft_window_size is None:
+            raise ValueError(
+                "--speculative-draft-kv-layout ring requires "
+                "--speculative-draft-window-size."
+            )
+        if cfg.enable_unified_memory:
+            raise ValueError(
+                "--speculative-draft-kv-layout ring is not compatible with "
+                "--enable-unified-memory: the unified pool places draft KV in "
+                "the target's pages; use the shared layout."
+            )
+        if cfg.disaggregation_mode not in (None, "null"):
+            raise ValueError(
+                "--speculative-draft-kv-layout ring does not support PD "
+                "disaggregation; use the shared layout."
+            )
+    declare_resolution(
+        server_args,
+        "_handle_dflash",
+        speculative_draft_kv_layout=layout,
+    )
 
     _resolve_dflash_draft_attention_backend(server_args)
 

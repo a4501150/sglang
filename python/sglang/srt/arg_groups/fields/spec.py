@@ -165,6 +165,13 @@ class Spec(msgspec.Struct):
         Optional[int],
         "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`), DFLASH, and the built-in EAGLE/MTP draft-decode path on the Triton and FlashInfer draft backends; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). For the built-in EAGLE/MTP draft, each draft-decode step attends to a --speculative-draft-sink-size sink plus the most recent N tokens, leaving the target verify pass unchanged; it is ignored (with a warning) if the draft model has a native sliding window of its own. Default is full attention/context.",
     ] = None
+    speculative_draft_kv_layout: A[
+        Optional[str],
+        Arg(
+            help="How the DFLASH draft's KV pool indexes its slots. 'shared' (default without a draft window): one draft slot per target token, so the draft pool spans the target's whole token index space and a radix prefix hit reuses the draft KV the tree preserved. 'ring' (default when --speculative-draft-window-size is set): each request owns a private ring of pages sized to the window, so DFLASH costs almost no target KV capacity; positions the request never materialized (a radix prefix hit) are clamped out of the window, so acceptance dips after a prefix hit until the window slides past the cached prefix. The draft pool cannot be spilled to the hierarchical cache in ring mode. Requires --speculative-draft-window-size and a DFLASH-family algorithm; not compatible with the unified memory pool or context-parallel KV.",
+            choices=["shared", "ring"],
+        ),
+    ] = None
     speculative_draft_sink_size: A[
         Optional[int],
         "Number of leading 'attention sink' tokens the draft always attends to, in addition to the --speculative-draft-window-size recent window (StreamingLLM-style). Honored only by the built-in EAGLE/MTP draft-decode path on the Triton and FlashInfer draft backends; the Llama EAGLE-3 and DFLASH windows ignore it. 0/unset => pure recent window. Requires --speculative-draft-window-size.",
