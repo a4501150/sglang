@@ -4,7 +4,8 @@ import torch
 from sglang.kernels.ops.attention.fast_topk import fast_topk
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def _check_topk_values(score, lengths, indices, topk, row_starts):
@@ -133,6 +134,57 @@ def test_fast_topk_unsupported_k():
     lengths = torch.full((2,), 4096, dtype=torch.int32, device="cuda")
     with pytest.raises(RuntimeError, match="topk"):
         fast_topk(score, lengths, 1024)
+
+
+# Regression for sgl-project/sglang#36807: a concentrated row (10.0 + 0.1*N(0,1))
+# puts ~16-34K candidates into the coarse fp16 threshold bin, far past the
+# 4096-entry smem staging buffer. The buggy kernel silently dropped the
+# overflow (plus its fused histogram counts) and still returned exactly-k
+# in-range, non-duplicate indices -- wrong and unstable.
+@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize("length", [30938, 65504])
+def test_fast_topk_threshold_bin_overflow(topk, length):
+    torch.manual_seed(0)
+    batch = 4
+    score = 10.0 + 0.1 * torch.randn(batch, length, dtype=torch.float32, device="cuda")
+    lengths = torch.full((batch,), length, dtype=torch.int32, device="cuda")
+    indices = fast_topk(score, lengths, topk)
+    _check_topk_values(score, lengths, indices, topk, None)
+
+
+# Same lengths, uniform scores: the threshold bin never overflows, so the
+# exact-fallback path must not disturb the fast path.
+@pytest.mark.parametrize("topk", [512, 2048])
+def test_fast_topk_non_overflow_control(topk):
+    torch.manual_seed(0)
+    batch, length = 4, 65504
+    score = torch.randn(batch, length, dtype=torch.float32, device="cuda")
+    lengths = torch.full((batch,), length, dtype=torch.int32, device="cuda")
+    indices = fast_topk(score, lengths, topk)
+    _check_topk_values(score, lengths, indices, topk, None)
+
+
+@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize("length", [30938, 65504])
+def test_fast_topk_overflow_stable_across_runs(topk, length):
+    # The overflow used to be unstable (which candidates survive depends on
+    # atomic arrival order). The fixed kernel must pick the same set every run.
+    torch.manual_seed(0)
+    batch = 4
+    score = 10.0 + 0.1 * torch.randn(batch, length, dtype=torch.float32, device="cuda")
+    lengths = torch.full((batch,), length, dtype=torch.int32, device="cuda")
+    first = (
+        score.gather(1, fast_topk(score, lengths, topk).long())
+        .sort(dim=1, descending=True)
+        .values
+    )
+    for _ in range(5):
+        got = (
+            score.gather(1, fast_topk(score, lengths, topk).long())
+            .sort(dim=1, descending=True)
+            .values
+        )
+        assert torch.equal(got, first), "top-k selection unstable across runs"
 
 
 if __name__ == "__main__":
