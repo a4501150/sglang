@@ -20,6 +20,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.arg_groups.overrides import (
     ResolvedView,
@@ -333,6 +334,73 @@ class TestFlashinferA2aRunnerDefault(CustomTestCase):
                 ),
                 {},
             )
+
+
+class TestModelOptNvFp4MethodBackendFrozen(CustomTestCase):
+    # The layer side of the invariant: the method refuses `auto` (the passes
+    # own resolution) and refuses a backend flip between construction and
+    # create_moe_runner (weight prep picked its layout from the first value).
+
+    def _method(self, backend):
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.layers.quantization import modelopt_quant as mq
+
+        with patch.object(mq, "get_moe_runner_backend", return_value=backend):
+            return mq.ModelOptNvFp4FusedMoEMethod(SimpleNamespace())
+
+    def test_init_rejects_auto(self):
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+        with self.assertRaisesRegex(ValueError, "auto"):
+            self._method(MoeRunnerBackend.AUTO)
+
+    def test_create_moe_runner_rejects_auto(self):
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+        method = self._method(MoeRunnerBackend.MARLIN)
+        from sglang.srt.layers.quantization import modelopt_quant as mq
+
+        with patch.object(
+            mq, "get_moe_runner_backend", return_value=MoeRunnerBackend.AUTO
+        ):
+            with self.assertRaisesRegex(ValueError, "auto"):
+                method.create_moe_runner(
+                    SimpleNamespace(), SimpleNamespace(is_gated=False)
+                )
+
+    def test_create_moe_runner_rejects_flip(self):
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+        method = self._method(MoeRunnerBackend.MARLIN)
+        from sglang.srt.layers.quantization import modelopt_quant as mq
+
+        with patch.object(
+            mq,
+            "get_moe_runner_backend",
+            return_value=MoeRunnerBackend.FLASHINFER_TRTLLM,
+        ):
+            with self.assertRaisesRegex(ValueError, "flipped"):
+                method.create_moe_runner(
+                    SimpleNamespace(), SimpleNamespace(is_gated=False)
+                )
+
+    def test_agreeing_backend_passes_the_guards(self):
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+        method = self._method(MoeRunnerBackend.MARLIN)
+        from sglang.srt.layers.quantization import modelopt_quant as mq
+
+        with patch.object(
+            mq, "get_moe_runner_backend", return_value=MoeRunnerBackend.MARLIN
+        ):
+            with patch.object(mq, "MoeRunner") as runner_cls:
+                method.create_moe_runner(
+                    SimpleNamespace(), SimpleNamespace(is_gated=False)
+                )
+        runner_cls.assert_called_once()
+        self.assertEqual(
+            method._moe_runner_backend, MoeRunnerBackend.MARLIN
+        )
 
 
 if __name__ == "__main__":
