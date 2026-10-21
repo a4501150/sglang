@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 
 class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
-    def __init__(self):
+    def __init__(self, weight_only: bool = False):
         if not get_platform().is_blackwell:
             raise ValueError(
                 "Current platform does not support NVFP4"
@@ -40,6 +40,10 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
             )
         self.group_size = 16
         self.use_flashinfer_trtllm = get_moe_runner_backend().is_flashinfer_trtllm()
+        # Weight-only (nvfp4a16) checkpoints ship no calibrated activation
+        # scale; activations are quantized per block with the identity
+        # global scale (1.0) instead.
+        self.weight_only = weight_only
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -144,8 +148,14 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         set_weight_attrs(w2_weight_scale_2, extra_weight_attrs)
 
         # Input Global Scales
+        # Ones when weight_only: the checkpoint ships no activation scale, and
+        # 1.0 is the identity that leaves per-block scale factors to carry the
+        # dynamic range (dynamic activation quantization).
         w13_input_scale = torch.nn.Parameter(
-            torch.empty(num_experts, 2, dtype=torch.float32), requires_grad=False
+            torch.ones(num_experts, 2, dtype=torch.float32)
+            if self.weight_only
+            else torch.empty(num_experts, 2, dtype=torch.float32),
+            requires_grad=False,
         )
         layer.register_parameter("w13_input_global_scale", w13_input_scale)
         extra_weight_attrs.update(
@@ -154,7 +164,10 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         set_weight_attrs(w13_input_scale, extra_weight_attrs)
 
         w2_input_scale = torch.nn.Parameter(
-            torch.empty(num_experts, dtype=torch.float32), requires_grad=False
+            torch.ones(num_experts, dtype=torch.float32)
+            if self.weight_only
+            else torch.empty(num_experts, dtype=torch.float32),
+            requires_grad=False,
         )
         layer.register_parameter("w2_input_global_scale", w2_input_scale)
         extra_weight_attrs.update(
@@ -163,6 +176,13 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.weight_only:
+            logger.warning_once(
+                "NVFP4 weight-only MoE: the checkpoint ships no input global "
+                "scale, so activations are quantized dynamically per block "
+                "(global scale 1.0). Run activation calibration for optimal "
+                "quality."
+            )
         # From packed to weight
         layer.w13_weight = torch.nn.Parameter(
             layer.w13_weight_packed.data, requires_grad=False

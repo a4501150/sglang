@@ -752,6 +752,14 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if is_activation_quantization_format(quant_format):
             if self._is_fp4a16_nvfp4(weight_quant, input_quant):
+                # Weight-only NVFP4: on native-FP4 GPUs serve via the W4A4
+                # kernels with dynamic per-block activation quantization
+                # instead of the Marlin repack. --fp4-gemm-backend marlin
+                # keeps the weight-only Marlin path.
+                if self._check_scheme_supported(
+                    CompressedTensorsW4A4Fp4.get_min_capability(), error=False
+                ) and not get_fp4_gemm_runner_backend().is_marlin():
+                    return CompressedTensorsW4A4Fp4(weight_only=True)
                 return CompressedTensorsW4A16Fp4()
 
             if self._is_fp4a4_nvfp4(weight_quant, input_quant):
@@ -957,6 +965,19 @@ class CompressedTensorsConfig(QuantizationConfig):
                     logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoE")
                     return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
         elif self._is_fp4a16_nvfp4(weight_quant, input_quant):
+            # Weight-only NVFP4: on native-FP4 GPUs serve via the W4A4 kernels
+            # with dynamic per-block activation quantization -- the Marlin
+            # repack would transiently double expert memory and OOM large
+            # expert counts. An explicit --moe-runner-backend marlin keeps the
+            # weight-only Marlin path for A/B runs.
+            if self._check_scheme_supported(
+                CompressedTensorsW4A4Nvfp4MoE.get_min_capability(), error=False
+            ) and not get_moe_runner_backend().is_marlin():
+                logger.info_once(
+                    "Using CompressedTensorsW4A4Nvfp4MoE (weight-only, "
+                    "dynamic activation quantization)"
+                )
+                return CompressedTensorsW4A4Nvfp4MoE(weight_only=True)
             logger.info_once("Using CompressedTensorsW4A16Nvfp4MoE")
             return CompressedTensorsW4A16Nvfp4MoE()
         elif self._is_fp4a4_nvfp4(weight_quant, input_quant):
