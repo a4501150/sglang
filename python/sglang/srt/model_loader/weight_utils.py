@@ -26,6 +26,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Sequence,
     Tuple,
     Union,
 )
@@ -1143,12 +1144,28 @@ def _drop_file_cache_after_load(path: str) -> None:
             os.close(fd)
 
 
+def filter_prefetch_files(
+    hf_weights_files: List[str],
+    exclude_files: Sequence[str],
+) -> List[str]:
+    """Drop ``exclude_files`` (realpath-matched) from a prefetch file list.
+
+    Files still load normally; only the page-cache prefetch skips them --
+    e.g. a PLE n-gram table the safetensors offload backend reads itself.
+    """
+    if not exclude_files:
+        return hf_weights_files
+    excluded = {os.path.realpath(f) for f in exclude_files}
+    return [f for f in hf_weights_files if os.path.realpath(f) not in excluded]
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    prefetch_exclude_files: Sequence[str] = (),
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -1158,7 +1175,8 @@ def safetensors_weights_iterator(
     prefetch_handle = None
     if prefetch and not disable_mmap:
         prefetch_handle = _prefetch_all_checkpoints(
-            sorted(hf_weights_files), num_threads=prefetch_num_threads
+            sorted(filter_prefetch_files(hf_weights_files, prefetch_exclude_files)),
+            num_threads=prefetch_num_threads,
         )
 
     for st_file in tqdm(
@@ -1330,6 +1348,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    prefetch_exclude_files: Sequence[str] = (),
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -1340,7 +1359,8 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch_handle = None
     if prefetch and not disable_mmap:
         prefetch_handle = _prefetch_all_checkpoints(
-            sorted(hf_weights_files), num_threads=prefetch_num_threads
+            sorted(filter_prefetch_files(hf_weights_files, prefetch_exclude_files)),
+            num_threads=prefetch_num_threads,
         )
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0

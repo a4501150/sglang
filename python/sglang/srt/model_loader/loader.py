@@ -150,6 +150,26 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 
+def _ple_prefetch_excluded_files(source) -> tuple:
+    """Checkpoint files the safetensors PLE offload backend reads itself.
+
+    Prefetching them would pull a 95-GiB table through the page cache for
+    nothing; the arch check keeps the model-module import off every other
+    model's load path.
+    """
+    model_config = source.model_config
+    if model_config is None:
+        return ()
+    architectures = model_config.hf_config.architectures or []
+    if "Qwen4ExpForConditionalGeneration" not in architectures:
+        return ()
+    from sglang.srt.models.qwen4_exp_ple_safetensors import (
+        ple_prefetch_excluded_files,
+    )
+
+    return ple_prefetch_excluded_files(model_config)
+
+
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
     if target_device.type == "cpu":
@@ -655,6 +675,7 @@ class DefaultModelLoader(BaseModelLoader):
             weight_loader_drop_cache_after_load = (
                 get_model().weight_loader_drop_cache_after_load
             )
+            prefetch_exclude_files = _ple_prefetch_excluded_files(source)
 
             # Prefetch and multi-threaded loading both read the same shards,
             # competing for I/O on shared/network storage. When prefetch is
@@ -701,6 +722,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    prefetch_exclude_files=prefetch_exclude_files,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -709,6 +731,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    prefetch_exclude_files=prefetch_exclude_files,
                 )
 
         else:
@@ -820,6 +843,18 @@ class DefaultModelLoader(BaseModelLoader):
         weight_files = sorted(
             {path for source in resolved_sources for path in source.weight_files}
         )
+        excluded = sorted(
+            {
+                excluded_path
+                for source in resolved_sources
+                for excluded_path in _ple_prefetch_excluded_files(source)
+            }
+        )
+        if excluded:
+            excluded_real = {os.path.realpath(f) for f in excluded}
+            weight_files = [
+                f for f in weight_files if os.path.realpath(f) not in excluded_real
+            ]
         return _prefetch_all_checkpoints(weight_files, num_threads=num_threads)
 
     def initialize_model_for_startup(

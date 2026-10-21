@@ -1067,8 +1067,13 @@ class ExecOffload(msgspec.Struct):
             "directly; use it on unified-memory devices (e.g. GB10 / DGX Spark) "
             "where pinned host memory comes out of the same pool as the model "
             "weights. Requires a device that reports "
-            "cudaDevAttrPageableMemoryAccessUsesHostPageTables.",
-            choices=["pinned", "file"],
+            "cudaDevAttrPageableMemoryAccessUsesHostPageTables. 'safetensors' "
+            "reads rows straight from the checkpoint's safetensors files on "
+            "storage at gather time (via cuFile/compat when available, O_DIRECT "
+            "pread otherwise); nothing is staged in host memory. Requires "
+            "--ple-offload-embedding and, for decode CUDA graphs, the "
+            "breakable backend (--cuda-graph-config 'decode:backend=breakable').",
+            choices=["pinned", "file", "safetensors"],
         ),
     ] = "pinned"
     ple_offload_dir: A[
