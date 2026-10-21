@@ -578,6 +578,71 @@ def rebuild_compact_draft_req_to_token_func(
 
 
 @triton.jit
+def rebuild_ring_draft_req_to_token(
+    draft_req_to_token,
+    req_pool_indices,
+    suffix_start,
+    draft_prefix_lens,
+    ring_tokens_per_req,
+    ring_pages,
+    draft_pool_len: tl.constexpr,
+    page_size: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    """Rebuild one request's ring-layout draft req->token row in a single pass.
+
+    Row layout written: [0, prefix_len + block_size) = ring slots of the
+    positions [suffix_start, suffix_start + prefix_len + block_size). The
+    slot is a pure function of (req, position), so the target's table is not
+    read at all. Fixed grid, per-row data-dependent loop bound; no host
+    reads, so the caller never syncs.
+    """
+    BLOCK: tl.constexpr = 256
+    pid = tl.program_id(axis=0)
+    req = tl.load(req_pool_indices + pid).to(tl.int64)
+    start = tl.load(suffix_start + pid).to(tl.int64)
+    prefix_len = tl.load(draft_prefix_lens + pid).to(tl.int64)
+    total = prefix_len + block_size
+
+    base = req * ring_tokens_per_req
+    dst_row = draft_req_to_token + req * draft_pool_len
+
+    offs = tl.arange(0, BLOCK).to(tl.int64)
+    num_loop = tl.cdiv(total, BLOCK)
+    for i in range(num_loop):
+        col = offs + i * BLOCK
+        pos = start + col
+        ring_page = (pos // page_size) % ring_pages
+        slot = base + ring_page * page_size + (pos % page_size)
+        tl.store(dst_row + col, slot, mask=col < total)
+
+
+def rebuild_ring_draft_req_to_token_func(
+    *,
+    draft_req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    suffix_start: torch.Tensor,
+    draft_prefix_lens: torch.Tensor,
+    ring_tokens_per_req: int,
+    ring_pages: int,
+    page_size: int,
+    block_size: int,
+) -> None:
+    batch_size = int(req_pool_indices.shape[0])
+    rebuild_ring_draft_req_to_token[(batch_size,)](
+        draft_req_to_token,
+        req_pool_indices,
+        suffix_start,
+        draft_prefix_lens,
+        int(ring_tokens_per_req),
+        int(ring_pages),
+        draft_req_to_token.shape[1],
+        page_size,
+        block_size,
+    )
+
+
+@triton.jit
 def assign_extend_cache_locs(
     req_pool_indices,
     req_to_token,
