@@ -28,6 +28,8 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.hicache_format import hicache_tensor_digest
 from sglang.srt.mem_cache.device_pool_info import (
     KVScaleLayout,
     MHABufferInfo,
@@ -710,6 +712,99 @@ class MHATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
+        self.log_transfer_digests("device_to_host", host_indices, device_indices)
+
+    def _host_page_kv(self, token_offset: int):
+        """(k, v) host tensors of the page starting at *token_offset*, in the
+        (page-token-major within component) byte order the page digests and
+        transfer digests compare against."""
+        if self.layout == "page_first_direct":
+            page = token_offset // self.page_size
+            return (
+                self.k_buffer[page, : self.target_layer_num],
+                self.v_buffer[page, : self.target_layer_num],
+            )
+        if self.layout == "page_first":
+            end = token_offset + self.page_size
+            return (self.k_buffer[token_offset:end], self.v_buffer[token_offset:end])
+        # layer_first: one (page, head, dim) row per layer.
+        return (
+            torch.stack(
+                [
+                    self.k_buffer[layer][token_offset : token_offset + self.page_size]
+                    for layer in range(self.layer_num)
+                ]
+            ),
+            torch.stack(
+                [
+                    self.v_buffer[layer][token_offset : token_offset + self.page_size]
+                    for layer in range(self.layer_num)
+                ]
+            ),
+        )
+
+    def _device_page_kv(self, token_offset: int):
+        def stacked(buffers):
+            return torch.stack(
+                [
+                    buffer[token_offset : token_offset + self.page_size]
+                    for buffer in buffers
+                ]
+            )
+
+        return stacked(self.device_k_buffers), stacked(self.device_v_buffers)
+
+    def log_transfer_digests(
+        self,
+        direction: str,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+    ) -> None:
+        if not envs.SGLANG_HICACHE_FILE_BACKEND_LOG_PAGE_DIGESTS.get():
+            return
+        if self.layout not in ("page_first", "page_first_direct", "layer_first"):
+            return
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
+        host_values = host_indices.detach().cpu().reshape(-1).tolist()
+        device_values = device_indices.detach().cpu().reshape(-1).tolist()
+        if len(host_values) != len(device_values) or len(host_values) % self.page_size:
+            return
+        for offset in range(0, len(host_values), self.page_size):
+            host_token = host_values[offset]
+            device_token = device_values[offset]
+            host_kv = self._host_page_kv(host_token)
+            device_kv = self._device_page_kv(device_token)
+            for component, host_tensor, device_tensor in zip(
+                ("kv_k", "kv_v"), host_kv, device_kv
+            ):
+                if self.layout == "page_first":
+                    # Host rows are (page, layer, ...); device rows are
+                    # (layer, page, ...). Same bytes, different axis order.
+                    device_tensor = device_tensor.permute(1, 0, 2, 3)
+                host_digest = hicache_tensor_digest(host_tensor)
+                device_digest = hicache_tensor_digest(device_tensor)
+                logger.warning(
+                    "HiCache KV transfer digest direction=%s component=%s "
+                    "host_page=%d device_index=%d bytes=%d host_sha256=%s "
+                    "device_sha256=%s exact=%s",
+                    direction,
+                    component,
+                    host_token,
+                    device_token,
+                    host_tensor.numel() * host_tensor.element_size(),
+                    host_digest,
+                    device_digest,
+                    host_digest == device_digest,
+                )
+
+    def get_debug_page_tensors(self, index: int):
+        if self.layout in ("page_first", "page_first_direct", "layer_first"):
+            host_k, host_v = self._host_page_kv(index)
+            yield "kv_k", host_k
+            yield "kv_v", host_v
+        else:
+            yield self.pool_label, self.get_data_page(index, flat=True)
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         if self.layout == "layer_first":

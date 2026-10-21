@@ -594,6 +594,12 @@ class UnifiedTreeCoreInterface(ABC):
             f"{type(self).__name__} does not expose build_backup_kv_action"
         )
 
+    def count_reuse_hits(self, key: RadixKey, inserted_len: int) -> list:
+        """Count a cache re-read over an already-keyed path, returning the
+        backup actions that fire; cores that count only on the insert walk
+        return no actions (their re-reads keep the insert-only counts)."""
+        return []
+
     @abstractmethod
     def build_storage_backup_spec(
         self, node_id: NodeId, pass_prefix_keys: bool

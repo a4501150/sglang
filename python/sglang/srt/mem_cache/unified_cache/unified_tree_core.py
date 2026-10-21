@@ -2422,6 +2422,36 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def build_backup_kv_action(self, node_id: NodeId) -> BackupKV:
         return self._build_backup_kv_action(self.node_by_id(node_id))
 
+    def count_reuse_hits(self, key: RadixKey, inserted_len: int) -> list:
+        """Count a cache re-read over an already-keyed path.
+
+        The insert walk is where node hit counts grow, but a request whose
+        checkpoint is fully clamped (a hybrid-SSM request that donates no
+        mamba state) never runs that walk -- its matched nodes would stay at
+        their first-hit count forever and write_through_selective would never
+        fire. Walk the page-aligned matched span and count exactly like the
+        insert walk: every node ending past ``inserted_len`` (nodes the
+        request itself inserted were counted back then). No values move and
+        no nodes are created; returns the backup actions that fired.
+        """
+        actions = []
+        key = key.page_aligned(self.page_size)
+        node = self.root_node
+        total = 0
+        while len(key) and node is not None:
+            child_key = key.child_key(self.page_size)
+            child = node.children.get(child_key)
+            if child is None:
+                break
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            node_end = total + prefix_len
+            if node_end > inserted_len and self._inc_hit_count_and_check(child):
+                actions.append(self._build_backup_kv_action(child))
+            total = node_end
+            node = child
+            key = key[prefix_len:]
+        return actions
+
     def _build_backup_spec(self, node: UnifiedTreeNode):
         """Gather missing Full and component transfers for Host backup."""
         device_value = node.component_data[BASE_COMPONENT_TYPE].value

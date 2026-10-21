@@ -180,6 +180,12 @@ class L2TransferEngine:
                     )
                 if on_layer_done is not None:
                     on_layer_done(layer_id)
+            for transfer in transfers:
+                transfer.host_pool.log_transfer_digests(
+                    "host_to_device",
+                    transfer.host_indices,
+                    transfer.device_indices,
+                )
         return completion
 
     @staticmethod

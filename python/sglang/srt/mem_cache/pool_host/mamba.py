@@ -8,7 +8,9 @@ from typing import Optional, Sequence
 import numpy as np
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
+from sglang.srt.mem_cache.hicache_format import hicache_tensor_digest
 from sglang.srt.mem_cache.pool_host.base import (
     HostKVCache,
     host_memory_budget_bytes,
@@ -869,6 +871,95 @@ class MambaPoolHost(HostKVCache):
             ]
         )
         return data_page.flatten() if flat else data_page
+
+    def storage_format_spec(self) -> dict:
+        # Mamba pages stack components the base fields cannot express
+        # (temporal/conv geometry plus per-slot side states), and this pool
+        # bypasses HostKVCache.__init__, so the spec is built from its own
+        # geometry.
+        return {
+            "pool": "mamba",
+            "layout": self.layout,
+            "page_size": self.page_size,
+            "num_mamba_layers": self.num_mamba_layers,
+            "temporal_shape": list(self.temporal_state_shape),
+            "temporal_dtype": str(self.temporal_dtype).removeprefix("torch."),
+            "conv_shapes": [list(shape) for shape in self.conv_state_shapes],
+            "conv_dtype": str(self.conv_dtype).removeprefix("torch."),
+            "slot_states": [
+                {
+                    "shape": list(state.shape[1:]),
+                    "dtype": str(state.dtype).removeprefix("torch."),
+                }
+                for state in self.slot_state_device_tensors
+            ],
+        }
+
+    def get_debug_page_tensors(self, index: int):
+        if self.temporal_state_elem_size > 0:
+            yield "mamba_temporal", self.temporal_buffer[index]
+        for conv_idx, conv_buf in enumerate(self.conv_buffer):
+            yield f"mamba_conv_{conv_idx}", conv_buf[index]
+        for state_idx, state_buf in enumerate(self.slot_state_buffers):
+            yield f"mamba_slot_state_{state_idx}", state_buf[
+                index : index + self.page_size
+            ]
+
+    def _iter_device_slot_tensors(self, index: int):
+        temporal_layers = (
+            self.temporal_device_layers
+            if self.mtp_draft_buffer_infos
+            else self.buffer_info.temporal
+        )
+        conv_layers = (
+            self.conv_device_layers
+            if self.mtp_draft_buffer_infos
+            else self.buffer_info.conv
+        )
+        if self.temporal_state_elem_size > 0:
+            yield "mamba_temporal", torch.stack(
+                [layer[index] for layer in temporal_layers]
+            )
+        for conv_idx, layers in enumerate(conv_layers):
+            yield f"mamba_conv_{conv_idx}", torch.stack(
+                [layer[index] for layer in layers]
+            )
+        for state_idx, state in enumerate(self.slot_state_device_tensors):
+            yield f"mamba_slot_state_{state_idx}", state[index]
+
+    def log_transfer_digests(
+        self,
+        direction: str,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+    ) -> None:
+        if not envs.SGLANG_HICACHE_FILE_BACKEND_LOG_PAGE_DIGESTS.get():
+            return
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
+        for host_index, device_index in zip(
+            host_indices.cpu().tolist(), device_indices.cpu().tolist()
+        ):
+            host_components = dict(self.get_debug_page_tensors(host_index))
+            device_components = dict(self._iter_device_slot_tensors(device_index))
+            for component, host_tensor in host_components.items():
+                host_digest = hicache_tensor_digest(host_tensor)
+                device_digest = hicache_tensor_digest(
+                    device_components[component]
+                )
+                logger.warning(
+                    "HiCache transfer digest direction=%s component=%s "
+                    "host_page=%d device_slot=%d bytes=%d host_sha256=%s "
+                    "device_sha256=%s exact=%s",
+                    direction,
+                    component,
+                    host_index,
+                    device_index,
+                    host_tensor.numel() * host_tensor.element_size(),
+                    host_digest,
+                    device_digest,
+                    host_digest == device_digest,
+                )
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
         return torch.zeros(

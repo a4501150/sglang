@@ -57,6 +57,16 @@ class RecordingBackend:
     def register_mem_host_pool_v2(self, host_pool: Any, host_pool_name: Any) -> None:
         self.order.append(f"v2:{host_pool_name}")
 
+    # The controller also probes the backend capability surface during
+    # attach and from the storage threads' idle paths.
+    supports_zero_copy_page_io = False
+
+    def touch_many(self, keys: List[str]) -> None:
+        pass
+
+    def maybe_sweep_orphans(self) -> None:
+        pass
+
     def on_host_pools_registered(self) -> None:
         self.order.append("complete")
         if self.fail_on_complete:

@@ -386,6 +386,18 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             device=self.gpu_device,
         )
 
+    def storage_format_spec(self) -> dict:
+        # This pool bypasses HostKVCache.__init__; the paged sidecar's page
+        # byte format is its own item geometry, not the base fields.
+        return {
+            "pool": self.pool_name,
+            "layout": self.layout,
+            "page_size": self.page_size,
+            "layer_num": self.layer_num,
+            "item_bytes": self.item_bytes,
+            "page_aligned_only": self.page_aligned_only,
+        }
+
     def _host_page_view(self, l: int) -> torch.Tensor:
         """View a host layer as ``[pages, 1, P, 1, dim]``."""
         if self.layout == "layer_first":
@@ -973,6 +985,18 @@ class DeepSeekV4StateHostPool(HostKVCache):
 
     def get_size_per_token(self):
         return self.state_page_bytes
+
+    def storage_format_spec(self) -> dict:
+        # This pool bypasses HostKVCache.__init__; its page byte format is
+        # the ring geometry, not the base fields.
+        return {
+            "pool": self.pool_name,
+            "layout": self.layout,
+            "page_size": self.page_size,
+            "layer_num": self.layer_num,
+            "state_page_bytes": self.state_page_bytes,
+            "ring_size": self.ring_size,
+        }
 
     def get_ksize_per_token(self):
         return self.state_page_bytes

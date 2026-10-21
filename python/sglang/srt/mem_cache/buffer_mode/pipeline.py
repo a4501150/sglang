@@ -144,6 +144,8 @@ class _StagedPrefetch(msgspec.Struct):
     aux_xfers: list[PoolTransfer]
     hash_values: list[str]
     operation_id: int
+    # The bounce lives in the device staging arena, not the host pool.
+    device_staged: bool = False
 
 
 class _OngoingBufferLoadBack(msgspec.Struct):
@@ -166,6 +168,8 @@ class _OngoingBufferLoadBack(msgspec.Struct):
     device_indices: torch.Tensor
     load_transfers: list[PoolTransfer]
     load_contexts: list[BufferLoadBackContext]
+    # The bounce lives in the device staging arena, not the host pool.
+    device_staged: bool = False
 
 
 class _AnchorLock(msgspec.Struct):
@@ -1203,17 +1207,38 @@ class BufferModePipeline:
             pool_beliefs = beliefs.pool(pool)
             pool_beliefs.add(keys)
             pool_beliefs.untrack_inflight(keys)
+        # Writes stage on the host even when device-target reads are on.
         self._free_staging_now(entry.host_indices, entry.aux_xfers)
         self.write_staged_tokens_ -= entry.occupied_units
         self._finish_inflight(entry.intent.snapshot.node_id, entry.intent.pool)
 
     def _free_staging_now(
-        self, host_indices: torch.Tensor, aux_xfers: list[PoolTransfer]
+        self,
+        host_indices: torch.Tensor,
+        aux_xfers: list[PoolTransfer],
+        *,
+        device_staged: bool = False,
     ) -> None:
         """Synchronously free a staging span (KV + aux pools) on the
         scheduler thread; buffer-mode acks/drops all run here, so frees
-        land before the tick's next gate reads pool availability."""
+        land before the tick's next gate reads pool availability. Write
+        staging is always host-side; prefetch/load bounces follow their
+        allocation (``device_staged``)."""
         cc = self._cache.cache_controller
+        if device_staged:
+            # The span is arena slots; KV-derived mirrors ride the anchor's
+            # slots and are skipped by the same indices_from_pool filter.
+            if host_indices is not None and host_indices.numel() > 0:
+                cc.device_staging_free(PoolName.KV, host_indices)
+            for t in aux_xfers or ():
+                if (
+                    t.host_indices is None
+                    or t.host_indices.numel() == 0
+                    or t.indices_from_pool is not None
+                ):
+                    continue
+                cc.device_staging_free(t.name, t.host_indices)
+            return
         if host_indices is not None and host_indices.numel() > 0:
             cc.mem_pool_host.free(host_indices)
         for t in aux_xfers or ():
@@ -1621,8 +1646,10 @@ class BufferModePipeline:
             # Nothing usable fetched: recompute.
             cache.discard_storage_prefetch_accounting(request)
             self.release_anchor_lock(request)
-            cc.append_host_mem_release(
-                host_indices[:num_tokens], extra_pools=aux_xfers or None
+            self._free_staging_now(
+                host_indices[:num_tokens],
+                aux_xfers or [],
+                device_staged=operation.device_staged,
             )
             cc.prefetch_tokens_occupied -= occupied_tokens
             cache.prefetch_loaded_tokens_by_reqid[request] = 0
@@ -1675,6 +1702,7 @@ class BufferModePipeline:
             aux_xfers=aux_xfers,
             hash_values=hash_values[: num_tokens // self._cache.page_size],
             operation_id=info.operation.id,
+            device_staged=info.operation.device_staged,
         )
 
     def defer_staged_admission(self, req: Req, pool: str) -> None:
@@ -1902,10 +1930,14 @@ class BufferModePipeline:
             # Not staging, so these stay out of the aux_xfers the ack frees.
             load_xfers.extend(load_context.load_xfers)
         trim_tokens = plan.device_prefix_len - f.matched_len
+        load_kwargs = {}
+        if f.device_staged:
+            load_kwargs["device_staged"] = True
         device_indices = cache.cache_controller.load(
             host_indices=f.host_indices[trim_tokens:],
             node_id=load_back_id,
             extra_pools=load_xfers or None,
+            **load_kwargs,
         )
         for load_context in load_contexts:
             load_context.finalize_allocation(success=device_indices is not None)
@@ -1924,6 +1956,7 @@ class BufferModePipeline:
                 device_indices=device_indices,
                 load_transfers=load_xfers,
                 load_contexts=load_contexts,
+                device_staged=f.device_staged,
             ),
             "",
         )
@@ -1988,8 +2021,10 @@ class BufferModePipeline:
 
     def _free_completed_load_back_buffers(self, f: _OngoingBufferLoadBack) -> None:
         cc = self._cache.cache_controller
-        # The H2D consumed the bounce buffers; free them outright.
-        self._free_staging_now(f.host_indices, f.aux_xfers)
+        # The copy consumed the bounce buffers; free them outright.
+        self._free_staging_now(
+            f.host_indices, f.aux_xfers, device_staged=f.device_staged
+        )
         for pool_name, device_indices in f.aux_device_releases:
             entry = cc.mem_pool_host.entry_map[pool_name]
             free_fn = entry.device_free_fn or entry.device_pool.free
@@ -2008,6 +2043,8 @@ class BufferModePipeline:
         if staged is None:
             return False
         self._cache._finish_storage_prefetch(request, fulfilled_tokens=0, reason=reason)
-        self._free_staging_now(staged.host_indices, staged.aux_xfers)
+        self._free_staging_now(
+            staged.host_indices, staged.aux_xfers, device_staged=staged.device_staged
+        )
         self._cache.cache_controller.prefetch_tokens_occupied -= staged.occupied_tokens
         return True

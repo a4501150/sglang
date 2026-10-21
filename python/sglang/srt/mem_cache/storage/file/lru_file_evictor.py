@@ -28,7 +28,7 @@ import logging
 import os
 import threading
 from collections import OrderedDict
-from typing import Any, Callable, Optional, Set, Tuple
+from typing import Any, Callable, List, Optional, Set, Tuple
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import human_readable_int
@@ -71,6 +71,7 @@ class LRUFileEvictor:
         tp_rank: int,
         extra_config: Optional[dict] = None,
         on_evict: Optional[Callable[[str], None]] = None,
+        sibling_keys: Optional[Callable[[str], List[str]]] = None,
     ) -> None:
         self.file_path = file_path
         # Files ending in one of these suffixes are created and evicted by this
@@ -78,6 +79,14 @@ class LRUFileEvictor:
         self._owned_suffixes = owned_suffixes
         self._tp_rank = tp_rank
         self._on_evict = on_evict
+        # Maps a tracked stem to the stems of the other files storing parts of
+        # the same page group (KV payload + sidecar pools). Eviction unlinks
+        # the whole group so a restore never finds an incomplete set.
+        self.sibling_keys = sibling_keys
+        # Optional backend hook that deletes untracked leftover files (tmp
+        # writes, stale-format pages) and returns the bytes reclaimed. Called
+        # before a watermark-driven eviction; must not take self._lock.
+        self.sweep_callback: Optional[Callable[[], int]] = None
 
         # suffixed_key -> file size in bytes; oldest at front.
         self._lru: OrderedDict[str, int] = OrderedDict()
@@ -222,24 +231,75 @@ class LRUFileEvictor:
                 self._total_bytes -= cur
 
     def touch(self, suffixed_key: str, tensor_path: str) -> None:
-        """Mark key as MRU, adopting an untracked on-disk file if needed."""
+        """Mark key as MRU, adopting an untracked on-disk file if needed.
+
+        Also refreshes the file mtime: the startup scan rebuilds the LRU
+        from mtimes, so without a read-time bump a hot page written long
+        ago looks stale after a restart and becomes the first victim.
+        """
         if not self._eviction_enabled or not self._owns(suffixed_key):
             return
+        tracked = False
         with self._lock:
             if suffixed_key in self._lru:
                 self._lru.move_to_end(suffixed_key, last=True)
+                tracked = True
+        if not tracked:
+            # Untracked file: stat without holding the lock.
+            try:
+                size = os.path.getsize(tensor_path)
+            except OSError:
                 return
-        # Untracked file: stat without holding the lock.
+            with self._lock:
+                if suffixed_key in self._lru:
+                    self._lru.move_to_end(suffixed_key, last=True)
+                else:
+                    self._lru[suffixed_key] = size
+                    self._total_bytes += size
         try:
-            size = os.path.getsize(tensor_path)
+            # ~1us on a hot inode (measured); a vanished file is benign.
+            os.utime(tensor_path, None)
         except OSError:
+            pass
+
+    def touch_many(self, stem_path_pairs) -> None:
+        """Batched touch: same semantics as ``touch`` per file, with two lock
+        passes and one utime sweep instead of per-file locking.
+
+        The lock is only held for OrderedDict updates; stats and utimes run
+        outside so a large batch does not block concurrent reserves.
+        """
+        if not self._eviction_enabled:
             return
+        untracked = []
         with self._lock:
-            if suffixed_key in self._lru:
-                self._lru.move_to_end(suffixed_key, last=True)
-            else:
-                self._lru[suffixed_key] = size
-                self._total_bytes += size
+            for stem, path in stem_path_pairs:
+                if not self._owns(stem):
+                    continue
+                if stem in self._lru:
+                    self._lru.move_to_end(stem, last=True)
+                else:
+                    untracked.append((stem, path))
+        adopted = []
+        for stem, path in untracked:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            adopted.append((stem, size))
+        if adopted:
+            with self._lock:
+                for stem, size in adopted:
+                    if stem in self._lru:
+                        self._lru.move_to_end(stem, last=True)
+                    else:
+                        self._lru[stem] = size
+                        self._total_bytes += size
+        for _, path in stem_path_pairs:
+            try:
+                os.utime(path, None)
+            except OSError:
+                pass
 
     def clear(self) -> None:
         """Reset all bookkeeping after the backend has removed the files."""
@@ -260,15 +320,37 @@ class LRUFileEvictor:
 
     def _enforce_free_space_locked(self, value_bytes: int) -> bool:
         """Evict until writing value_bytes still leaves min_free_bytes free.
-        Caller holds _lock. Returns False if the write can't be satisfied."""
+        Caller holds _lock. Returns False if the write can't be satisfied.
+
+        Evicting every live entry frees at most the reclaimable bytes, so
+        when even that cannot bring the filesystem above the watermark the
+        write is refused up front instead of trashing the cache to no
+        effect.
+        """
         if self.min_free_bytes <= 0:
             return True
         fs = self._fs_stats()
         if fs is None:
             return True  # cannot probe -> permissive, fall back to OS errors
+        free = fs[1]
+        if free - value_bytes >= self.min_free_bytes:
+            # Ample headroom: the eviction loop below would be a no-op, so
+            # skip the (lock-held) orphan sweep and reclaimable sum.
+            return True
+        if self.sweep_callback is not None:
+            # Untracked leftovers are reclaimable without evicting live
+            # pages; the sweep does its own directory IO and never takes
+            # self._lock.
+            free += self.sweep_callback()
+        own_reclaimable = sum(
+            size
+            for key, size in self._lru.items()
+            if key not in self._pending_writes
+        )
+        if free + own_reclaimable - value_bytes < self.min_free_bytes:
+            return False
         # tmpfs frees space on unlink, so credit reclaimed bytes back to the
         # estimate rather than re-probing statvfs on every eviction.
-        free = fs[1]
         self._evict_while(
             lambda reclaimed: (free + reclaimed) - value_bytes < self.min_free_bytes
         )
@@ -303,16 +385,33 @@ class LRUFileEvictor:
             self._lru[stem] = size
             self._total_bytes += size
 
+    def _group_siblings_locked(self, evict_stem: str) -> List[str]:
+        """Other stems storing parts of the same page group. Caller holds
+        _lock."""
+        if self.sibling_keys is None:
+            return []
+        try:
+            siblings = self.sibling_keys(evict_stem)
+        except Exception as e:
+            # Derivation is pure string math; failure must not stop eviction.
+            logger.warning(
+                f"HiCacheFile sibling derivation failed for {evict_stem}: {e}"
+            )
+            return []
+        return [s for s in siblings if s != evict_stem]
+
     def _evict_one_lru_locked(self) -> Tuple[str, int]:
-        """Evict the single oldest evictable LRU entry. Caller holds _lock.
+        """Evict the single oldest evictable LRU entry, with its page group.
 
         The shared pop / skip-pending / unlink / ``_total_bytes`` step driven by
         `_evict_while`. Returns ``(outcome, freed_bytes)``:
 
-        - ``("evicted", n)``: oldest entry dropped from the index; ``n`` disk
-          bytes reclaimed (0 if the file was already gone).
-        - ``("skipped", 0)``: oldest entry is an in-flight write; re-pinned at MRU
-          so the writer is not evicted out from under itself.
+        - ``("evicted", n)``: oldest entry (and its sidecar siblings) dropped
+          from the index; ``n`` disk bytes reclaimed (0 for already-gone
+          files).
+        - ``("skipped", 0)``: the entry or one of its siblings is an in-flight
+          write; re-pinned at MRU so the group is not torn apart and the
+          writer is not evicted out from under itself.
         - ``("stop", 0)``: nothing evictable (empty index) or the unlink failed
           (entry re-pinned at LRU); the caller should stop its eviction loop.
         """
@@ -321,6 +420,12 @@ class LRUFileEvictor:
         evict_stem, evict_size = self._lru.popitem(last=False)  # oldest
         if evict_stem in self._pending_writes:
             # Keep in-flight reservations; their file isn't committed yet.
+            self._lru[evict_stem] = evict_size
+            return "skipped", 0
+        siblings = self._group_siblings_locked(evict_stem)
+        if any(sib in self._pending_writes for sib in siblings):
+            # A sidecar of this page is being written; evicting the payload
+            # now would leave an incomplete group on disk. Defer the group.
             self._lru[evict_stem] = evict_size
             return "skipped", 0
         tensor_path = os.path.join(self.file_path, f"{evict_stem}.bin")
@@ -339,6 +444,23 @@ class LRUFileEvictor:
             self._lru.move_to_end(evict_stem, last=False)
             return "stop", 0
         self._total_bytes -= evict_size
+        for sib in siblings:
+            sib_path = os.path.join(self.file_path, f"{sib}.bin")
+            sib_size = self._lru.pop(sib, None)
+            try:
+                os.remove(sib_path)
+            except FileNotFoundError:
+                pass  # already gone; still drop the stale index entry
+            except OSError as e:
+                logger.warning(f"HiCacheFile sibling eviction failed for {sib}: {e}")
+                if sib_size is not None:
+                    self._lru[sib] = sib_size
+                continue
+            if sib_size is not None:
+                freed += sib_size
+                self._total_bytes -= sib_size
+            if self._on_evict is not None:
+                self._on_evict(sib)
         return "evicted", freed
 
     def _evict_while(self, should_continue) -> int:
