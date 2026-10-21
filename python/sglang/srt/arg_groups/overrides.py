@@ -57,6 +57,7 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     use_mla_backend,
 )
 from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
+from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
 
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
@@ -1514,18 +1515,162 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
                 moe_runner_backend,
             )
             moe_runner_backend = mxfp8_default
+    # ModelOpt NVFP4 MoE must resolve `auto` here, once, before any layer is
+    # built: ModelOptNvFp4FusedMoEMethod snapshots the backend at construction
+    # and its create_moe_runner would otherwise resolve `auto` independently
+    # (the trtllm forward then reads tensors -- g1_scale_c -- that only the
+    # trtllm weight prep builds). The operator does not have to name the
+    # quantization, so read it off the checkpoint like
+    # _deepseek_moe_quant_resolution does. A2A backends other than `none`
+    # resolve in _moe_runner_backend_a2a_default, after the A2A backend is
+    # final (waterfill can flip `none` to `deepep`; megamoe/deepep_v2/pplx
+    # resolve their runner in their own handle_a2a_moe branches).
     if (
         moe_runner_backend == "auto"
-        and view.quantization == "modelopt_fp4"
-        and (get_platform().is_sm120 or get_platform().is_sm110)
+        and _is_modelopt_fp4_checkpoint(view)
+        and view.moe_a2a_backend == "none"
     ):
-        moe_runner_backend = "flashinfer_cutlass"
-        logger.info(
-            "Use flashinfer_cutlass as MoE runner backend on SM110/SM120 for "
-            "modelopt_fp4 (trtllm-gen MoE kernels are SM100-only)"
-        )
+        if get_platform().is_sm120 or get_platform().is_sm110:
+            moe_runner_backend = "flashinfer_cutlass"
+            logger.info(
+                "Use flashinfer_cutlass as MoE runner backend on SM110/SM120 for "
+                "modelopt_fp4 (trtllm-gen MoE kernels are SM100-only)"
+            )
+        elif get_platform().is_blackwell:
+            moe_runner_backend = "flashinfer_trtllm"
+            logger.info(
+                "Use flashinfer_trtllm as MoE runner backend on Blackwell for "
+                "modelopt_fp4"
+            )
+        elif get_platform().is_cuda and not get_platform().is_hip and (
+            (8, 0) <= tuple(get_platform().device_capability) < (10, 0)
+        ):
+            # The fp4-marlin (W4A16) fallback the method used to pick in its
+            # own __init__; marlin repacks the weights, so this must be the
+            # one resolution.
+            moe_runner_backend = "marlin"
+            logger.info(
+                "Use marlin as MoE runner backend on SM80-SM90 for modelopt_fp4"
+            )
     if moe_runner_backend != view.moe_runner_backend:
         return {"moe_runner_backend": moe_runner_backend}
+    return {}
+
+
+def _is_modelopt_fp4_checkpoint(view: Any) -> bool:
+    """Whether the MoE experts are ModelOpt NVFP4, whether named on the CLI
+    or detected from the checkpoint's HF quantization_config."""
+    if view.quantization in ("modelopt_fp4", "modelopt_mixed"):
+        return True
+    if view.quantization not in (None, "modelopt"):
+        return False
+    hf_config = model_config_of(view).hf_config
+    quant_cfg = getattr(hf_config, "quantization_config", None) or {}
+    quant_method = get_quantization_config(hf_config)
+    # The parsed hf_config may already carry the canonical method name
+    # (modelopt_fp4) instead of the raw "modelopt" the checkpoint ships.
+    return quant_method == "modelopt_fp4" or (
+        quant_method == "modelopt"
+        and canonicalize_modelopt_quant_algo(quant_cfg.get("quant_algo"))
+        == "modelopt_fp4"
+    )
+
+
+@register_post_process
+def _moe_runner_backend_a2a_default(view: Any) -> dict:
+    """A2A-driven MoE runner defaults, resolved once the A2A backend is final.
+
+    Runs in handle_a2a_moe after _a2a_backend_overrides, so the runner matches
+    the A2A backend that will actually dispatch (waterfill can flip `none` to
+    `deepep` before this). `none` is quant-pass territory
+    (_moe_runner_backend_quant_constraints); megamoe/deepep_v2/pplx resolve
+    their runner in their own handle_a2a_moe branches, which see a concrete
+    value by then.
+
+    The supported-runner matrices mirror the asserts in handle_moe_kernel_config
+    and handle_a2a_moe: trtllm-gen MoE kernels are SM100-only, and
+    flashinfer_cutlass takes modelopt_fp4/modelopt_fp8/bf16 only. Combinations
+    with no runner fail here, at resolution, instead of the first decode graph
+    capture.
+    """
+    a2a = view.moe_a2a_backend
+    if view.moe_runner_backend != "auto" or a2a == "none":
+        return {}
+
+    if a2a == "flashinfer":
+        # NVFP4 experts need no checkpoint detection here: they resolve to
+        # the same runner as the modelopt_fp8/bf16 row on every SM
+        # (cutlass on SM110/SM120, trtllm on SM100-family), so the CLI
+        # quantization alone decides. mxfp8/nvfp4_online resolved earlier
+        # in the quant pass and never arrive as `auto`.
+        is_sm11x = get_platform().is_sm120 or get_platform().is_sm110
+        if view.quantization in (
+            "modelopt_fp4",
+            "modelopt_mixed",
+            "modelopt_fp8",
+            None,
+        ):
+            resolved = "flashinfer_cutlass" if is_sm11x else "flashinfer_trtllm"
+        elif view.quantization in ("fp8", "compressed-tensors"):
+            resolved = "flashinfer_trtllm"
+        else:
+            raise ValueError(
+                f"--moe-a2a-backend flashinfer has no MoE runner for "
+                f"quantization {view.quantization!r} with moe_runner_backend "
+                "'auto'; pass --moe-runner-backend explicitly. Supported "
+                "under FlashInfer A2A: modelopt_fp4, modelopt_fp8, "
+                "modelopt_mixed, fp8, compressed-tensors, mxfp8, nvfp4_online, "
+                "or bfloat16."
+            )
+        if not get_platform().is_blackwell:
+            raise ValueError(
+                "--moe-a2a-backend flashinfer needs a Blackwell MoE runner "
+                "(flashinfer_cutlass or flashinfer_trtllm); pass "
+                "--moe-runner-backend explicitly on this platform."
+            )
+        if is_sm11x and resolved == "flashinfer_trtllm":
+            raise ValueError(
+                f"--moe-a2a-backend flashinfer cannot run {view.quantization!r} "
+                "experts on SM110/SM120: trtllm-gen MoE kernels are SM100-only "
+                "and flashinfer_cutlass takes modelopt_fp4, modelopt_fp8 or "
+                "bf16 only."
+            )
+        logger.info(
+            "Use %s as MoE runner backend for FlashInfer MoE A2A", resolved
+        )
+        return {"moe_runner_backend": resolved}
+
+    if a2a == "deepep":
+        try:
+            fp4_experts = _is_modelopt_fp4_checkpoint(view) or (
+                model_config_of(view).nvfp4_moe_meta is not None
+            )
+        except OSError:
+            # A directly-invoking unit test can carry a model path that
+            # cannot build a ModelConfig; production cannot (the launch
+            # would have failed on the same path before any layer). Skip
+            # checkpoint detection exactly as before this pass existed.
+            fp4_experts = False
+        if fp4_experts:
+            # The deepep family keys FP4 off cutedsl: the cutedsl v1 masked
+            # path is the DeepEP-dispatch FP4 MoE (handle_a2a_moe forces
+            # deepep_mode low_latency for it). Left to the layer, the method
+            # __init__ and create_moe_runner resolve `auto` differently and
+            # the trtllm forward reads tensors only the trtllm weight prep
+            # builds.
+            logger.info(
+                "Use flashinfer_cutedsl as MoE runner backend for DeepEP with "
+                "NVFP4 experts"
+            )
+            return {"moe_runner_backend": "flashinfer_cutedsl"}
+        # Other quantizations keep `auto`: their scheme is the single
+        # in-layer owner (fp8 resolves deep_gemm/triton in its
+        # create_moe_runner from per-layer facts) and their weight prep does
+        # not read the backend, so there is no split-brain.
+        return {}
+
+    # mooncake/nixl/mori/ascend_tp follow the deepep rule: resolve in the
+    # layer unless the family demands otherwise here.
     return {}
 
 

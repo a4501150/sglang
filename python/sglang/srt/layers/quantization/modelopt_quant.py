@@ -2387,20 +2387,32 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto() and is_cuda():
-            capability = get_device_capability()
-            use_marlin_fallback = (8, 0) <= capability < (10, 0)
-        else:
-            use_marlin_fallback = moe_runner_backend.is_marlin()
-        if not get_platform().is_blackwell and not use_marlin_fallback:
+        if moe_runner_backend.is_auto():
+            # The server-arg pipeline owns this resolution
+            # (_moe_runner_backend_quant_constraints /
+            # _moe_runner_backend_a2a_default); `auto` here means it missed
+            # this combination, and this class cannot resolve it without
+            # split-braining weight prep against the runner (g1_scale_c).
+            raise ValueError(
+                "moe_runner_backend 'auto' reached "
+                "ModelOptNvFp4FusedMoEMethod; the server-arg pipeline must "
+                "resolve it before layers are built (see "
+                "arg_groups/overrides.py: _moe_runner_backend_quant_constraints, "
+                "_moe_runner_backend_a2a_default), or the platform is "
+                "unsupported (NVFP4 needs Blackwell, or marlin on CUDA SM80-SM90)."
+            )
+        # Frozen for the layer's lifetime: create_moe_runner must see the same
+        # value, or weight prep and runner disagree.
+        self._init_runner_backend = moe_runner_backend
+        if not get_platform().is_blackwell and not moe_runner_backend.is_marlin():
             raise ValueError(
                 "Current platform does not support NVFP4"
                 " quantization with the selected MoE backend. Please use "
                 "Blackwell and above, or use moe_runner_backend=marlin on SM80+."
             )
         self.enable_flashinfer_trtllm_moe = (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            moe_runner_backend.is_flashinfer_trtllm()
+            or moe_runner_backend.is_flashinfer_trtllm_routed()
         )
         # MegaMoE consumes canonical W13 directly, regardless of the nominal
         # runner.
@@ -3084,12 +3096,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         moe_runner_backend = get_moe_runner_backend()
 
         if moe_runner_backend.is_auto():
-            if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
-                moe_runner_backend = MoeRunnerBackend.MARLIN
-            else:
-                # TRTLLM is currently the most performant and tested FP4 MoE
-                # backend, so use it as the default.
-                moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+            raise ValueError(
+                "moe_runner_backend 'auto' reached create_moe_runner for the "
+                "ModelOpt NVFP4 MoE; the server-arg pipeline resolves it "
+                "before layers are built (see arg_groups/overrides.py: "
+                "_moe_runner_backend_quant_constraints, "
+                "_moe_runner_backend_a2a_default)."
+            )
+        if moe_runner_backend is not self._init_runner_backend:
+            # The backend flipped between construction and runner creation;
+            # the weight-prep layout chosen in __init__ would disagree with
+            # the runner.
+            raise ValueError(
+                f"The MoE runner backend flipped between construction "
+                f"({self._init_runner_backend}) and create_moe_runner "
+                f"({moe_runner_backend}) for the ModelOpt NVFP4 MoE; weight "
+                "prep and runner must agree."
+            )
 
         self._moe_runner_backend = moe_runner_backend
 

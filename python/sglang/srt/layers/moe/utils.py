@@ -479,6 +479,14 @@ def initialize_moe_config():
     moe = get_flags().moe
     moe.a2a_backend = MoeA2ABackend(exec_moe.moe_a2a_backend)
     moe.runner_backend = resolve_moe_runner_backend(exec_moe.moe_runner_backend)
+    if moe.runner_backend.is_auto():
+        logger.warning(
+            "The MoE runner backend stayed 'auto' after server-arg "
+            "resolution; the per-quant scheme picks it at layer build. "
+            "Quantizations whose schemes branch on the backend before that "
+            "(e.g. ModelOpt NVFP4) resolve centrally instead -- see "
+            "arg_groups/overrides.py: _moe_runner_backend_quant_constraints."
+        )
     moe.speculative_runner_backend = (
         resolve_moe_runner_backend(spec.speculative_moe_runner_backend)
         if spec.speculative_moe_runner_backend is not None
@@ -511,6 +519,16 @@ def get_moe_a2a_backend() -> MoeA2ABackend:
 
 
 def get_moe_runner_backend() -> MoeRunnerBackendLike:
+    # Resolution ownership: the quantization/A2A server-arg passes resolve
+    # `auto` for every backend combination whose inputs are visible there
+    # (ModelOpt NVFP4 everywhere; FlashInfer/DeepEP A2A per quantization --
+    # arg_groups/overrides.py). What can still arrive as `auto` resolves
+    # exactly once, in the scheme's create_moe_runner, and only where the
+    # decision needs per-layer facts the arg pipeline cannot see (activation
+    # strategy, kernel-availability envs) or the platform is NPU (every NPU
+    # scheme maps auto to ASCEND). Schemes that read the backend in weight
+    # prep must not keep a local default -- that is the ModelOpt
+    # g1_scale_c split-brain.
     moe = get_flags().moe
     if moe.runner_backend is None:
         moe.runner_backend = MoeRunnerBackend.AUTO

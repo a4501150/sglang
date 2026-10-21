@@ -11,6 +11,7 @@ from sglang.srt.arg_groups.overrides import (
     _a2a_backend_overrides,
     _a2a_ep_size,
     _a2a_fusion_adjustments,
+    _moe_runner_backend_a2a_default,
     _moe_runner_backend_quant_constraints,
     _moe_runner_fusion_disable,
     declare_resolution,
@@ -294,6 +295,11 @@ def handle_a2a_moe(server_args: Any):
     # pipeline (arg_groups/overrides.py: _a2a_fusion_adjustments),
     # invoked here at the legacy write slots.
     run_post_process_pass(server_args, _a2a_fusion_adjustments)
+
+    # The A2A backend is final from here on (_a2a_backend_overrides may have
+    # flipped it), so the runner defaults that key on it resolve now, before
+    # the per-backend branches below read or assert a backend.
+    run_post_process_pass(server_args, _moe_runner_backend_a2a_default)
 
     a2a_backend = resolved_view(server_args).moe_a2a_backend
     if cfg.enable_waterfill:
