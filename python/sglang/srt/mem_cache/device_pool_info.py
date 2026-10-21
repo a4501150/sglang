@@ -85,6 +85,10 @@ class KVBuffers(msgspec.Struct, frozen=True, kw_only=True):
 class KVScaleLayout(Enum):
     TOKEN = "token"
     MXFP8_INTERLEAVED = "mxfp8_interleaved"
+    # Per-token FP32 descales of the dynamic-FP8 pool (fp8 payload rows).
+    # Distinct from TOKEN so host-pool dispatch never mistakes an FP4
+    # block-scale layout for the dynamic-FP8 scale buffers.
+    DYNAMIC_FP8_TOKEN = "dynamic_fp8_token"
 
 
 class KVScaleBuffers(msgspec.Struct, frozen=True, kw_only=True):

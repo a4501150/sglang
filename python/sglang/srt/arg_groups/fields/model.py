@@ -200,7 +200,9 @@ class Model(msgspec.Struct):
             help=(
                 'Data type for kv cache storage. "auto" will use model data type. '
                 '"bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and '
-                '"fp8_e4m3" are supported for CUDA 11.8+. "mxfp8" is supported '
+                '"fp8_e4m3" are supported for CUDA 11.8+. '
+                '"fp8_e4m3_dynamic" stores one FP32 scale per token and KV head '
+                'and quantizes at write time (QSA models on CUDA). "mxfp8" is supported '
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
@@ -210,6 +212,7 @@ class Model(msgspec.Struct):
                 "auto",
                 "fp8_e5m2",
                 "fp8_e4m3",
+                "fp8_e4m3_dynamic",
                 "mxfp8",
                 "bf16",
                 "bfloat16",

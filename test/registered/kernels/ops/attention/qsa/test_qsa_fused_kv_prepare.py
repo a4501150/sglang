@@ -426,7 +426,11 @@ def test_fused_pool_eligibility(dtype, quantized, wrapped):
         pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
         pool.full_kv_pool = storage
     backend = QwenSparseAttnBackend(SimpleNamespace(token_to_kv_pool=pool))
-    assert backend._fused_kv_pool_eligible == (not quantized and dtype != torch.float16)
+    # BF16 only: an FP8 pool with calibrated or dynamic per-token scales must
+    # take the non-fused path where _store_kv/the gathers apply the descales.
+    assert backend._fused_kv_pool_eligible == (
+        not quantized and dtype is torch.bfloat16
+    )
     assert not QwenSparseAttnBackend()._fused_kv_pool_eligible
     assert not QwenSparseAttnBackend(
         SimpleNamespace(token_to_kv_pool=object())

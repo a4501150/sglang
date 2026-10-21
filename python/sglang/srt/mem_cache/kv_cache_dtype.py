@@ -53,8 +53,13 @@ def configure_kv_cache_dtype(
             kv_cache_dtype = fp8_dtype
         else:
             kv_cache_dtype = torch.float8_e5m2
-    elif server_args_kv_cache_dtype == "fp8_e4m3":
-        if _is_hip:  # Using natively supported format
+    elif server_args_kv_cache_dtype in ("fp8_e4m3", "fp8_e4m3_dynamic"):
+        if _is_hip:
+            if server_args_kv_cache_dtype == "fp8_e4m3_dynamic":
+                raise ValueError(
+                    "--kv-cache-dtype fp8_e4m3_dynamic is not supported on ROCm."
+                )
+            # Using natively supported format
             kv_cache_dtype = fp8_dtype
         else:
             kv_cache_dtype = torch.float8_e4m3fn
@@ -94,6 +99,25 @@ def configure_kv_cache_dtype(
         )
         kv_cache_dtype = model_dtype
         # "auto" is the tag for an unquantized pool; backends gate descale on it.
+        resolved_kv_cache_dtype = "auto"
+
+    # DFLASH draft on any other backend: no draft pool consumes the dynamic
+    # per-token scale buffers, so a draft that would inherit the target's
+    # fp8_e4m3_dynamic keeps a bf16 pool of its own.
+    if (
+        is_draft_worker
+        and is_dflash
+        and speculative_draft_kv_cache_dtype is None
+        and server_args_kv_cache_dtype == "fp8_e4m3_dynamic"
+        and kv_cache_dtype != model_dtype
+    ):
+        logger.info(
+            "DFLASH draft: overriding inherited KV cache dtype "
+            "fp8_e4m3_dynamic -> %s (the draft pool has no dynamic-FP8 "
+            "scale support; it stays bf16).",
+            model_dtype,
+        )
+        kv_cache_dtype = model_dtype
         resolved_kv_cache_dtype = "auto"
 
     return resolved_kv_cache_dtype, kv_cache_dtype

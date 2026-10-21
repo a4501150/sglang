@@ -1427,6 +1427,7 @@ def setup_state_kv_args(
         DSATokenToKVPool,
         HybridLinearKVPool,
         MHATokenToKVPool,
+        MHATokenToKVPoolDynamicFP8,
         MHATokenToKVPoolMXFP8,
         MiniMaxSparseKVPool,
     )
@@ -1463,7 +1464,19 @@ def setup_state_kv_args(
                 tail_item_lens,
             )
 
-    if isinstance(token_to_kv_pool, MHATokenToKVPoolMXFP8):
+    # Pools whose scales ride as their own component so they inherit the index
+    # payload of the KV they describe. QSA wraps the scale-carrying full pool in
+    # HybridLinearKVPool/QSATokenToKVPool; both wrapper shapes must ship scales.
+    has_separate_kv_scales = isinstance(
+        token_to_kv_pool, (MHATokenToKVPoolDynamicFP8, MHATokenToKVPoolMXFP8)
+    ) or (
+        isinstance(token_to_kv_pool, HybridLinearKVPool)
+        and isinstance(
+            token_to_kv_pool.full_kv_pool,
+            (MHATokenToKVPoolDynamicFP8, MHATokenToKVPoolMXFP8),
+        )
+    )
+    if has_separate_kv_scales:
         append_state_component(
             kv_args,
             StateType.BLOCK_SCALE,
