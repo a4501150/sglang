@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import inspect
 import logging
 import time
@@ -1358,6 +1359,11 @@ class ModelRunner:
 
         self.dtype = self.model_config.dtype
 
+        # Loaders snapshot params_dicts before post-processing replaces the
+        # parameters; a reference cycle holding one would pin the replaced
+        # tensors forever once the scheduler freezes the GC.
+        gc.collect()
+        torch.cuda.empty_cache()
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory
         self.weight_load_time = time.perf_counter() - tic_total
