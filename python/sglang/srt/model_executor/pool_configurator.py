@@ -104,10 +104,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _dflash_ring_layout(kvc: KVCacheConfigurator):
+    """The active DFLASH ring layout from the spec context, else None.
+
+    Local (not module-level) so kvc's page size drives the geometry; the
+    ring does not scale with DCP (rejected at draft-pool build)."""
+    from sglang.srt.speculative.dflash_draft_kv_layout import (
+        active_dflash_ring_layout,
+    )
+
+    return active_dflash_ring_layout(kvc.page_size or 1)
+
+
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     """Bytes/token the DFLASH draft KV pool adds, 0 if none; replicated across DCP
     ranks because the draft pool spans the widened virtual location space."""
     if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
+        return 0
+    if _dflash_ring_layout(kvc) is not None:
+        # Ring drafts pay a fixed per-request cost, charged as a bias in
+        # _resolve_memory_pool_config, not per target token.
         return 0
     cell_size = kvc.spec_aux_config.dflash_draft_cell_size_per_token
     if cell_size is None or int(cell_size) <= 0:
@@ -311,7 +327,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
         # (e.g. MLA target, per-head K/V draft), so size from the draft config.
-        if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
+        # A ring-layout draft is charged as a fixed per-request ring instead
+        # (kv_cache_configurator._resolve_memory_pool_config), never per token.
+        if (
+            kvc.spec_algorithm.is_dflash_family()
+            and not kvc.is_draft_worker
+            and _dflash_ring_layout(kvc) is None
+        ):
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )
